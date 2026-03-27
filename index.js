@@ -72,6 +72,57 @@ app.get('/init-db', async (req, res) => {
   }
 });
 
+app.get('/init-groups', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS groups (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT UNIQUE,
+        title TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    res.send('Groups table ready ✅');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Failed ❌');
+  }
+});
+
+app.post('/group/save', async (req, res) => {
+  const { chat_id, title } = req.body;
+
+  try {
+    await pool.query(
+      `
+        INSERT INTO groups (chat_id, title)
+        VALUES ($1, $2)
+        ON CONFLICT (chat_id) DO NOTHING
+      `,
+      [chat_id, title || null]
+    );
+
+    res.send('Group saved ✅');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error ❌');
+  }
+});
+
+app.get('/groups', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT chat_id, title FROM groups ORDER BY created_at DESC'
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error fetching groups ❌');
+  }
+});
+
 app.post('/user/create', async (req, res) => {
   const { telegram_id, username, referral_code_used } = req.body;
 
@@ -129,6 +180,120 @@ app.post('/user/create', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('Error creating user ❌');
+  }
+});
+
+app.get('/referrals/:telegram_id', async (req, res) => {
+  const { telegram_id } = req.params;
+
+  try {
+    // Get the user first
+    const userResult = await pool.query(
+      'SELECT * FROM users WHERE telegram_id = $1',
+      [telegram_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found ❌' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Find all users they referred
+    const referralsResult = await pool.query(
+      'SELECT * FROM users WHERE referred_by = $1',
+      [user.referral_code]
+    );
+
+    res.json({
+      user: user.username,
+      referral_code: user.referral_code,
+      total_referrals: referralsResult.rows.length,
+      referrals: referralsResult.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error fetching referrals ❌');
+  }
+});
+
+app.get('/leaderboard', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        u.username,
+        u.referral_code,
+        COUNT(r.id)::int AS total_referrals
+      FROM users u
+      LEFT JOIN users r
+        ON r.referred_by = u.referral_code
+      GROUP BY u.id
+      ORDER BY total_referrals DESC
+      LIMIT 10;
+    `);
+
+    res.json({
+      leaderboard: result.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error fetching leaderboard ❌');
+  }
+});
+
+app.get('/user/stats/:telegram_id', async (req, res) => {
+  const { telegram_id } = req.params;
+
+  try {
+    // Get user
+    const userResult = await pool.query(
+      'SELECT * FROM users WHERE telegram_id = $1',
+      [telegram_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found ❌' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Count referrals
+    const countResult = await pool.query(
+      'SELECT COUNT(*)::int AS total FROM users WHERE referred_by = $1',
+      [user.referral_code]
+    );
+
+    const totalReferrals = countResult.rows[0].total;
+
+    // Get rank (1 = most referrals)
+    const rankResult = await pool.query(
+      `
+        SELECT rank
+        FROM (
+          SELECT
+            u.referral_code,
+            CAST(RANK() OVER (ORDER BY COUNT(r.id) DESC) AS int) AS rank
+          FROM users u
+          LEFT JOIN users r
+            ON r.referred_by = u.referral_code
+          GROUP BY u.referral_code
+        ) ranked
+        WHERE referral_code = $1;
+      `,
+      [user.referral_code]
+    );
+
+    const rank = rankResult.rows[0]?.rank || 0;
+
+    res.json({
+      username: user.username,
+      referral_code: user.referral_code,
+      total_referrals: totalReferrals,
+      rank,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error fetching stats ❌');
   }
 });
 
