@@ -142,9 +142,27 @@ async function fetchApifyDatasetItems({ datasetId, token, limit = 500, offset = 
   return json;
 }
 
+async function fetchApifyDatasetItemsWithRetry({ datasetId, token, limit, offset, retries = 3 }) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await fetchApifyDatasetItems({ datasetId, token, limit, offset });
+    } catch (err) {
+      lastErr = err;
+      const status = String(err?.message || '');
+      const backoff = 250 * attempt;
+      console.error(`Apify fetch failed (attempt ${attempt}/${retries}) for ${datasetId}:`, status);
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+  throw lastErr || new Error('Apify fetch failed');
+}
+
 async function getCommunitiesFromApify({ datasetId, platformHint }) {
   const token = String(process.env.APIFY_API_TOKEN || '').trim();
-  const items = await fetchApifyDatasetItems({ datasetId, token });
+  const items = await fetchApifyDatasetItemsWithRetry({ datasetId, token, retries: 3 });
 
   const normalized = [];
   for (const item of items) {
@@ -159,5 +177,6 @@ async function getCommunitiesFromApify({ datasetId, platformHint }) {
 module.exports = {
   getCommunitiesFromApify,
   fetchApifyDatasetItems,
+  fetchApifyDatasetItemsWithRetry,
   normalizeCommunity,
 };

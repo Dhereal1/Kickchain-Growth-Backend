@@ -40,6 +40,12 @@ function getIntelConfig() {
   const maxItemsPerDataset =
     Number(json.max_items_per_dataset ?? process.env.APIFY_MAX_ITEMS_PER_DATASET ?? 1000) || 1000;
 
+  const maxDatasetsPerRun =
+    Number(json.max_datasets_per_run ?? process.env.INTEL_MAX_DATASETS_PER_RUN ?? 5) || 5;
+
+  const pipelineTimeoutMs =
+    Number(json.pipeline_timeout_ms ?? process.env.INTEL_PIPELINE_TIMEOUT_MS ?? 8000) || 8000;
+
   const postTtlDays =
     Number(json.post_ttl_days ?? process.env.INTEL_POST_TTL_DAYS ?? 30) || 30;
 
@@ -55,6 +61,8 @@ function getIntelConfig() {
     intentThreshold,
     trendingSpikeRatio,
     maxItemsPerDataset,
+    maxDatasetsPerRun,
+    pipelineTimeoutMs,
     postTtlDays,
     datasetsDefault,
   };
@@ -63,4 +71,3 @@ function getIntelConfig() {
 module.exports = {
   getIntelConfig,
 };
-

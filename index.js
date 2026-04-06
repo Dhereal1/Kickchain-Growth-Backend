@@ -9,6 +9,7 @@ const { sendToUsers } = require('./bot/notifyUsers');
 const { registerIntelRoutes } = require('./routes/intelRoutes');
 const { ingestDatasets, aggregateDaily, cleanupOldPosts } = require('./services/intelPipeline');
 const { getIntelConfig } = require('./services/intelConfig');
+const { dispatchIntelWebhooks } = require('./services/intelWebhooks');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -213,6 +214,10 @@ async function ensureGrowthSchema() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS intent_score INT DEFAULT 0");
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS engagement_score INT DEFAULT 0");
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS score NUMERIC DEFAULT 0");
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP");
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS communities_name_platform_uq ON communities (name, platform)'
   );
@@ -224,6 +229,7 @@ async function ensureGrowthSchema() {
       platform TEXT NOT NULL,
       community_name TEXT NOT NULL,
       post_id TEXT NOT NULL,
+      content_hash TEXT,
       text TEXT,
       views INT,
       posted_at TIMESTAMP,
@@ -236,6 +242,10 @@ async function ensureGrowthSchema() {
       UNIQUE(platform, post_id)
     );
   `);
+  await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_hash TEXT");
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_hash_uq ON community_posts (platform, content_hash)'
+  );
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_posts_lookup_idx ON community_posts (platform, community_name, posted_at)'
   );
@@ -251,10 +261,12 @@ async function ensureGrowthSchema() {
       intent_score INT NOT NULL,
       engagement_score INT NOT NULL,
       score NUMERIC NOT NULL,
+      trend_score INT DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW(),
       UNIQUE(day, platform, name)
     );
   `);
+  await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS trend_score INT DEFAULT 0");
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_metrics_rank_idx ON community_metrics (day, score DESC)'
   );
@@ -267,7 +279,40 @@ async function ensureGrowthSchema() {
       platform TEXT,
       fetched_items INT DEFAULT 0,
       inserted_posts INT DEFAULT 0,
+      deduped_posts INT DEFAULT 0,
+      communities_updated INT DEFAULT 0,
+      duration_ms INT DEFAULT 0,
+      status TEXT DEFAULT 'running',
       error TEXT
+    );
+  `);
+  await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS deduped_posts INT DEFAULT 0");
+  await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS communities_updated INT DEFAULT 0");
+  await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS duration_ms INT DEFAULT 0");
+  await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'running'");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS client_configs (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      intent_keywords TEXT[],
+      platforms TEXT[],
+      thresholds JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_webhooks (
+      id SERIAL PRIMARY KEY,
+      name TEXT,
+      url TEXT UNIQUE NOT NULL,
+      secret TEXT,
+      enabled BOOLEAN DEFAULT TRUE,
+      last_sent_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
 
@@ -625,6 +670,30 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
     const aggregate = await aggregateDaily({ pool, ensureGrowthSchema });
     const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema });
 
+    // Client webhook output (SaaS-ready)
+    let webhookResult = null;
+    try {
+      const oppRes = await pool.query(
+        `
+          WITH latest_day AS (SELECT MAX(day) AS day FROM community_metrics)
+          SELECT *
+          FROM community_metrics
+          WHERE day = (SELECT day FROM latest_day)
+          ORDER BY score DESC
+          LIMIT 10
+        `
+      );
+      const top = oppRes.rows || [];
+      const payload = {
+        timestamp: new Date().toISOString(),
+        top_opportunities: top,
+      };
+      webhookResult = await dispatchIntelWebhooks({ pool, ensureGrowthSchema, payload });
+    } catch (err) {
+      console.error('intel webhook dispatch failed:', err?.message || String(err));
+      webhookResult = { sent: 0, failed: 1 };
+    }
+
     // Internal alert system (Telegram only; no user DMs)
     const alertChatId = String(process.env.INTEL_ALERT_TELEGRAM_CHAT_ID || '').trim();
     const botUsername = String(process.env.BOT_USERNAME || '').trim();
@@ -670,7 +739,14 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
       }
     }
 
-    return res.json({ ok: true, ingest, aggregate, cleanup, alerted: !!alertChatId });
+    return res.json({
+      ok: true,
+      ingest,
+      aggregate,
+      cleanup,
+      webhooks: webhookResult,
+      alerted: !!alertChatId,
+    });
   } catch (err) {
     console.error('intel-full-pipeline cron failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: 'Cron pipeline failed' });

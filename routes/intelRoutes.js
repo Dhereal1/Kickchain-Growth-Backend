@@ -32,6 +32,99 @@ function computeRecommendations(topCommunities) {
 function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   const router = express.Router();
 
+  router.post('/webhook', async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const adminKey = (process.env.ADMIN_API_KEY || '').trim();
+      if (adminKey) {
+        const auth = String(req.headers.authorization || '');
+        if (auth !== `Bearer ${adminKey}`) return res.sendStatus(401);
+      }
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const url = String(body.url || '').trim();
+      const name = String(body.name || '').trim() || null;
+      const secret = String(body.secret || '').trim() || null;
+      const enabled = body.enabled === false ? false : true;
+
+      if (!url) return res.status(400).json({ ok: false, error: 'url is required' });
+
+      await pool.query(
+        `
+          INSERT INTO intel_webhooks (name, url, secret, enabled, updated_at)
+          VALUES ($1, $2, $3, $4, NOW())
+          ON CONFLICT (url)
+          DO UPDATE SET name=EXCLUDED.name, secret=EXCLUDED.secret, enabled=EXCLUDED.enabled, updated_at=NOW()
+        `,
+        [name, url, secret, enabled]
+      );
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('intel webhook register failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to save webhook' });
+    }
+  });
+
+  router.get('/runs', async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+      const r = await pool.query(
+        `
+          SELECT
+            id,
+            run_at,
+            datasets,
+            platform,
+            fetched_items,
+            inserted_posts,
+            deduped_posts,
+            communities_updated,
+            duration_ms,
+            status,
+            error
+          FROM intel_runs
+          ORDER BY id DESC
+          LIMIT 50
+        `
+      );
+      return res.json({ runs: r.rows || [] });
+    } catch (err) {
+      console.error('intel runs failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load runs' });
+    }
+  });
+
+  router.get('/health', async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+      const cfg = getIntelConfig();
+      const r = await pool.query(
+        `SELECT * FROM intel_runs ORDER BY id DESC LIMIT 1`
+      );
+      const last = r.rows[0] || null;
+      const lastRunAt = last?.run_at ? new Date(last.run_at).toISOString() : null;
+      const lastIngestCount = Number(last?.inserted_posts || 0);
+      const datasetsConnected = (cfg.datasetsDefault || []).length;
+
+      const healthy =
+        !!last &&
+        last.status === 'success' &&
+        (Date.now() - new Date(last.run_at).getTime()) < 36 * 60 * 60 * 1000;
+
+      return res.json({
+        last_run: lastRunAt,
+        status: healthy ? 'healthy' : 'unhealthy',
+        datasets_connected: datasetsConnected,
+        last_ingest_count: lastIngestCount,
+      });
+    } catch (err) {
+      console.error('intel health failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Health check failed' });
+    }
+  });
+
   // Multi-source ingestion (supports GET for backward compatibility, prefer POST)
   const syncHandler = async (req, res) => {
     try {
@@ -122,7 +215,13 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
 
       const latestDayRes = await pool.query(`SELECT MAX(day) AS day FROM community_metrics`);
       const day = latestDayRes.rows[0]?.day;
-      if (!day) return res.json({ high_intent_communities: [], trending_communities: [], hot_posts: [] });
+      if (!day) {
+        return res.json({
+          summary: { total_opportunities: 0, top_platform: null },
+          opportunities: { high_intent: [], trending: [], hot_posts: [] },
+          metadata: { generated_at: new Date().toISOString(), confidence_score: 0 },
+        });
+      }
 
       const highIntentRes = await pool.query(
         `
@@ -137,18 +236,11 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
 
       const trendingRes = await pool.query(
         `
-          WITH prev AS (
-            SELECT name, platform, activity_score
-            FROM community_metrics
-            WHERE day = $1::date - INTERVAL '1 day'
-          )
           SELECT
-            m.*,
-            COALESCE(p.activity_score, 0) AS prev_activity_score
+            *
           FROM community_metrics m
-          LEFT JOIN prev p ON p.name = m.name AND p.platform = m.platform
           WHERE m.day = $1 AND m.activity_score >= 1
-          ORDER BY (m.activity_score - COALESCE(p.activity_score, 0)) DESC, m.score DESC
+          ORDER BY m.trend_score DESC, m.score DESC
           LIMIT 10
         `,
         [day]
@@ -171,10 +263,40 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         `
       );
 
+      const highIntent = highIntentRes.rows || [];
+      const trending = trendingRes.rows || [];
+      const hotPosts = hotPostsRes.rows || [];
+
+      const totalOpp =
+        highIntent.length + trending.length + hotPosts.length;
+
+      const topPlatform =
+        highIntent[0]?.platform || trending[0]?.platform || hotPosts[0]?.platform || null;
+
+      // Simple confidence heuristic: presence of intent and at least some posts.
+      const confidence =
+        Math.min(
+          1,
+          0.2 +
+            (highIntent.length ? 0.4 : 0) +
+            (hotPosts.length ? 0.2 : 0) +
+            (trending.length ? 0.2 : 0)
+        );
+
       return res.json({
-        high_intent_communities: highIntentRes.rows || [],
-        trending_communities: trendingRes.rows || [],
-        hot_posts: hotPostsRes.rows || [],
+        summary: {
+          total_opportunities: totalOpp,
+          top_platform: topPlatform,
+        },
+        opportunities: {
+          high_intent: highIntent,
+          trending: trending,
+          hot_posts: hotPosts,
+        },
+        metadata: {
+          generated_at: new Date().toISOString(),
+          confidence_score: Number(confidence.toFixed(2)),
+        },
       });
     } catch (err) {
       console.error('opportunities failed:', err?.message || String(err));

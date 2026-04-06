@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { fetchApifyDatasetItems, normalizeCommunity } = require('./apifyService');
+const { fetchApifyDatasetItemsWithRetry, normalizeCommunity } = require('./apifyService');
 const { extractSignals } = require('./signalEngine');
 const { getIntelConfig } = require('./intelConfig');
 
@@ -14,6 +14,14 @@ function stablePostId({ platform, datasetId, item, normalized }) {
     text: normalized?.text || '',
     date: normalized?.posted_at || item?.date || item?.timestamp || null,
   });
+  return crypto.createHash('sha256').update(base).digest('hex');
+}
+
+function contentHash({ text, communityName }) {
+  const t = String(text || '').trim();
+  const c = String(communityName || '').trim();
+  const base = `${t}\n${c}`.toLowerCase();
+  if (!base.trim()) return null;
   return crypto.createHash('sha256').update(base).digest('hex');
 }
 
@@ -34,27 +42,44 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
 
   await ensureGrowthSchema();
 
+  const startedAt = Date.now();
+  const maxDatasets = Math.max(1, Number(cfg.maxDatasetsPerRun) || 5);
+  const timeoutMs = Math.max(1000, Number(cfg.pipelineTimeoutMs) || 8000);
+  const runDatasets = datasets.slice(0, maxDatasets);
+
   const run = await pool.query(
     `INSERT INTO intel_runs (datasets, platform) VALUES ($1, $2) RETURNING id`,
-    [datasets, platformHint || null]
+    [runDatasets, platformHint || null]
   );
   const runId = run.rows[0].id;
 
   let fetchedItems = 0;
   let insertedPosts = 0;
+  let dedupedPosts = 0;
+  let communitiesUpdated = 0;
 
   try {
-    for (const datasetId of datasets) {
-      const items = await fetchApifyDatasetItems({
+    for (const datasetId of runDatasets) {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`Pipeline timeout after ${timeoutMs}ms`);
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      const items = await fetchApifyDatasetItemsWithRetry({
         datasetId,
         token,
         limit: cfg.maxItemsPerDataset,
         offset: 0,
+        retries: 3,
       });
 
       fetchedItems += items.length;
 
       for (const item of items) {
+        if (Date.now() - startedAt > timeoutMs) {
+          throw new Error(`Pipeline timeout after ${timeoutMs}ms`);
+        }
+
         const normalized = normalizeCommunity(item, platformHint);
         if (!normalized?.name || !normalized?.platform || normalized.platform === 'unknown') continue;
 
@@ -69,21 +94,23 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
         const views = Number(normalized.views ?? item?.views ?? item?.viewCount ?? 0) || 0;
 
         const signals = extractSignals({ text, views, raw: item });
+        const chash = contentHash({ text, communityName: normalized.name });
 
         // Posts table (dedup by platform+post_id)
         const postRes = await pool.query(
           `
             INSERT INTO community_posts (
-              platform, community_name, post_id, text, views, posted_at, dataset_id,
+              platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
               intent_score, engagement_score, frequency_score, raw
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-            ON CONFLICT (platform, post_id) DO NOTHING
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ON CONFLICT DO NOTHING
           `,
           [
             normalized.platform,
             normalized.name,
             postId,
+            chash,
             text || null,
             views,
             toTimestamp(normalized.posted_at) || toTimestamp(item?.date || item?.timestamp) || null,
@@ -96,9 +123,10 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
         );
 
         if (postRes.rowCount) insertedPosts += 1;
+        else dedupedPosts += 1;
 
         // Communities master list (upsert)
-        await pool.query(
+        const communityRes = await pool.query(
           `
             INSERT INTO communities (
               name, platform, member_count, activity_score, keyword_matches,
@@ -128,22 +156,55 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
             item,
           ]
         );
+        if (communityRes.rowCount) communitiesUpdated += 1;
       }
     }
 
+    const durationMs = Date.now() - startedAt;
     await pool.query(
-      `UPDATE intel_runs SET fetched_items=$1, inserted_posts=$2 WHERE id=$3`,
-      [fetchedItems, insertedPosts, runId]
+      `UPDATE intel_runs
+       SET fetched_items=$1,
+           inserted_posts=$2,
+           deduped_posts=$3,
+           communities_updated=$4,
+           duration_ms=$5,
+           status='success'
+       WHERE id=$6`,
+      [fetchedItems, insertedPosts, dedupedPosts, communitiesUpdated, durationMs, runId]
     );
   } catch (err) {
+    const durationMs = Date.now() - startedAt;
     await pool.query(
-      `UPDATE intel_runs SET fetched_items=$1, inserted_posts=$2, error=$3 WHERE id=$4`,
-      [fetchedItems, insertedPosts, String(err?.message || err), runId]
+      `UPDATE intel_runs
+       SET fetched_items=$1,
+           inserted_posts=$2,
+           deduped_posts=$3,
+           communities_updated=$4,
+           duration_ms=$5,
+           status='failed',
+           error=$6
+       WHERE id=$7`,
+      [
+        fetchedItems,
+        insertedPosts,
+        dedupedPosts,
+        communitiesUpdated,
+        durationMs,
+        String(err?.message || err),
+        runId,
+      ]
     );
     throw err;
   }
 
-  return { runId, fetchedItems, insertedPosts };
+  return {
+    runId,
+    datasets_processed: runDatasets.length,
+    posts_ingested: insertedPosts,
+    posts_deduped: dedupedPosts,
+    communities_updated: communitiesUpdated,
+    fetched_items: fetchedItems,
+  };
 }
 
 function computeCommunityScore({ activity_score, engagement_score, intent_score }) {
@@ -192,19 +253,29 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
   let upserted = 0;
   for (const row of aggRes.rows) {
     const score = computeCommunityScore(row);
+    const prevRes = await pool.query(
+      `SELECT activity_score
+       FROM community_metrics
+       WHERE day = $1::date - INTERVAL '1 day' AND platform=$2 AND name=$3`,
+      [targetDay, row.platform, row.name]
+    );
+    const prevActivity = Number(prevRes.rows[0]?.activity_score || 0);
+    const trendScore = Number(row.activity_score || 0) - prevActivity;
+
     const r = await pool.query(
       `
         INSERT INTO community_metrics (
-          day, platform, name, total_messages, activity_score, intent_score, engagement_score, score
+          day, platform, name, total_messages, activity_score, intent_score, engagement_score, score, trend_score
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         ON CONFLICT (day, platform, name)
         DO UPDATE SET
           total_messages = EXCLUDED.total_messages,
           activity_score = EXCLUDED.activity_score,
           intent_score = EXCLUDED.intent_score,
           engagement_score = EXCLUDED.engagement_score,
-          score = EXCLUDED.score
+          score = EXCLUDED.score,
+          trend_score = EXCLUDED.trend_score
       `,
       [
         targetDay,
@@ -215,6 +286,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
         row.intent_score,
         row.engagement_score,
         score,
+        trendScore,
       ]
     );
     upserted += r.rowCount ? 1 : 0;
@@ -249,4 +321,3 @@ module.exports = {
   cleanupOldPosts,
   computeCommunityScore,
 };
-
