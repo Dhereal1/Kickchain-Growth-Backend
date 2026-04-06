@@ -276,6 +276,7 @@ async function ensureGrowthSchema() {
       id BIGSERIAL PRIMARY KEY,
       run_at TIMESTAMP NOT NULL DEFAULT NOW(),
       datasets JSONB,
+      dataset_ids JSONB,
       platform TEXT,
       fetched_items INT DEFAULT 0,
       inserted_posts INT DEFAULT 0,
@@ -283,9 +284,12 @@ async function ensureGrowthSchema() {
       communities_updated INT DEFAULT 0,
       duration_ms INT DEFAULT 0,
       status TEXT DEFAULT 'running',
+      error_message TEXT,
       error TEXT
     );
   `);
+  await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS dataset_ids JSONB");
+  await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS error_message TEXT");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS deduped_posts INT DEFAULT 0");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS communities_updated INT DEFAULT 0");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS duration_ms INT DEFAULT 0");
@@ -315,6 +319,24 @@ async function ensureGrowthSchema() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+      id BIGSERIAL PRIMARY KEY,
+      webhook_id INT NOT NULL REFERENCES intel_webhooks(id) ON DELETE CASCADE,
+      run_id BIGINT REFERENCES intel_runs(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INT NOT NULL DEFAULT 0,
+      last_status_code INT,
+      last_error TEXT,
+      payload JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS webhook_deliveries_run_idx ON webhook_deliveries (run_id, created_at DESC)'
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS daily_referral_ranks (
@@ -610,6 +632,10 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
   if (!allowed) return res.sendStatus(401);
 
   try {
+    if (String(process.env.INTEL_SANDBOX || '').trim().toLowerCase() === 'true') {
+      return res.json({ ok: true, sandbox: true });
+    }
+
     const cfg = getIntelConfig();
     const datasets =
       (req.query.datasets ? String(req.query.datasets).split(',') : null) ||
@@ -653,6 +679,10 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
   if (!allowed) return res.sendStatus(401);
 
   try {
+    if (String(process.env.INTEL_SANDBOX || '').trim().toLowerCase() === 'true') {
+      return res.json({ ok: true, sandbox: true });
+    }
+
     const cfg = getIntelConfig();
     const datasets = cfg.datasetsDefault;
     if (!datasets.length) {
@@ -688,7 +718,12 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
         timestamp: new Date().toISOString(),
         top_opportunities: top,
       };
-      webhookResult = await dispatchIntelWebhooks({ pool, ensureGrowthSchema, payload });
+      webhookResult = await dispatchIntelWebhooks({
+        pool,
+        ensureGrowthSchema,
+        payload,
+        runId: ingest?.runId || null,
+      });
     } catch (err) {
       console.error('intel webhook dispatch failed:', err?.message || String(err));
       webhookResult = { sent: 0, failed: 1 };

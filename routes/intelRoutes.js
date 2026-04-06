@@ -32,15 +32,29 @@ function computeRecommendations(topCommunities) {
 function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   const router = express.Router();
 
+  function requireIntelApiKey(req, res) {
+    const configured = String(process.env.INTEL_API_KEY || '').trim();
+    if (!configured) {
+      res.status(500).json({ error: 'intel_api_key_not_configured' });
+      return false;
+    }
+
+    const auth = String(req.headers.authorization || '');
+    const parts = auth.split(' ');
+    const key = parts.length === 2 && parts[0].toLowerCase() === 'bearer' ? parts[1] : '';
+
+    if (key !== configured) {
+      res.status(401).json({ error: 'unauthorized' });
+      return false;
+    }
+    return true;
+  }
+
   router.post('/webhook', async (req, res) => {
     try {
       await ensureGrowthSchema();
 
-      const adminKey = (process.env.ADMIN_API_KEY || '').trim();
-      if (adminKey) {
-        const auth = String(req.headers.authorization || '');
-        if (auth !== `Bearer ${adminKey}`) return res.sendStatus(401);
-      }
+      if (!requireIntelApiKey(req, res)) return;
 
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const url = String(body.url || '').trim();
@@ -70,12 +84,15 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   router.get('/runs', async (req, res) => {
     try {
       await ensureGrowthSchema();
+      if (!requireIntelApiKey(req, res)) return;
+
       const r = await pool.query(
         `
           SELECT
             id,
             run_at,
             datasets,
+            dataset_ids,
             platform,
             fetched_items,
             inserted_posts,
@@ -83,13 +100,31 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             communities_updated,
             duration_ms,
             status,
+            error_message,
             error
           FROM intel_runs
           ORDER BY id DESC
           LIMIT 50
         `
       );
-      return res.json({ runs: r.rows || [] });
+
+      const runs = r.rows || [];
+      const considered = runs.filter((x) => x.status === 'success' || x.status === 'failed');
+      const successes = considered.filter((x) => x.status === 'success').length;
+      const successRate = considered.length ? successes / considered.length : 0;
+      const avgDuration =
+        considered.length
+          ? Math.round(
+              considered.reduce((sum, x) => sum + Number(x.duration_ms || 0), 0) / considered.length
+            )
+          : 0;
+
+      return res.json({
+        success_rate: Number(successRate.toFixed(2)),
+        avg_duration_ms: avgDuration,
+        avg_processing_time_ms: avgDuration,
+        last_5_runs: runs.slice(0, 5),
+      });
     } catch (err) {
       console.error('intel runs failed:', err?.message || String(err));
       return res.status(500).json({ ok: false, error: 'Failed to load runs' });
@@ -128,6 +163,22 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   // Multi-source ingestion (supports GET for backward compatibility, prefer POST)
   const syncHandler = async (req, res) => {
     try {
+      if (String(process.env.INTEL_SANDBOX || '').trim().toLowerCase() === 'true') {
+        return res.json({
+          ok: true,
+          sandbox: true,
+          ingest: {
+            runId: null,
+            datasets_processed: 0,
+            posts_ingested: 0,
+            posts_deduped: 0,
+            communities_updated: 0,
+            fetched_items: 0,
+          },
+          aggregate: { day: new Date().toISOString().slice(0, 10), communitiesAggregated: 0 },
+        });
+      }
+
       const cfg = getIntelConfig();
       const body = req.body && typeof req.body === 'object' ? req.body : {};
 
@@ -211,7 +262,35 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   router.get('/opportunities', async (req, res) => {
     try {
       await ensureGrowthSchema();
+      if (!requireIntelApiKey(req, res)) return;
+
+      if (String(process.env.INTEL_SANDBOX || '').trim().toLowerCase() === 'true') {
+        return res.json({
+          summary: { total_opportunities: 3, top_platform: 'telegram' },
+          opportunities: {
+            high_intent: [{ name: '@demo_channel', platform: 'telegram', intent_score: 5, engagement_score: 20, activity_score: 10, trend_score: 5, score: 12 }],
+            trending: [{ name: '@demo_trending', platform: 'telegram', trend_score: 15, activity_score: 20, score: 10 }],
+            hot_posts: [{ platform: 'telegram', community_name: '@demo_channel', post_id: 'demo', intent_score: 3, engagement_score: 10, views: 100, posted_at: new Date().toISOString() }],
+          },
+          metadata: { generated_at: new Date().toISOString(), confidence_score: 0.75 },
+        });
+      }
+
       const cfg = getIntelConfig();
+      const clientId = req.query.client_id ? Number(req.query.client_id) : null;
+
+      let intentThreshold = cfg.intentThreshold;
+      let platforms = cfg.platforms;
+      if (clientId && Number.isFinite(clientId)) {
+        const cr = await pool.query(`SELECT * FROM client_configs WHERE id = $1`, [clientId]);
+        const c = cr.rows[0];
+        if (c?.thresholds?.intent_threshold) {
+          intentThreshold = Number(c.thresholds.intent_threshold) || intentThreshold;
+        }
+        if (Array.isArray(c?.platforms) && c.platforms.length) {
+          platforms = c.platforms.map((p) => String(p).toLowerCase());
+        }
+      }
 
       const latestDayRes = await pool.query(`SELECT MAX(day) AS day FROM community_metrics`);
       const day = latestDayRes.rows[0]?.day;
@@ -228,10 +307,11 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           SELECT *
           FROM community_metrics
           WHERE day = $1 AND intent_score >= $2
+          ${platforms && platforms.length ? 'AND platform = ANY($3::text[])' : ''}
           ORDER BY score DESC
           LIMIT 10
         `,
-        [day, cfg.intentThreshold]
+        platforms && platforms.length ? [day, intentThreshold, platforms] : [day, intentThreshold]
       );
 
       const trendingRes = await pool.query(
@@ -240,10 +320,11 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             *
           FROM community_metrics m
           WHERE m.day = $1 AND m.activity_score >= 1
+          ${platforms && platforms.length ? 'AND m.platform = ANY($2::text[])' : ''}
           ORDER BY m.trend_score DESC, m.score DESC
           LIMIT 10
         `,
-        [day]
+        platforms && platforms.length ? [day, platforms] : [day]
       );
 
       const hotPostsRes = await pool.query(
@@ -258,9 +339,12 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             posted_at
           FROM community_posts
           WHERE posted_at >= NOW() - INTERVAL '24 hours'
+            ${platforms && platforms.length ? 'AND platform = ANY($1::text[])' : ''}
           ORDER BY (intent_score * 2 + engagement_score) DESC, views DESC
           LIMIT 10
         `
+        ,
+        platforms && platforms.length ? [platforms] : []
       );
 
       const highIntent = highIntentRes.rows || [];
@@ -273,15 +357,18 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       const topPlatform =
         highIntent[0]?.platform || trending[0]?.platform || hotPosts[0]?.platform || null;
 
-      // Simple confidence heuristic: presence of intent and at least some posts.
-      const confidence =
-        Math.min(
-          1,
-          0.2 +
-            (highIntent.length ? 0.4 : 0) +
-            (hotPosts.length ? 0.2 : 0) +
-            (trending.length ? 0.2 : 0)
-        );
+      // Confidence score (client-facing): normalize intent + engagement against caps.
+      const intentCap = 10;
+      const engagementCap = 100;
+      const sample = highIntent.slice(0, 10);
+      const avgIntent =
+        sample.length ? sample.reduce((s, x) => s + Number(x.intent_score || 0), 0) / sample.length : 0;
+      const avgEng =
+        sample.length ? sample.reduce((s, x) => s + Number(x.engagement_score || 0), 0) / sample.length : 0;
+      const confidence = Math.min(
+        1,
+        (Math.min(1, avgIntent / intentCap) * 0.7) + (Math.min(1, avgEng / engagementCap) * 0.3)
+      );
 
       return res.json({
         summary: {

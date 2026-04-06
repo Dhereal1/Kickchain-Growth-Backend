@@ -52,6 +52,7 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
     [runDatasets, platformHint || null]
   );
   const runId = run.rows[0].id;
+  await pool.query(`UPDATE intel_runs SET dataset_ids = $1 WHERE id = $2`, [runDatasets, runId]);
 
   let fetchedItems = 0;
   let insertedPosts = 0;
@@ -174,6 +175,7 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
     );
   } catch (err) {
     const durationMs = Date.now() - startedAt;
+    const msg = String(err?.message || err);
     await pool.query(
       `UPDATE intel_runs
        SET fetched_items=$1,
@@ -182,15 +184,17 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
            communities_updated=$4,
            duration_ms=$5,
            status='failed',
-           error=$6
-       WHERE id=$7`,
+           error_message=$6,
+           error=$7
+       WHERE id=$8`,
       [
         fetchedItems,
         insertedPosts,
         dedupedPosts,
         communitiesUpdated,
         durationMs,
-        String(err?.message || err),
+        msg,
+        String(err?.details || err?.stack || msg),
         runId,
       ]
     );
