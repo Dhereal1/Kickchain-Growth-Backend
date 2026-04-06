@@ -62,7 +62,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           `
             INSERT INTO communities (name, platform, member_count, activity_score, keyword_matches, raw, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (platform, name)
+            ON CONFLICT (name, platform)
             DO UPDATE SET
               member_count = EXCLUDED.member_count,
               activity_score = EXCLUDED.activity_score,
@@ -157,7 +157,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           `
             INSERT INTO communities (name, platform, member_count, activity_score, keyword_matches, raw, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (platform, name)
+            ON CONFLICT (name, platform)
             DO UPDATE SET
               member_count = EXCLUDED.member_count,
               activity_score = EXCLUDED.activity_score,
@@ -194,4 +194,3 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
 module.exports = {
   registerIntelRoutes,
 };
-

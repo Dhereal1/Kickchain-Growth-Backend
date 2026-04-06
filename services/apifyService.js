@@ -6,6 +6,39 @@ function normalizeNumber(value) {
   return i < 0 ? 0 : i;
 }
 
+function getKeywordList() {
+  const raw = String(process.env.INTEL_KEYWORDS || '').trim();
+  if (!raw) return ['game', 'play', '1v1', 'bet', 'earn'];
+  return raw
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function normalizeTelegramDatasetItem(item) {
+  const text = String(item?.text || '');
+  const keywordList = getKeywordList();
+
+  const lowered = text.toLowerCase();
+  const keywordMatches = keywordList.filter((k) => lowered.includes(k)).length;
+
+  const channel =
+    String(item?.channel || item?.channelName || item?.chat || item?.name || '')
+      .trim()
+      .slice(0, 200) || null;
+
+  const views = normalizeNumber(item?.views ?? item?.viewCount) ?? 0;
+
+  return {
+    name: channel ? channel.toLowerCase() : null,
+    platform: 'telegram',
+    member_count: views,
+    activity_score: views,
+    keyword_matches: keywordMatches,
+    raw: item,
+  };
+}
+
 function inferPlatform(item, hintedPlatform) {
   const hint = String(hintedPlatform || '').trim().toLowerCase();
   if (hint === 'telegram' || hint === 'discord') return hint;
@@ -21,6 +54,11 @@ function inferPlatform(item, hintedPlatform) {
 }
 
 function normalizeCommunity(item, hintedPlatform) {
+  const hint = String(hintedPlatform || '').trim().toLowerCase();
+  if (hint === 'telegram' || item?.channel || item?.channelName) {
+    return normalizeTelegramDatasetItem(item);
+  }
+
   const name =
     String(
       item?.name ||
@@ -121,4 +159,3 @@ module.exports = {
   fetchApifyDatasetItems,
   normalizeCommunity,
 };
-

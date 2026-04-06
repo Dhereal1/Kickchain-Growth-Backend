@@ -208,8 +208,9 @@ async function ensureGrowthSchema() {
     );
   `);
   await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS communities_platform_name_uq ON communities (platform, name)'
+    'CREATE UNIQUE INDEX IF NOT EXISTS communities_name_platform_uq ON communities (name, platform)'
   );
+  await pool.query('DROP INDEX IF EXISTS communities_platform_name_uq');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS daily_referral_ranks (
