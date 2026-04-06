@@ -37,7 +37,9 @@ function normalizeTelegramDatasetItem(item) {
       String(item?.id || item?.messageId || item?.message_id || item?.url || '').trim() ||
       null,
     posted_at:
-      item?.date || item?.postedAt || item?.timestamp ? new Date(item.date || item.postedAt || item.timestamp).toISOString() : null,
+      item?.date || item?.postedAt || item?.timestamp
+        ? String(item.date || item.postedAt || item.timestamp)
+        : null,
   };
 }
 
