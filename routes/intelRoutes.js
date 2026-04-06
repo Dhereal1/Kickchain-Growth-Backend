@@ -1,6 +1,7 @@
 const express = require('express');
 const { ingestDatasets, aggregateDaily } = require('../services/intelPipeline');
 const { getIntelConfig } = require('../services/intelConfig');
+const { requireApiKey } = require('../middleware/auth');
 
 function computeRecommendations(topCommunities) {
   const recommendations = [];
@@ -32,29 +33,9 @@ function computeRecommendations(topCommunities) {
 function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   const router = express.Router();
 
-  function requireIntelApiKey(req, res) {
-    const configured = String(process.env.INTEL_API_KEY || '').trim();
-    if (!configured) {
-      res.status(500).json({ error: 'intel_api_key_not_configured' });
-      return false;
-    }
-
-    const auth = String(req.headers.authorization || '');
-    const parts = auth.split(' ');
-    const key = parts.length === 2 && parts[0].toLowerCase() === 'bearer' ? parts[1] : '';
-
-    if (key !== configured) {
-      res.status(401).json({ error: 'unauthorized' });
-      return false;
-    }
-    return true;
-  }
-
-  router.post('/webhook', async (req, res) => {
+  router.post('/webhook', requireApiKey, async (req, res) => {
     try {
       await ensureGrowthSchema();
-
-      if (!requireIntelApiKey(req, res)) return;
 
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const url = String(body.url || '').trim();
@@ -81,10 +62,9 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.get('/runs', async (req, res) => {
+  router.get('/runs', requireApiKey, async (req, res) => {
     try {
       await ensureGrowthSchema();
-      if (!requireIntelApiKey(req, res)) return;
 
       const r = await pool.query(
         `
@@ -131,7 +111,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.get('/health', async (req, res) => {
+  router.get('/health', requireApiKey, async (req, res) => {
     try {
       await ensureGrowthSchema();
       const cfg = getIntelConfig();
@@ -259,10 +239,9 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.get('/opportunities', async (req, res) => {
+  router.get('/opportunities', requireApiKey, async (req, res) => {
     try {
       await ensureGrowthSchema();
-      if (!requireIntelApiKey(req, res)) return;
 
       if (String(process.env.INTEL_SANDBOX || '').trim().toLowerCase() === 'true') {
         return res.json({
