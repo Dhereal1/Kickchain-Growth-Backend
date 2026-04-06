@@ -1,7 +1,7 @@
 node_modules/
 .env
+_import/
 
 # Bot subproject
 bot/node_modules/
 bot/.env
-
