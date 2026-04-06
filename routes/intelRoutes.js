@@ -1,5 +1,6 @@
 const express = require('express');
-const { getCommunitiesFromApify } = require('../services/apifyService');
+const { ingestDatasets, aggregateDaily } = require('../services/intelPipeline');
+const { getIntelConfig } = require('../services/intelConfig');
 
 function computeRecommendations(topCommunities) {
   const recommendations = [];
@@ -28,97 +29,79 @@ function computeRecommendations(topCommunities) {
   return recommendations;
 }
 
-function makeCronAuthCheck(req) {
-  const cronHeader = String(req.headers['x-vercel-cron'] || '');
-  const secret = (process.env.CRON_SECRET || '').trim();
-  const qs = req.query?.secret ? String(req.query.secret) : '';
-  return cronHeader === '1' || (secret && qs && qs === secret);
-}
-
 function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   const router = express.Router();
 
-  router.get('/sync-communities', async (req, res) => {
+  // Multi-source ingestion (supports GET for backward compatibility, prefer POST)
+  const syncHandler = async (req, res) => {
     try {
-      await ensureGrowthSchema();
+      const cfg = getIntelConfig();
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
 
-      const datasetId =
-        String(req.query.datasetId || '').trim() ||
-        String(process.env.APIFY_DATASET_ID || '').trim();
-      const platformHint = String(req.query.platform || '').trim().toLowerCase() || undefined;
+      const datasets =
+        (Array.isArray(body.datasets) ? body.datasets : null) ||
+        (req.query.datasetId ? [String(req.query.datasetId)] : null) ||
+        cfg.datasetsDefault;
 
-      if (!datasetId) {
+      const platform =
+        String(body.platform || req.query.platform || '').trim().toLowerCase() ||
+        cfg.platforms[0] ||
+        'telegram';
+
+      const cleanedDatasets = (datasets || [])
+        .map((d) => String(d).trim())
+        .filter(Boolean);
+
+      if (!cleanedDatasets.length) {
         return res.status(400).json({
           ok: false,
-          error: 'Missing datasetId. Provide ?datasetId=... or set APIFY_DATASET_ID.',
+          error:
+            'Missing datasets. Send JSON { datasets: [...] } or set APIFY_DATASET_IDS/APIFY_DATASET_ID.',
         });
       }
 
-      const communities = await getCommunitiesFromApify({ datasetId, platformHint });
-
-      let upserted = 0;
-      for (const c of communities) {
-        const r = await pool.query(
-          `
-            INSERT INTO communities (name, platform, member_count, activity_score, keyword_matches, raw, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (name, platform)
-            DO UPDATE SET
-              member_count = EXCLUDED.member_count,
-              activity_score = EXCLUDED.activity_score,
-              keyword_matches = EXCLUDED.keyword_matches,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-          `,
-          [
-            c.name,
-            c.platform,
-            c.member_count,
-            c.activity_score,
-            c.keyword_matches,
-            c.raw,
-          ]
-        );
-        upserted += r.rowCount ? 1 : 0;
-      }
-
-      return res.json({
-        ok: true,
-        datasetId,
-        fetched: communities.length,
-        upserted,
+      const ingest = await ingestDatasets({
+        pool,
+        ensureGrowthSchema,
+        datasets: cleanedDatasets,
+        platform,
       });
+
+      // Aggregate for today after ingestion.
+      const aggregate = await aggregateDaily({ pool, ensureGrowthSchema });
+
+      return res.json({ ok: true, ingest, aggregate });
     } catch (err) {
       console.error('sync-communities failed:', err?.message || String(err));
-      return res.status(500).json({ ok: false, error: 'Sync failed' });
+      return res.status(500).json({ ok: false, error: err?.message || 'Sync failed' });
     }
-  });
+  };
+
+  router.get('/sync-communities', syncHandler);
+  router.post('/sync-communities', syncHandler);
 
   router.get('/today', async (req, res) => {
     try {
       await ensureGrowthSchema();
 
-      const result = await pool.query(
-        `
-          SELECT
-            id,
-            name,
-            platform,
-            member_count,
-            activity_score,
-            keyword_matches,
-            created_at,
-            updated_at,
-            (
-              (COALESCE(activity_score, 0) * 0.6) +
-              (COALESCE(member_count, 0) * 0.2) +
-              (COALESCE(keyword_matches, 0) * 0.2)
-            ) AS score
-          FROM communities
-          ORDER BY score DESC, updated_at DESC
-          LIMIT 10
-        `
-      );
+      const result = await pool.query(`
+        WITH latest_day AS (
+          SELECT MAX(day) AS day FROM community_metrics
+        )
+        SELECT
+          m.day,
+          m.platform,
+          m.name,
+          m.total_messages,
+          m.activity_score,
+          m.intent_score,
+          m.engagement_score,
+          m.score
+        FROM community_metrics m
+        JOIN latest_day d ON m.day = d.day
+        ORDER BY m.score DESC
+        LIMIT 10
+      `);
 
       const topCommunities = result.rows || [];
 
@@ -132,58 +115,70 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  // Cron (Vercel safe): triggers sync using APIFY_DATASET_ID (or override via query)
-  router.get('/cron/intel-sync', async (req, res) => {
-    if (!makeCronAuthCheck(req)) return res.sendStatus(401);
-
+  router.get('/opportunities', async (req, res) => {
     try {
       await ensureGrowthSchema();
-      const datasetId =
-        String(req.query.datasetId || '').trim() ||
-        String(process.env.APIFY_DATASET_ID || '').trim();
+      const cfg = getIntelConfig();
 
-      if (!datasetId) {
-        return res.status(400).json({
-          ok: false,
-          error: 'Missing APIFY_DATASET_ID (or pass ?datasetId=...)',
-        });
-      }
+      const latestDayRes = await pool.query(`SELECT MAX(day) AS day FROM community_metrics`);
+      const day = latestDayRes.rows[0]?.day;
+      if (!day) return res.json({ high_intent_communities: [], trending_communities: [], hot_posts: [] });
 
-      const platformHint = String(req.query.platform || '').trim().toLowerCase() || undefined;
-      const communities = await getCommunitiesFromApify({ datasetId, platformHint });
+      const highIntentRes = await pool.query(
+        `
+          SELECT *
+          FROM community_metrics
+          WHERE day = $1 AND intent_score >= $2
+          ORDER BY score DESC
+          LIMIT 10
+        `,
+        [day, cfg.intentThreshold]
+      );
 
-      for (const c of communities) {
-        await pool.query(
-          `
-            INSERT INTO communities (name, platform, member_count, activity_score, keyword_matches, raw, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (name, platform)
-            DO UPDATE SET
-              member_count = EXCLUDED.member_count,
-              activity_score = EXCLUDED.activity_score,
-              keyword_matches = EXCLUDED.keyword_matches,
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-          `,
-          [
-            c.name,
-            c.platform,
-            c.member_count,
-            c.activity_score,
-            c.keyword_matches,
-            c.raw,
-          ]
-        );
-      }
+      const trendingRes = await pool.query(
+        `
+          WITH prev AS (
+            SELECT name, platform, activity_score
+            FROM community_metrics
+            WHERE day = $1::date - INTERVAL '1 day'
+          )
+          SELECT
+            m.*,
+            COALESCE(p.activity_score, 0) AS prev_activity_score
+          FROM community_metrics m
+          LEFT JOIN prev p ON p.name = m.name AND p.platform = m.platform
+          WHERE m.day = $1 AND m.activity_score >= 1
+          ORDER BY (m.activity_score - COALESCE(p.activity_score, 0)) DESC, m.score DESC
+          LIMIT 10
+        `,
+        [day]
+      );
+
+      const hotPostsRes = await pool.query(
+        `
+          SELECT
+            platform,
+            community_name,
+            post_id,
+            views,
+            intent_score,
+            engagement_score,
+            posted_at
+          FROM community_posts
+          WHERE posted_at >= NOW() - INTERVAL '24 hours'
+          ORDER BY (intent_score * 2 + engagement_score) DESC, views DESC
+          LIMIT 10
+        `
+      );
 
       return res.json({
-        ok: true,
-        datasetId,
-        fetched: communities.length,
+        high_intent_communities: highIntentRes.rows || [],
+        trending_communities: trendingRes.rows || [],
+        hot_posts: hotPostsRes.rows || [],
       });
     } catch (err) {
-      console.error('cron intel-sync failed:', err?.message || String(err));
-      return res.status(500).json({ ok: false, error: 'Cron sync failed' });
+      console.error('opportunities failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load opportunities' });
     }
   });
 

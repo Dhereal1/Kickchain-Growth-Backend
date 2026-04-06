@@ -17,10 +17,6 @@ function getKeywordList() {
 
 function normalizeTelegramDatasetItem(item) {
   const text = String(item?.text || '');
-  const keywordList = getKeywordList();
-
-  const lowered = text.toLowerCase();
-  const keywordMatches = keywordList.filter((k) => lowered.includes(k)).length;
 
   const channel =
     String(item?.channel || item?.channelName || item?.chat || item?.name || '')
@@ -34,8 +30,14 @@ function normalizeTelegramDatasetItem(item) {
     platform: 'telegram',
     member_count: views,
     activity_score: views,
-    keyword_matches: keywordMatches,
     raw: item,
+    text,
+    views,
+    post_id:
+      String(item?.id || item?.messageId || item?.message_id || item?.url || '').trim() ||
+      null,
+    posted_at:
+      item?.date || item?.postedAt || item?.timestamp ? new Date(item.date || item.postedAt || item.timestamp).toISOString() : null,
   };
 }
 

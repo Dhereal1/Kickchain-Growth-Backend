@@ -7,6 +7,8 @@ const { processLeaderboardUpdate } = require('./events/leaderboardHype');
 const { createKickchainBot } = require('./bot/kickchainBot');
 const { sendToUsers } = require('./bot/notifyUsers');
 const { registerIntelRoutes } = require('./routes/intelRoutes');
+const { ingestDatasets, aggregateDaily, cleanupOldPosts } = require('./services/intelPipeline');
+const { getIntelConfig } = require('./services/intelConfig');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -202,6 +204,10 @@ async function ensureGrowthSchema() {
       member_count INT,
       activity_score INT,
       keyword_matches INT DEFAULT 0,
+      intent_score INT DEFAULT 0,
+      engagement_score INT DEFAULT 0,
+      score NUMERIC DEFAULT 0,
+      last_seen_at TIMESTAMP,
       raw JSONB,
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
@@ -211,6 +217,59 @@ async function ensureGrowthSchema() {
     'CREATE UNIQUE INDEX IF NOT EXISTS communities_name_platform_uq ON communities (name, platform)'
   );
   await pool.query('DROP INDEX IF EXISTS communities_platform_name_uq');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS community_posts (
+      id BIGSERIAL PRIMARY KEY,
+      platform TEXT NOT NULL,
+      community_name TEXT NOT NULL,
+      post_id TEXT NOT NULL,
+      text TEXT,
+      views INT,
+      posted_at TIMESTAMP,
+      dataset_id TEXT,
+      intent_score INT DEFAULT 0,
+      engagement_score INT DEFAULT 0,
+      frequency_score INT DEFAULT 0,
+      raw JSONB,
+      ingested_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(platform, post_id)
+    );
+  `);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS community_posts_lookup_idx ON community_posts (platform, community_name, posted_at)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS community_metrics (
+      id BIGSERIAL PRIMARY KEY,
+      day DATE NOT NULL,
+      platform TEXT NOT NULL,
+      name TEXT NOT NULL,
+      total_messages INT NOT NULL,
+      activity_score INT NOT NULL,
+      intent_score INT NOT NULL,
+      engagement_score INT NOT NULL,
+      score NUMERIC NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(day, platform, name)
+    );
+  `);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS community_metrics_rank_idx ON community_metrics (day, score DESC)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_runs (
+      id BIGSERIAL PRIMARY KEY,
+      run_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      datasets JSONB,
+      platform TEXT,
+      fetched_items INT DEFAULT 0,
+      inserted_posts INT DEFAULT 0,
+      error TEXT
+    );
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS daily_referral_ranks (
@@ -495,6 +554,126 @@ registerWithApiAlias('get', '/cron/daily-nudge', async (req, res) => {
   } catch (err) {
     console.error('daily-nudge cron failed:', err?.message || String(err));
     return res.status(500).json({ ok: false });
+  }
+});
+
+registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  try {
+    const cfg = getIntelConfig();
+    const datasets =
+      (req.query.datasets ? String(req.query.datasets).split(',') : null) ||
+      cfg.datasetsDefault;
+
+    const platform =
+      String(req.query.platform || '').trim().toLowerCase() ||
+      cfg.platforms[0] ||
+      'telegram';
+
+    const cleanedDatasets = (datasets || [])
+      .map((d) => String(d).trim())
+      .filter(Boolean);
+
+    if (!cleanedDatasets.length) {
+      return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
+    }
+
+    const ingest = await ingestDatasets({
+      pool,
+      ensureGrowthSchema,
+      datasets: cleanedDatasets,
+      platform,
+    });
+
+    const aggregate = await aggregateDaily({ pool, ensureGrowthSchema });
+    const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema });
+
+    return res.json({ ok: true, ingest, aggregate, cleanup });
+  } catch (err) {
+    console.error('intel-sync cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'Cron sync failed' });
+  }
+});
+
+registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  try {
+    const cfg = getIntelConfig();
+    const datasets = cfg.datasetsDefault;
+    if (!datasets.length) {
+      return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
+    }
+
+    const platform = cfg.platforms[0] || 'telegram';
+
+    const ingest = await ingestDatasets({
+      pool,
+      ensureGrowthSchema,
+      datasets,
+      platform,
+    });
+    const aggregate = await aggregateDaily({ pool, ensureGrowthSchema });
+    const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema });
+
+    // Internal alert system (Telegram only; no user DMs)
+    const alertChatId = String(process.env.INTEL_ALERT_TELEGRAM_CHAT_ID || '').trim();
+    const botUsername = String(process.env.BOT_USERNAME || '').trim();
+    if (alertChatId) {
+      try {
+        const opp = await pool.query(
+          `
+            WITH latest_day AS (SELECT MAX(day) AS day FROM community_metrics)
+            SELECT *
+            FROM community_metrics
+            WHERE day = (SELECT day FROM latest_day)
+            ORDER BY score DESC
+            LIMIT 5
+          `
+        );
+
+        const lines = [];
+        lines.push('🔥 Daily Intel Report');
+        lines.push('');
+
+        const top = opp.rows || [];
+        if (!top.length) {
+          lines.push('No communities ranked yet.');
+        } else {
+          lines.push('Top Opportunities:');
+          for (const c of top) {
+            lines.push(
+              `- ${c.name} (${c.platform}) — intent ${c.intent_score}, engagement ${c.engagement_score}, activity ${c.activity_score}`
+            );
+          }
+        }
+
+        lines.push('');
+        lines.push('→ Suggested action: engage manually (no automation).');
+        if (botUsername) {
+          lines.push(`Intel API: https://t.me/${botUsername}`);
+        }
+
+        // Use internal notifier; this sends to a single admin chat only.
+        await sendToUsers([alertChatId], lines.join('\n'));
+      } catch (err) {
+        console.error('intel alert failed:', err?.message || String(err));
+      }
+    }
+
+    return res.json({ ok: true, ingest, aggregate, cleanup, alerted: !!alertChatId });
+  } catch (err) {
+    console.error('intel-full-pipeline cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'Cron pipeline failed' });
   }
 });
 

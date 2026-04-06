@@ -33,7 +33,11 @@ async function sendToUsers(userIds, text, extra) {
   return results;
 }
 
+async function sendToChatId(chatId, text, extra) {
+  return sendToUsers([chatId], text, extra);
+}
+
 module.exports = {
   sendToUsers,
+  sendToChatId,
 };
-
