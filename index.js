@@ -5,6 +5,7 @@ const leaderboardService = require('./services/leaderboardService');
 const { postWeeklyLeaderboard } = require('./jobs/weeklyLeaderboard');
 const { processLeaderboardUpdate } = require('./events/leaderboardHype');
 const { createKickchainBot } = require('./bot/kickchainBot');
+const { sendToUsers } = require('./bot/notifyUsers');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -189,6 +190,17 @@ async function ensureGrowthSchema() {
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS tournaments_title_uq ON tournaments (title)'
   );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_referral_ranks (
+      day DATE NOT NULL,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      rank INT NOT NULL,
+      total_referrals INT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (day, telegram_id)
+    );
+  `);
 }
 
 function registerWithApiAlias(method, path, handler) {
@@ -317,6 +329,150 @@ registerWithApiAlias('get', '/cron/weekly-leaderboard', async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error('weekly-leaderboard cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false });
+  }
+});
+
+registerWithApiAlias('get', '/cron/daily-nudge', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+
+  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  const maxUsers = Number(process.env.DAILY_NUDGE_MAX_USERS || 50);
+  const onlyTop = Number(process.env.DAILY_NUDGE_ONLY_TOP || 10);
+
+  try {
+    await ensureGrowthSchema();
+
+    const newPlayersRes = await pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM users
+       WHERE created_at >= (NOW() AT TIME ZONE 'UTC')::date`
+    );
+    const newPlayers = newPlayersRes.rows[0]?.c ?? 0;
+
+    const todayRes = await pool.query(
+      `SELECT (NOW() AT TIME ZONE 'UTC')::date AS day`
+    );
+    const today = todayRes.rows[0].day;
+
+    const prevDayRes = await pool.query(
+      `SELECT day
+       FROM daily_referral_ranks
+       WHERE day < $1
+       ORDER BY day DESC
+       LIMIT 1`,
+      [today]
+    );
+    const prevDay = prevDayRes.rows[0]?.day || null;
+
+    const currentRanksRes = await pool.query(
+      `
+        WITH ranked AS (
+          SELECT
+            u.telegram_id,
+            COUNT(r.id)::int AS total_referrals,
+            CAST(RANK() OVER (ORDER BY COUNT(r.id) DESC) AS int) AS rank
+          FROM users u
+          LEFT JOIN users r ON r.referred_by = u.referral_code
+          GROUP BY u.telegram_id
+        )
+        SELECT *
+        FROM ranked
+        WHERE rank <= $1
+        ORDER BY rank ASC
+      `,
+      [onlyTop]
+    );
+
+    // Persist today's snapshot for top ranks.
+    for (const row of currentRanksRes.rows) {
+      await pool.query(
+        `
+          INSERT INTO daily_referral_ranks (day, telegram_id, rank, total_referrals)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (day, telegram_id)
+          DO UPDATE SET rank = EXCLUDED.rank, total_referrals = EXCLUDED.total_referrals
+        `,
+        [today, row.telegram_id, row.rank, row.total_referrals]
+      );
+    }
+
+    let previousRanks = new Map();
+    if (prevDay) {
+      const prevRes = await pool.query(
+        `SELECT telegram_id, rank
+         FROM daily_referral_ranks
+         WHERE day = $1`,
+        [prevDay]
+      );
+      previousRanks = new Map(prevRes.rows.map((r) => [String(r.telegram_id), r.rank]));
+    }
+
+    const targets = [];
+    for (const row of currentRanksRes.rows) {
+      const prevRank = previousRanks.get(String(row.telegram_id));
+      if (prevRank && row.rank > prevRank) {
+        targets.push({
+          telegram_id: row.telegram_id,
+          prevRank,
+          rank: row.rank,
+        });
+      }
+    }
+
+    const botUsername = String(process.env.BOT_USERNAME || '').trim();
+    const playNow =
+      botUsername
+        ? `https://t.me/${botUsername}`
+        : 'Open the bot and tap “Play Match”';
+
+    const messagesSent = [];
+    const targetIds = targets.slice(0, maxUsers).map((t) => t.telegram_id);
+    for (const t of targets.slice(0, maxUsers)) {
+      const text =
+        `🔥 New players joined today: ${newPlayers}\n\n` +
+        `You dropped to #${t.rank} on the leaderboard (was #${t.prevRank}).\n\n` +
+        `⚔️ Play now to climb back up:\n${playNow}\n\n` +
+        `What is this?`;
+      messagesSent.push(text);
+    }
+
+    // Send individualized nudges (best-performing moment is after “win”; this is the daily fallback).
+    // If we have no previous snapshot, don't spam; just store ranks for tomorrow.
+    if (!prevDay || !targets.length) {
+      return res.json({
+        ok: true,
+        newPlayers,
+        prevDay,
+        nudged: 0,
+        note: 'No previous snapshot or no drops detected; snapshot updated.',
+      });
+    }
+
+    // Send one-by-one to preserve personalization.
+    let sent = 0;
+    let failed = 0;
+    for (let i = 0; i < targetIds.length; i++) {
+      const id = targetIds[i];
+      const text = messagesSent[i];
+      const r = await sendToUsers([id], text);
+      sent += r.sent;
+      failed += r.failed;
+    }
+
+    return res.json({
+      ok: true,
+      newPlayers,
+      prevDay,
+      nudged: sent,
+      failed,
+    });
+  } catch (err) {
+    console.error('daily-nudge cron failed:', err?.message || String(err));
     return res.status(500).json({ ok: false });
   }
 });

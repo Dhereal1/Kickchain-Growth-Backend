@@ -112,6 +112,27 @@ function createKickchainBot(options) {
   };
 
   const bot = new Telegraf(botToken);
+  const PLAY_MATCH_CB = 'kc_play_match';
+  const REFERRAL_PUSH_CB = 'kc_referral_push';
+  let cachedBotUsername = '';
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const getBotUsername = async (ctx) => {
+    if (cachedBotUsername) return cachedBotUsername;
+    const fromCtx = ctx.botInfo?.username;
+    if (fromCtx) {
+      cachedBotUsername = fromCtx;
+      return cachedBotUsername;
+    }
+    try {
+      const me = await ctx.telegram.getMe();
+      cachedBotUsername = me?.username || '';
+      return cachedBotUsername;
+    } catch {
+      return '';
+    }
+  };
 
   bot.start(async (ctx) => {
     try {
@@ -153,21 +174,96 @@ function createKickchainBot(options) {
       const referralLink = `https://t.me/${botUsername}?start=${data.referral_code}`;
 
       await ctx.reply(
-        `Welcome ${data.username} 🚀\n\n` +
+        `🚀 Welcome to Kickchain\n\n` +
+          `⚔️ Play 1v1 matches and win rewards\n\n` +
+          `👉 Tap below to start your first match\n\n` +
           `🔥 Your referral link:\n${referralLink}\n\n` +
-          `📊 Your Stats:\n` +
-          (data.tier ? `• Tier: ${data.tier}\n` : '') +
-          `• Referrals: ${data.total_referrals}\n` +
-          `• Rank: #${data.rank}\n\n` +
-          (typeof data.wins === 'number' ? `• Wins: ${data.wins}\n` : '') +
-          (typeof data.matches_played === 'number'
-            ? `• Matches: ${data.matches_played}\n\n`
-            : '\n') +
-          `Invite more friends and climb the leaderboard 🏆`
+          `🏆 Invite friends → climb leaderboard → earn more`,
+        {
+          reply_markup: {
+            inline_keyboard: [[{ text: '🎮 Play Match', callback_data: PLAY_MATCH_CB }]],
+          },
+        }
       );
     } catch (err) {
       console.error('Bot request failed:', err?.message || 'Unknown error');
       ctx.reply('Something went wrong ❌');
+    }
+  });
+
+  bot.action(PLAY_MATCH_CB, async (ctx) => {
+    try {
+      await ctx.answerCbQuery('Finding opponent...');
+
+      const telegram_id = ctx.from?.id;
+      if (!telegram_id) return;
+
+      // Immediate action + dopamine loop (no real gameplay needed yet)
+      await ctx.reply('Finding opponent...');
+      await sleep(2500);
+      await ctx.reply('🔥 You won!');
+
+      const stats = await axios.get(`${backendUrl}/user/stats/${telegram_id}`);
+      const data = stats.data || {};
+      const botUsername = await getBotUsername(ctx);
+      const referralLink = botUsername
+        ? `https://t.me/${botUsername}?start=${data.referral_code}`
+        : '';
+
+      await ctx.reply(
+        `🔥 You won your first match!\n\n` +
+          `Invite a friend and earn rewards:\n` +
+          `${referralLink || '(referral link unavailable)'}\n\n` +
+          `🏆 Climb the leaderboard now\n\n` +
+          `What is this?`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📣 Share Referral', callback_data: REFERRAL_PUSH_CB }],
+              [{ text: '🎮 Play Again', callback_data: PLAY_MATCH_CB }],
+            ],
+          },
+        }
+      );
+    } catch (err) {
+      console.error('play_match action failed:', err?.message || 'Unknown error');
+      try {
+        await ctx.answerCbQuery('Failed to create match');
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  bot.action(REFERRAL_PUSH_CB, async (ctx) => {
+    try {
+      await ctx.answerCbQuery('Here is your referral link');
+
+      const telegram_id = ctx.from?.id;
+      if (!telegram_id) return;
+
+      const stats = await axios.get(`${backendUrl}/user/stats/${telegram_id}`);
+      const data = stats.data || {};
+      const botUsername = await getBotUsername(ctx);
+      const referralLink = botUsername
+        ? `https://t.me/${botUsername}?start=${data.referral_code}`
+        : '';
+
+      const shareText =
+        `⚔️ I just won on Kickchain!\n\n` +
+        `Join with my link:\n${referralLink || '(referral link unavailable)'}\n\n` +
+        `🏆 Let’s climb the leaderboard together.`;
+
+      await ctx.reply(
+        `📣 Copy and share this message:\n\n${shareText}`
+      );
+    } catch (err) {
+      console.error('referral_push action failed:', err?.message || 'Unknown error');
+      try {
+        await ctx.answerCbQuery('Failed');
+      } catch {
+        // ignore
+      }
     }
   });
 
