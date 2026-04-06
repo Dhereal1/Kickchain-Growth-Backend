@@ -469,8 +469,13 @@ registerWithApiAlias('get', '/cron/weekly-leaderboard', async (req, res) => {
   const cronHeader = String(req.headers['x-vercel-cron'] || '');
   const secret = (process.env.CRON_SECRET || '').trim();
   const qs = req.query?.secret ? String(req.query.secret) : '';
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
 
-  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
   if (!allowed) return res.sendStatus(401);
 
   try {
@@ -486,8 +491,13 @@ registerWithApiAlias('get', '/cron/daily-nudge', async (req, res) => {
   const cronHeader = String(req.headers['x-vercel-cron'] || '');
   const secret = (process.env.CRON_SECRET || '').trim();
   const qs = req.query?.secret ? String(req.query.secret) : '';
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
 
-  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
   if (!allowed) return res.sendStatus(401);
 
   const maxUsers = Number(process.env.DAILY_NUDGE_MAX_USERS || 50);
@@ -630,7 +640,12 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
   const cronHeader = String(req.headers['x-vercel-cron'] || '');
   const secret = (process.env.CRON_SECRET || '').trim();
   const qs = req.query?.secret ? String(req.query.secret) : '';
-  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
   if (!allowed) return res.sendStatus(401);
 
   try {
@@ -677,7 +692,12 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
   const cronHeader = String(req.headers['x-vercel-cron'] || '');
   const secret = (process.env.CRON_SECRET || '').trim();
   const qs = req.query?.secret ? String(req.query.secret) : '';
-  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
   if (!allowed) return res.sendStatus(401);
 
   try {
