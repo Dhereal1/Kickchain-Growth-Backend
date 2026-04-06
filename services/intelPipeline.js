@@ -219,6 +219,20 @@ function computeCommunityScore({ activity_score, engagement_score, intent_score 
   return Number.isFinite(score) ? score : 0;
 }
 
+function computeConfidenceScore({ intent_score, engagement_score }) {
+  const maxIntent = 5;
+  const maxEngagement = 1000;
+
+  const normalizedIntent = Math.max(0, Math.min(1, Number(intent_score || 0) / maxIntent));
+  const normalizedEngagement = Math.max(
+    0,
+    Math.min(1, Number(engagement_score || 0) / maxEngagement)
+  );
+
+  const confidence = normalizedIntent * 0.6 + normalizedEngagement * 0.4;
+  return Number.isFinite(confidence) ? confidence : 0;
+}
+
 async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
   await ensureGrowthSchema();
 
@@ -257,6 +271,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
   let upserted = 0;
   for (const row of aggRes.rows) {
     const score = computeCommunityScore(row);
+    const confidenceScore = computeConfidenceScore(row);
     const prevRes = await pool.query(
       `SELECT activity_score
        FROM community_metrics
@@ -269,9 +284,9 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
     const r = await pool.query(
       `
         INSERT INTO community_metrics (
-          day, platform, name, total_messages, activity_score, intent_score, engagement_score, score, trend_score
+          day, platform, name, total_messages, activity_score, intent_score, engagement_score, score, trend_score, confidence_score
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
         ON CONFLICT (day, platform, name)
         DO UPDATE SET
           total_messages = EXCLUDED.total_messages,
@@ -279,7 +294,8 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
           intent_score = EXCLUDED.intent_score,
           engagement_score = EXCLUDED.engagement_score,
           score = EXCLUDED.score,
-          trend_score = EXCLUDED.trend_score
+          trend_score = EXCLUDED.trend_score,
+          confidence_score = EXCLUDED.confidence_score
       `,
       [
         targetDay,
@@ -291,6 +307,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
         row.engagement_score,
         score,
         trendScore,
+        confidenceScore,
       ]
     );
     upserted += r.rowCount ? 1 : 0;
@@ -324,4 +341,5 @@ module.exports = {
   aggregateDaily,
   cleanupOldPosts,
   computeCommunityScore,
+  computeConfidenceScore,
 };

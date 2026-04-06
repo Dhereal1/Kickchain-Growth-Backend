@@ -220,6 +220,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           m.activity_score,
           m.intent_score,
           m.engagement_score,
+          m.confidence_score,
           m.score
         FROM community_metrics m
         JOIN latest_day d ON m.day = d.day
@@ -344,10 +345,20 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         sample.length ? sample.reduce((s, x) => s + Number(x.intent_score || 0), 0) / sample.length : 0;
       const avgEng =
         sample.length ? sample.reduce((s, x) => s + Number(x.engagement_score || 0), 0) / sample.length : 0;
-      const confidence = Math.min(
-        1,
-        (Math.min(1, avgIntent / intentCap) * 0.7) + (Math.min(1, avgEng / engagementCap) * 0.3)
-      );
+      const confidenceFromRows = (rows) => {
+        const r = (rows || []).filter((x) => typeof x.confidence_score === 'number');
+        if (!r.length) return null;
+        const avg = r.reduce((s, x) => s + Number(x.confidence_score || 0), 0) / r.length;
+        return Math.max(0, Math.min(1, avg));
+      };
+
+      const confidence =
+        confidenceFromRows(highIntent.slice(0, 10)) ??
+        confidenceFromRows(trending.slice(0, 10)) ??
+        Math.min(
+          1,
+          (Math.min(1, avgIntent / intentCap) * 0.7) + (Math.min(1, avgEng / engagementCap) * 0.3)
+        );
 
       return res.json({
         summary: {

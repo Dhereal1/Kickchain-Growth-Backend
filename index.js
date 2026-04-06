@@ -262,11 +262,13 @@ async function ensureGrowthSchema() {
       engagement_score INT NOT NULL,
       score NUMERIC NOT NULL,
       trend_score INT DEFAULT 0,
+      confidence_score FLOAT DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW(),
       UNIQUE(day, platform, name)
     );
   `);
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS trend_score INT DEFAULT 0");
+  await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS confidence_score FLOAT DEFAULT 0");
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_metrics_rank_idx ON community_metrics (day, score DESC)'
   );
