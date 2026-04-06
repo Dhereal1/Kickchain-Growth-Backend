@@ -1,14 +1,14 @@
 require('dotenv').config();
 const express = require('express');
-const cron = require('node-cron');
 const pool = require('./db/pool');
 const leaderboardService = require('./services/leaderboardService');
 const { postWeeklyLeaderboard } = require('./jobs/weeklyLeaderboard');
 const { processLeaderboardUpdate } = require('./events/leaderboardHype');
+const { createKickchainBot } = require('./bot/kickchainBot');
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 function corsMiddleware(req, res, next) {
   const configured = (process.env.CORS_ORIGIN || '*').trim();
@@ -46,6 +46,63 @@ app.use(corsMiddleware);
 
 function generateReferralCode(telegram_id) {
   return `KC${telegram_id}${Math.floor(Math.random() * 1000)}`;
+}
+
+let botSingleton = null;
+function getBot() {
+  if (botSingleton !== null) return botSingleton;
+  const { bot } = createKickchainBot();
+  botSingleton = bot || null;
+  return botSingleton;
+}
+
+function isValidTelegramWebhook(req) {
+  const secret = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+  if (!secret) return true;
+
+  const header = req.headers['x-telegram-bot-api-secret-token'];
+  if (header && String(header) === secret) return true;
+
+  const qs = req.query?.secret;
+  if (qs && String(qs) === secret) return true;
+
+  return false;
+}
+
+function getPublicBaseUrl(req) {
+  const envUrl = (process.env.PUBLIC_BASE_URL || '').trim();
+  if (envUrl) return envUrl.replace(/\/+$/, '');
+
+  const proto =
+    (req.headers['x-forwarded-proto'] && String(req.headers['x-forwarded-proto']).split(',')[0]) ||
+    'https';
+  const host =
+    (req.headers['x-forwarded-host'] && String(req.headers['x-forwarded-host']).split(',')[0]) ||
+    req.headers.host;
+
+  if (!host) return '';
+  return `${proto}://${host}`.replace(/\/+$/, '');
+}
+
+async function telegramSetWebhook({ webhookUrl }) {
+  const botToken = String(process.env.BOT_TOKEN || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!botToken) return { ok: false, description: 'BOT_TOKEN missing' };
+
+  const secret = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+  const body = {
+    url: webhookUrl,
+    allowed_updates: ['message', 'callback_query'],
+    drop_pending_updates: true,
+  };
+  if (secret) body.secret_token = secret;
+
+  const r = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const json = await r.json().catch(() => null);
+  return json || { ok: false, description: 'Invalid Telegram response' };
 }
 
 function computeTierFromReferrals(totalReferrals) {
@@ -201,6 +258,67 @@ registerWithApiAlias('get', '/health', async (req, res) => {
     service: 'kickchain-backend',
     time: new Date().toISOString(),
   });
+});
+
+// Telegram webhook (Vercel/serverless friendly)
+registerWithApiAlias('get', '/telegram/webhook', async (req, res) => {
+  res.json({ ok: true, bot: !!process.env.BOT_TOKEN });
+});
+
+registerWithApiAlias('post', '/telegram/webhook', async (req, res) => {
+  try {
+    if (!isValidTelegramWebhook(req)) return res.sendStatus(401);
+
+    const bot = getBot();
+    if (!bot) return res.status(503).json({ ok: false, error: 'Bot disabled' });
+
+    await bot.handleUpdate(req.body);
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error('Telegram webhook failed:', err?.message || String(err));
+    return res.sendStatus(200);
+  }
+});
+
+registerWithApiAlias('post', '/telegram/set-webhook', async (req, res) => {
+  const adminKey = (process.env.ADMIN_API_KEY || '').trim();
+  if (adminKey) {
+    const auth = String(req.headers.authorization || '');
+    if (auth !== `Bearer ${adminKey}`) return res.sendStatus(401);
+  }
+
+  const baseUrl = getPublicBaseUrl(req);
+  if (!baseUrl) return res.status(400).json({ ok: false, error: 'Missing base URL' });
+
+  const secret = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+  const webhookUrl = secret
+    ? `${baseUrl}/telegram/webhook?secret=${encodeURIComponent(secret)}`
+    : `${baseUrl}/telegram/webhook`;
+
+  try {
+    const telegram = await telegramSetWebhook({ webhookUrl });
+    return res.json({ ok: true, webhookUrl, telegram });
+  } catch (err) {
+    console.error('set-webhook failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'Failed to set webhook' });
+  }
+});
+
+registerWithApiAlias('get', '/cron/weekly-leaderboard', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+
+  const allowed = cronHeader === '1' || (secret && qs && qs === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  try {
+    await postWeeklyLeaderboard();
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('weekly-leaderboard cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false });
+  }
 });
 
 registerWithApiAlias('get', '/init-db', async (req, res) => {
@@ -688,35 +806,41 @@ registerWithApiAlias('post', '/seed-tournaments', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
 
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-async function shutdown(signal) {
-  console.log(`Received ${signal}, shutting down...`);
-  server.close(() => {
-    console.log('HTTP server closed.');
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
   });
-  try {
-    await pool.end();
-    console.log('DB pool closed.');
-  } catch (err) {
-    console.error('Failed to close DB pool:', err?.message || String(err));
-  } finally {
-    process.exit(0);
+
+  async function shutdown(signal) {
+    console.log(`Received ${signal}, shutting down...`);
+    server.close(() => {
+      console.log('HTTP server closed.');
+    });
+    try {
+      await pool.end();
+      console.log('DB pool closed.');
+    } catch (err) {
+      console.error('Failed to close DB pool:', err?.message || String(err));
+    } finally {
+      process.exit(0);
+    }
+  }
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  // Local-only scheduler (Vercel serverless can't keep a process alive reliably).
+  if (process.env.ENABLE_WEEKLY_LEADERBOARD === 'true' && !process.env.VERCEL) {
+    // eslint-disable-next-line global-require
+    const cron = require('node-cron');
+    const schedule = process.env.WEEKLY_LEADERBOARD_CRON || '0 18 * * 0';
+    cron.schedule(schedule, () => {
+      console.log('Posting weekly leaderboard...');
+      postWeeklyLeaderboard();
+    });
   }
 }
 
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('SIGINT', () => void shutdown('SIGINT'));
-
-// Weekly auto-broadcast (disabled unless explicitly enabled)
-if (process.env.ENABLE_WEEKLY_LEADERBOARD === 'true') {
-  const schedule = process.env.WEEKLY_LEADERBOARD_CRON || '0 18 * * 0';
-  cron.schedule(schedule, () => {
-    console.log('Posting weekly leaderboard...');
-    postWeeklyLeaderboard();
-  });
-}
+module.exports = app;
