@@ -6,6 +6,7 @@ const { postWeeklyLeaderboard } = require('./jobs/weeklyLeaderboard');
 const { processLeaderboardUpdate } = require('./events/leaderboardHype');
 const { createKickchainBot } = require('./bot/kickchainBot');
 const { sendToUsers } = require('./bot/notifyUsers');
+const { registerIntelRoutes } = require('./routes/intelRoutes');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -44,6 +45,8 @@ function corsMiddleware(req, res, next) {
 }
 
 app.use(corsMiddleware);
+
+registerIntelRoutes(app, { pool, ensureGrowthSchema });
 
 function generateReferralCode(telegram_id) {
   return `KC${telegram_id}${Math.floor(Math.random() * 1000)}`;
@@ -189,6 +192,23 @@ async function ensureGrowthSchema() {
 
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS tournaments_title_uq ON tournaments (title)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS communities (
+      id SERIAL PRIMARY KEY,
+      name TEXT,
+      platform TEXT,
+      member_count INT,
+      activity_score INT,
+      keyword_matches INT DEFAULT 0,
+      raw JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS communities_platform_name_uq ON communities (platform, name)'
   );
 
   await pool.query(`
