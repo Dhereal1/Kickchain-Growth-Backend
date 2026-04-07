@@ -642,7 +642,15 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
     const apifyActors = createApifyActors();
 
     const messageExtraction = body.message_extraction !== false;
-    const scrape = body.scrape === true;
+
+    // Default discovery search queries (keep simple; safe defaults).
+    const defaultQueries = [
+      'telegram crypto group',
+      'telegram betting group',
+      'web3 gaming telegram group',
+      'telegram gambling chat',
+      'telegram crypto signals group',
+    ];
 
     const extraction = messageExtraction
       ? await discoverFromMessageExtraction({
@@ -654,9 +662,21 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
         })
       : { ok: true, skipped: true };
 
-    const queries = Array.isArray(body.queries) ? body.queries.map(String).filter(Boolean) : [];
+    const queries = Array.isArray(body.queries)
+      ? body.queries.map(String).filter(Boolean)
+      : defaultQueries;
+
+    const searchEnabled = body.search !== false;
+    const scrape =
+      body.scrape === true || (body.scrape === undefined && searchEnabled && queries.length);
     let search = { ok: true, skipped: true };
-    if (queries.length) {
+    if (searchEnabled && queries.length) {
+      if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
+        return res.status(400).json({
+          ok: false,
+          error: 'APIFY_DISCOVERY_ACTOR_ID is required for search discovery',
+        });
+      }
       const run = await apifyActors.runSearch({ queries });
       const text = JSON.stringify(run.items || []);
       const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
@@ -670,20 +690,29 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
       });
       search.datasetId = run.datasetId;
       search.items = (run.items || []).length;
+      search.queries = queries;
     }
 
     let scrapeResult = { ok: true, skipped: true };
     if (scrape) {
-      scrapeResult = await scrapeDiscoveredCommunities({
-        pool,
-        ensureGrowthSchema,
-        apifyActors,
-        userId,
-        maxScrapes: Number(body.max_scrapes || cfg.maxScrapes),
-        cooldownHours: Number(body.cooldown_hours || cfg.cooldownHours),
-        platform,
-        configOverride: body.configOverride || null,
-      });
+      if (!String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID || '').trim()) {
+        scrapeResult = {
+          ok: false,
+          skipped: true,
+          error: 'APIFY_TELEGRAM_SCRAPER_ACTOR_ID is required to scrape discovered communities',
+        };
+      } else {
+        scrapeResult = await scrapeDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          apifyActors,
+          userId,
+          maxScrapes: Number(body.max_scrapes || cfg.maxScrapes),
+          cooldownHours: Number(body.cooldown_hours || cfg.cooldownHours),
+          platform,
+          configOverride: body.configOverride || null,
+        });
+      }
     }
 
     const rankings = await computeAndStoreCommunityRankings({
