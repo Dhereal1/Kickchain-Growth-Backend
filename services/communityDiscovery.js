@@ -133,6 +133,10 @@ async function scrapeDiscoveredCommunities({
 }) {
   await ensureGrowthSchema();
 
+  const actorCandidates = apifyActors.getTelegramScraperActors
+    ? apifyActors.getTelegramScraperActors()
+    : [];
+
   const candidates = await pool.query(
     `
       SELECT id, community_name, last_scraped_at
@@ -153,24 +157,69 @@ async function scrapeDiscoveredCommunities({
     const name = String(row.community_name || '').trim();
     if (!name) continue;
 
+    if (!actorCandidates.length) {
+      skipped.push({ community: name, reason: 'no_scraper_actors_configured' });
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
     try {
-      // eslint-disable-next-line no-await-in-loop
-      const { datasetId } = await apifyActors.runTelegramScraper({ community: name });
-      if (!datasetId) {
-        skipped.push({ community: name, reason: 'no_dataset_id' });
+      const attempts = [];
+      let success = null;
+
+      for (const candidate of actorCandidates.slice(0, 3)) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const { datasetId } = await apifyActors.runTelegramScraper({
+            community: name,
+            actorId: candidate.actorId,
+          });
+
+          if (!datasetId) {
+            attempts.push({ actor: candidate.key, status: 'failed', reason: 'no_dataset_id' });
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+
+          // Verify dataset has at least 1 item.
+          // eslint-disable-next-line no-await-in-loop
+          const peek = apifyActors.fetchDatasetItems
+            ? await apifyActors.fetchDatasetItems({ datasetId, limit: 1, offset: 0 })
+            : [];
+          const items = Array.isArray(peek) ? peek.length : 0;
+          if (!items) {
+            attempts.push({ actor: candidate.key, status: 'failed', reason: 'empty_dataset' });
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+
+          success = { actor: candidate.key, actor_id: candidate.actorId, datasetId, items };
+          attempts.push({ actor: candidate.key, status: 'success', reason: null });
+          break;
+        } catch (err) {
+          attempts.push({
+            actor: candidate.key,
+            status: 'failed',
+            reason: err?.message || String(err),
+          });
+        }
+      }
+
+      if (!success) {
+        skipped.push({ community: name, reason: 'all_actors_failed', attempts });
         // eslint-disable-next-line no-continue
         continue;
       }
 
-      datasetIds.push(datasetId);
-      scraped.push({ community: name, datasetId });
+      datasetIds.push(success.datasetId);
+      scraped.push({ community: name, actor: success.actor, datasetId: success.datasetId, items: success.items });
 
       // eslint-disable-next-line no-await-in-loop
       await pool.query(
         `UPDATE discovered_communities
          SET last_scraped_at = NOW(), last_dataset_id = $1
          WHERE id = $2`,
-        [String(datasetId), row.id]
+        [String(success.datasetId), row.id]
       );
     } catch (err) {
       skipped.push({ community: name, reason: err?.message || String(err) });

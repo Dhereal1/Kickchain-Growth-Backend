@@ -95,6 +95,30 @@ function buildInputFromTemplate({ templateJson, vars }) {
   return jsonParse(rendered, null);
 }
 
+function getTelegramScraperActorCandidates() {
+  const primary =
+    String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_PRIMARY || '').trim() ||
+    String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID || '').trim();
+  const secondary = String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_SECONDARY || '').trim();
+  const tertiary = String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_TERTIARY || '').trim();
+
+  const raw = [
+    { key: 'primary', actorId: primary },
+    { key: 'secondary', actorId: secondary },
+    { key: 'tertiary', actorId: tertiary },
+  ].filter((x) => x.actorId);
+
+  // De-dupe by actorId but keep first occurrence (priority order).
+  const seen = new Set();
+  const out = [];
+  for (const r of raw) {
+    if (seen.has(r.actorId)) continue;
+    seen.add(r.actorId);
+    out.push(r);
+  }
+  return out;
+}
+
 function createApifyActors() {
   const token = String(process.env.APIFY_API_TOKEN || '').trim();
   if (!token) {
@@ -106,11 +130,14 @@ function createApifyActors() {
       runTelegramScraper: async () => {
         throw new Error('APIFY_API_TOKEN is required');
       },
+      fetchDatasetItems: async () => {
+        throw new Error('APIFY_API_TOKEN is required');
+      },
+      getTelegramScraperActors: () => [],
     };
   }
 
   const discoveryActorId = String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim();
-  const telegramActorId = String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID || '').trim();
   const telegramInputTemplate = String(process.env.APIFY_TELEGRAM_SCRAPER_INPUT_TEMPLATE_JSON || '').trim();
 
   const maxWaitMs = Number(process.env.APIFY_ACTOR_MAX_WAIT_MS || 25000) || 25000;
@@ -200,9 +227,13 @@ function createApifyActors() {
     return { runId: started.runId, datasetId, items };
   }
 
-  async function runTelegramScraper({ community }) {
-    if (!telegramActorId) {
-      throw new Error('APIFY_TELEGRAM_SCRAPER_ACTOR_ID is not set');
+  async function runTelegramScraper({ community, actorId }) {
+    const actor =
+      String(actorId || '').trim() || getTelegramScraperActorCandidates()[0]?.actorId || '';
+    if (!actor) {
+      throw new Error(
+        'APIFY_TELEGRAM_SCRAPER_ACTOR_ID_PRIMARY/APIFY_TELEGRAM_SCRAPER_ACTOR_ID is not set'
+      );
     }
 
     const username = String(community || '').trim();
@@ -221,7 +252,7 @@ function createApifyActors() {
         ],
       };
 
-    const started = await startActorRun({ actorId: telegramActorId, token, input });
+    const started = await startActorRun({ actorId: actor, token, input });
     if (!started.runId) throw new Error('Apify telegram scrape did not return runId');
     const finished = await waitForRun({ runId: started.runId, token, timeoutMs: maxWaitMs });
     const datasetId = finished.datasetId || started.datasetId;
@@ -232,6 +263,9 @@ function createApifyActors() {
     enabled: true,
     runSearch,
     runTelegramScraper,
+    fetchDatasetItems: async ({ datasetId, limit = 1, offset = 0 }) =>
+      fetchDatasetItems({ datasetId, token, limit, offset }),
+    getTelegramScraperActors: () => getTelegramScraperActorCandidates(),
   };
 }
 

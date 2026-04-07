@@ -719,11 +719,18 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
 
     let scrapeResult = { ok: true, skipped: true };
     if (scrape) {
-      if (!String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID || '').trim()) {
+      const anyScraperActor =
+        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_PRIMARY || '').trim() ||
+        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_SECONDARY || '').trim() ||
+        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_TERTIARY || '').trim() ||
+        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID || '').trim();
+
+      if (!anyScraperActor) {
         scrapeResult = {
           ok: false,
           skipped: true,
-          error: 'APIFY_TELEGRAM_SCRAPER_ACTOR_ID is required to scrape discovered communities',
+          error:
+            'APIFY_TELEGRAM_SCRAPER_ACTOR_ID_PRIMARY (or APIFY_TELEGRAM_SCRAPER_ACTOR_ID) is required to scrape discovered communities',
         };
       } else {
         scrapeResult = await scrapeDiscoveredCommunities({
