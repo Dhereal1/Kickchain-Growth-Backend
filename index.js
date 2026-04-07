@@ -664,11 +664,16 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
 
     const queries = Array.isArray(body.queries)
       ? body.queries.map(String).filter(Boolean)
-      : defaultQueries;
+      : Array.isArray(body.searchStringsArray)
+        ? body.searchStringsArray.map(String).filter(Boolean)
+        : defaultQueries;
 
     const searchEnabled = body.search !== false;
     const scrape =
-      body.scrape === true || (body.scrape === undefined && searchEnabled && queries.length);
+      body.scrape_discovered === true ||
+      body.scrapeDiscovered === true ||
+      body.scrape === true ||
+      (body.scrape === undefined && searchEnabled && queries.length);
     let search = { ok: true, skipped: true };
     if (searchEnabled && queries.length) {
       if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {

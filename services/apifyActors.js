@@ -121,13 +121,28 @@ function createApifyActors() {
       throw new Error('APIFY_DISCOVERY_ACTOR_ID is not set');
     }
 
-    const input =
-      jsonParse(process.env.APIFY_DISCOVERY_INPUT_JSON, null) || {
-        queries: Array.isArray(queries) ? queries : [],
-      };
+    const qs = Array.isArray(queries) ? queries : [];
+    const baseInput = jsonParse(process.env.APIFY_DISCOVERY_INPUT_JSON, null) || {};
 
-    // If the actor expects a different field name, use APIFY_DISCOVERY_INPUT_JSON.
-    if (!input.queries && Array.isArray(queries)) input.queries = queries;
+    // Default to a common Google-search actor shape (e.g. apify/google-search-scraper).
+    // Keep it minimal and overrideable via APIFY_DISCOVERY_INPUT_JSON.
+    const input = {
+      maxResultsPerPage: 5,
+      ...baseInput,
+    };
+
+    // Best-effort mapping: support either `searchStringsArray` (common) or `queries` (custom actors).
+    if (Array.isArray(input.searchStringsArray)) {
+      // Keep env-provided input if present.
+    } else if (qs.length) {
+      input.searchStringsArray = qs;
+    }
+
+    if (Array.isArray(input.queries)) {
+      // Keep env-provided input if present.
+    } else if (qs.length) {
+      input.queries = qs;
+    }
 
     const started = await startActorRun({ actorId: discoveryActorId, token, input });
     if (!started.runId) throw new Error('Apify search run did not return runId');
@@ -178,4 +193,3 @@ function createApifyActors() {
 module.exports = {
   createApifyActors,
 };
-
