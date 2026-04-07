@@ -315,6 +315,21 @@ async function ensureGrowthSchema() {
     'CREATE INDEX IF NOT EXISTS community_posts_lookup_idx ON community_posts (platform, community_name, posted_at)'
   );
 
+  // Explicit constraint (requested): makes post uniqueness clear at the schema level.
+  await runOnce('2026-04-07_add_unique_post_constraint', `
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'unique_post'
+      ) THEN
+        ALTER TABLE community_posts
+        ADD CONSTRAINT unique_post UNIQUE (user_id, platform, post_id);
+      END IF;
+    END$$;
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS community_metrics (
       id BIGSERIAL PRIMARY KEY,
