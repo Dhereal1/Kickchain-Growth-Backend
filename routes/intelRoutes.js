@@ -200,14 +200,15 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       const promoKeywords = Array.isArray(body.promo_keywords) ? body.promo_keywords.map(String) : null;
       const activityKeywords = Array.isArray(body.activity_keywords) ? body.activity_keywords.map(String) : null;
       const platforms = Array.isArray(body.platforms) ? body.platforms.map(String) : null;
-      const thresholds = body.thresholds && typeof body.thresholds === 'object' ? body.thresholds : null;
+      const thresholdsObj = body.thresholds && typeof body.thresholds === 'object' ? body.thresholds : null;
+      const thresholdsJson = thresholdsObj ? JSON.stringify(thresholdsObj) : null;
 
       await pool.query(
         `
           INSERT INTO intel_user_configs (
             user_id, datasets, keywords, intent_keywords, promo_keywords, activity_keywords, platforms, thresholds, updated_at
           )
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,NOW())
           ON CONFLICT (user_id)
           DO UPDATE SET
             datasets=COALESCE(EXCLUDED.datasets, intel_user_configs.datasets),
@@ -219,7 +220,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             thresholds=COALESCE(EXCLUDED.thresholds, intel_user_configs.thresholds),
             updated_at=NOW()
         `,
-        [userId, datasets, keywords, intentKeywords, promoKeywords, activityKeywords, platforms, thresholds]
+        [userId, datasets, keywords, intentKeywords, promoKeywords, activityKeywords, platforms, thresholdsJson]
       );
 
       return res.json({ ok: true });
@@ -251,13 +252,39 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       const cfg = getIntelConfig();
       const body = req.body && typeof req.body === 'object' ? req.body : {};
 
+      const userId = req.intelAuth?.isAdmin
+        ? (body.user_id ? Number(body.user_id) : null)
+        : Number(req.intelAuth?.user?.id);
+
+      let userConfig = null;
+      if (userId) {
+        const uc = await pool.query(
+          `SELECT * FROM intel_user_configs WHERE user_id = $1 LIMIT 1`,
+          [userId]
+        );
+        userConfig = uc.rows[0] || null;
+      }
+
+      const configOverride = userConfig
+        ? {
+            keywords: userConfig.keywords,
+            intentKeywords: userConfig.intent_keywords,
+            promoKeywords: userConfig.promo_keywords,
+            activityKeywords: userConfig.activity_keywords,
+          }
+        : null;
+
       const datasets =
         (Array.isArray(body.datasets) ? body.datasets : null) ||
         (req.query.datasetId ? [String(req.query.datasetId)] : null) ||
+        (userConfig?.datasets && Array.isArray(userConfig.datasets) ? userConfig.datasets : null) ||
         cfg.datasetsDefault;
 
       const platform =
         String(body.platform || req.query.platform || '').trim().toLowerCase() ||
+        (userConfig?.platforms && Array.isArray(userConfig.platforms) && userConfig.platforms.length
+          ? String(userConfig.platforms[0]).toLowerCase()
+          : '') ||
         cfg.platforms[0] ||
         'telegram';
 
@@ -278,14 +305,15 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         ensureGrowthSchema,
         datasets: cleanedDatasets,
         platform,
-        userId: req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id),
+        userId,
+        configOverride,
       });
 
       // Aggregate for today after ingestion.
       const aggregate = await aggregateDaily({
         pool,
         ensureGrowthSchema,
-        userId: req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id),
+        userId,
       });
 
       return res.json({ ok: true, ingest, aggregate });

@@ -1,4 +1,6 @@
-require('dotenv').config();
+if (!process.env.VERCEL) {
+  require('dotenv').config({ quiet: true });
+}
 const express = require('express');
 const pool = require('./db/pool');
 const leaderboardService = require('./services/leaderboardService');
@@ -124,6 +126,29 @@ function computeTierFromReferrals(totalReferrals) {
 async function ensureGrowthSchema() {
   // Keep this idempotent and safe to run multiple times.
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      key TEXT PRIMARY KEY,
+      applied_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  async function runOnce(key, statements) {
+    const r = await pool.query(
+      `INSERT INTO schema_migrations (key) VALUES ($1)
+       ON CONFLICT (key) DO NOTHING
+       RETURNING key`,
+      [key]
+    );
+    if (!r.rowCount) return;
+
+    const list = Array.isArray(statements) ? statements : [statements];
+    for (const sql of list) {
+      // eslint-disable-next-line no-await-in-loop
+      await pool.query(sql);
+    }
+  }
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       telegram_id BIGINT UNIQUE NOT NULL,
@@ -227,7 +252,10 @@ async function ensureGrowthSchema() {
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS score NUMERIC DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP");
   // Legacy unique index (single-tenant). Keep it for existing rows with NULL user_id.
-  await pool.query('DROP INDEX IF EXISTS communities_name_platform_uq');
+  await runOnce('2026-04-07_drop_communities_global_unique', [
+    'DROP INDEX IF EXISTS communities_name_platform_uq',
+    'DROP INDEX IF EXISTS communities_platform_name_uq',
+  ]);
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS communities_name_platform_uq ON communities (name, platform) WHERE user_id IS NULL'
   );
@@ -235,7 +263,6 @@ async function ensureGrowthSchema() {
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS communities_user_name_platform_uq ON communities (user_id, name, platform) WHERE user_id IS NOT NULL'
   );
-  await pool.query('DROP INDEX IF EXISTS communities_platform_name_uq');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS community_posts (
@@ -255,18 +282,22 @@ async function ensureGrowthSchema() {
       engagement_score INT DEFAULT 0,
       frequency_score INT DEFAULT 0,
       raw JSONB,
-      ingested_at TIMESTAMP DEFAULT NOW(),
-      UNIQUE(platform, post_id)
+      ingested_at TIMESTAMP DEFAULT NOW()
     );
   `);
   // Allow multi-tenant dedupe (unique per user), keep legacy behavior via partial indexes.
-  await pool.query('ALTER TABLE community_posts DROP CONSTRAINT IF EXISTS community_posts_platform_post_id_key');
+  await runOnce('2026-04-07_migrate_community_posts_uniques', [
+    'ALTER TABLE community_posts DROP CONSTRAINT IF EXISTS community_posts_platform_post_id_key',
+    'DROP INDEX IF EXISTS community_posts_platform_post_uq',
+    'DROP INDEX IF EXISTS community_posts_platform_hash_uq',
+    'DROP INDEX IF EXISTS community_posts_user_platform_post_uq',
+    'DROP INDEX IF EXISTS community_posts_user_platform_hash_uq',
+  ]);
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_hash TEXT");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS promo_score INT DEFAULT 0");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_activity_score INT DEFAULT 0");
   // Legacy uniques (single-tenant). Keep them for NULL user_id rows.
-  await pool.query('DROP INDEX IF EXISTS community_posts_platform_hash_uq');
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_post_uq ON community_posts (platform, post_id) WHERE user_id IS NULL'
   );
@@ -301,12 +332,13 @@ async function ensureGrowthSchema() {
       score NUMERIC NOT NULL,
       trend_score INT DEFAULT 0,
       confidence_score FLOAT DEFAULT 0,
-      created_at TIMESTAMP DEFAULT NOW(),
-      UNIQUE(day, platform, name)
+      created_at TIMESTAMP DEFAULT NOW()
     );
   `);
   // Allow multi-tenant metrics (unique per user).
-  await pool.query('ALTER TABLE community_metrics DROP CONSTRAINT IF EXISTS community_metrics_day_platform_name_key');
+  await runOnce('2026-04-07_drop_community_metrics_global_unique', [
+    'ALTER TABLE community_metrics DROP CONSTRAINT IF EXISTS community_metrics_day_platform_name_key',
+  ]);
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS trend_score INT DEFAULT 0");
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS confidence_score FLOAT DEFAULT 0");
@@ -395,7 +427,7 @@ async function ensureGrowthSchema() {
       id SERIAL PRIMARY KEY,
       user_id INT,
       name TEXT,
-      url TEXT UNIQUE NOT NULL,
+      url TEXT NOT NULL,
       secret TEXT,
       enabled BOOLEAN DEFAULT TRUE,
       last_sent_at TIMESTAMP,
@@ -405,7 +437,9 @@ async function ensureGrowthSchema() {
   `);
   await pool.query("ALTER TABLE intel_webhooks ADD COLUMN IF NOT EXISTS user_id INT");
   // Drop global-unique constraint so multiple users can use the same URL.
-  await pool.query("ALTER TABLE intel_webhooks DROP CONSTRAINT IF EXISTS intel_webhooks_url_key");
+  await runOnce('2026-04-07_drop_intel_webhooks_global_url_unique', [
+    'ALTER TABLE intel_webhooks DROP CONSTRAINT IF EXISTS intel_webhooks_url_key',
+  ]);
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS intel_webhooks_user_url_uq ON intel_webhooks (user_id, url) WHERE user_id IS NOT NULL'
   );
@@ -736,7 +770,13 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
     cronHeader === '1' ||
     (secret && qs && qs === secret) ||
     (secret && token && token === secret);
-  if (!allowed) return res.sendStatus(401);
+  if (!allowed) {
+    return res.status(401).json({
+      ok: false,
+      error: 'unauthorized',
+      hint: 'Vercel Cron calls include x-vercel-cron: 1. For manual tests, pass ?secret=CRON_SECRET or Authorization: Bearer <CRON_SECRET>.',
+    });
+  }
 
   try {
     if (String(process.env.INTEL_SANDBOX || '').trim().toLowerCase() === 'true') {
@@ -838,7 +878,13 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
     cronHeader === '1' ||
     (secret && qs && qs === secret) ||
     (secret && token && token === secret);
-  if (!allowed) return res.sendStatus(401);
+  if (!allowed) {
+    return res.status(401).json({
+      ok: false,
+      error: 'unauthorized',
+      hint: 'Vercel Cron calls include x-vercel-cron: 1. For manual tests, pass ?secret=CRON_SECRET or Authorization: Bearer <CRON_SECRET>.',
+    });
+  }
 
   try {
     if (String(process.env.INTEL_SANDBOX || '').trim().toLowerCase() === 'true') {

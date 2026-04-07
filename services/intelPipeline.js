@@ -296,14 +296,22 @@ function computeSignalScore({ promo_score, content_activity_score, intent_score 
   return Number.isFinite(score) ? score : 0;
 }
 
-function computeConfidenceScore({ intent_score, engagement_score }) {
-  const maxIntent = 5;
-  const maxEngagement = 1000;
+function computeConfidenceScore({ intent_score, engagement_score, total_messages }) {
+  const messages = Math.max(1, Number(total_messages || 0) || 1);
 
-  const normalizedIntent = Math.max(0, Math.min(1, Number(intent_score || 0) / maxIntent));
+  // We aggregate intent/engagement as sums; convert to per-post averages for a stable 0..1 confidence signal.
+  const avgIntentPerPost = (Number(intent_score || 0) || 0) / messages;
+  const avgEngagementPerPost = (Number(engagement_score || 0) || 0) / messages;
+
+  // intent_score is keyword matches (+1 for '?') per post; defaults currently ~0..11.
+  const maxIntentPerPost = 10;
+  // engagement_score is normalized to 0..100 in signalEngine.
+  const maxEngagementPerPost = 100;
+
+  const normalizedIntent = Math.max(0, Math.min(1, avgIntentPerPost / maxIntentPerPost));
   const normalizedEngagement = Math.max(
     0,
-    Math.min(1, Number(engagement_score || 0) / maxEngagement)
+    Math.min(1, avgEngagementPerPost / maxEngagementPerPost)
   );
 
   const confidence = normalizedIntent * 0.6 + normalizedEngagement * 0.4;
