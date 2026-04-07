@@ -248,11 +248,11 @@ function computeConfidenceScore({ intent_score, engagement_score }) {
 async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
   await ensureGrowthSchema();
 
-  const dayDate = day
-    ? String(day)
-    : null;
+  const debug = String(process.env.INTEL_DEBUG || '').trim().toLowerCase() === 'true';
 
-  // Use UTC day boundaries.
+  const dayDate = day ? String(day) : null;
+
+  // Use UTC day boundaries for persistence key, but allow a rolling window when day isn't specified.
   const targetDayRes = await pool.query(
     `SELECT COALESCE($1::date, (NOW() AT TIME ZONE 'UTC')::date) AS day`,
     [dayDate]
@@ -260,12 +260,20 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
   const targetDay = targetDayRes.rows[0].day;
 
   // Aggregate posts ingested for that day.
+  // Root-cause fix for "communitiesAggregated: 0":
+  // many Apify items don't carry a reliable posted_at; fall back to ingested_at and use a 24h window by default.
+  const filterSql = dayDate
+    ? `(COALESCE(posted_at, ingested_at) AT TIME ZONE 'UTC')::date = $1`
+    : `COALESCE(posted_at, ingested_at) >= NOW() - INTERVAL '1 day'`;
+
+  const params = dayDate ? [targetDay] : [];
+
   const aggRes = await pool.query(
     `
-      WITH day_posts AS (
+      WITH window_posts AS (
         SELECT *
         FROM community_posts
-        WHERE (posted_at AT TIME ZONE 'UTC')::date = $1
+        WHERE ${filterSql}
       )
       SELECT
         platform,
@@ -274,11 +282,24 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
         COUNT(*)::int AS activity_score,
         COALESCE(SUM(intent_score), 0)::int AS intent_score,
         COALESCE(SUM(engagement_score), 0)::int AS engagement_score
-      FROM day_posts
+      FROM window_posts
       GROUP BY platform, community_name
     `,
-    [targetDay]
+    params
   );
+
+  if (debug) {
+    try {
+      const countRes = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM community_posts WHERE ${filterSql}`,
+        params
+      );
+      console.log('INTEL_DEBUG post_count_window:', countRes.rows[0]?.c ?? 0);
+      console.log('INTEL_DEBUG aggregated_rows:', aggRes.rows.length);
+    } catch (err) {
+      console.log('INTEL_DEBUG failed:', err?.message || String(err));
+    }
+  }
 
   let upserted = 0;
   for (const row of aggRes.rows) {
