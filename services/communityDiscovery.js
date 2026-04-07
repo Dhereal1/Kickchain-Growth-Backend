@@ -176,7 +176,12 @@ async function scrapeDiscoveredCommunities({
           });
 
           if (!datasetId) {
-            attempts.push({ actor: candidate.key, status: 'failed', reason: 'no_dataset_id' });
+            attempts.push({
+              actor: candidate.key,
+              actor_id: candidate.actorId,
+              status: 'failed',
+              reason: 'no_dataset_id',
+            });
             // eslint-disable-next-line no-continue
             continue;
           }
@@ -188,19 +193,32 @@ async function scrapeDiscoveredCommunities({
             : [];
           const items = Array.isArray(peek) ? peek.length : 0;
           if (!items) {
-            attempts.push({ actor: candidate.key, status: 'failed', reason: 'empty_dataset' });
+            attempts.push({
+              actor: candidate.key,
+              actor_id: candidate.actorId,
+              status: 'failed',
+              reason: 'empty_dataset',
+            });
             // eslint-disable-next-line no-continue
             continue;
           }
 
           success = { actor: candidate.key, actor_id: candidate.actorId, datasetId, items };
-          attempts.push({ actor: candidate.key, status: 'success', reason: null });
-          break;
-        } catch (err) {
           attempts.push({
             actor: candidate.key,
+            actor_id: candidate.actorId,
+            status: 'success',
+            reason: null,
+          });
+          break;
+        } catch (err) {
+          const details = err?.details ? String(err.details).slice(0, 500) : null;
+          attempts.push({
+            actor: candidate.key,
+            actor_id: candidate.actorId,
             status: 'failed',
             reason: err?.message || String(err),
+            details,
           });
         }
       }
@@ -212,7 +230,13 @@ async function scrapeDiscoveredCommunities({
       }
 
       datasetIds.push(success.datasetId);
-      scraped.push({ community: name, actor: success.actor, datasetId: success.datasetId, items: success.items });
+      scraped.push({
+        community: name,
+        actor: success.actor,
+        actor_id: success.actor_id,
+        datasetId: success.datasetId,
+        items: success.items,
+      });
 
       // eslint-disable-next-line no-await-in-loop
       await pool.query(
