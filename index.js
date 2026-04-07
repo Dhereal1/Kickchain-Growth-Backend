@@ -682,7 +682,12 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
           error: 'APIFY_DISCOVERY_ACTOR_ID is required for search discovery',
         });
       }
-      const run = await apifyActors.runSearch({ queries });
+
+      const searchInputOverride = {
+        ...(Number.isFinite(Number(body.maxResultsPerPage)) ? { maxResultsPerPage: Number(body.maxResultsPerPage) } : {}),
+      };
+
+      const run = await apifyActors.runSearch({ queries, input: searchInputOverride });
       const text = JSON.stringify(run.items || []);
       const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
       search = await upsertDiscoveredCommunities({
@@ -730,7 +735,14 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
     return res.json({ ok: true, extraction, search, scrape: scrapeResult, rankings });
   } catch (err) {
     console.error('intel discovery run failed:', err?.message || String(err));
-    return res.status(500).json({ ok: false, error: err?.message || 'discovery_failed' });
+    if (err?.details) {
+      console.error('intel discovery apify details:', String(err.details).slice(0, 2000));
+    }
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || 'discovery_failed',
+      details: err?.details ? String(err.details).slice(0, 2000) : undefined,
+    });
   }
 });
 

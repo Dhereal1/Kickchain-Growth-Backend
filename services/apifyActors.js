@@ -116,7 +116,7 @@ function createApifyActors() {
   const maxWaitMs = Number(process.env.APIFY_ACTOR_MAX_WAIT_MS || 25000) || 25000;
   const datasetFetchLimit = Number(process.env.APIFY_DISCOVERY_DATASET_LIMIT || 200) || 200;
 
-  async function runSearch({ queries }) {
+  async function runSearch({ queries, input: inputOverride = null } = {}) {
     if (!discoveryActorId) {
       throw new Error('APIFY_DISCOVERY_ACTOR_ID is not set');
     }
@@ -126,9 +126,13 @@ function createApifyActors() {
 
     // Default to a common Google-search actor shape (e.g. apify/google-search-scraper).
     // Keep it minimal and overrideable via APIFY_DISCOVERY_INPUT_JSON.
+    const overrideObj =
+      inputOverride && typeof inputOverride === 'object' ? inputOverride : {};
+
     const input = {
       maxResultsPerPage: 5,
       ...baseInput,
+      ...overrideObj,
     };
 
     // Best-effort mapping: support either `searchStringsArray` (common) or `queries` (custom actors).
