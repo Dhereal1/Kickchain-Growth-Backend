@@ -662,11 +662,18 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
         })
       : { ok: true, skipped: true };
 
+    const hasDirectInput = body.input && typeof body.input === 'object' && !Array.isArray(body.input);
+
     const queries = Array.isArray(body.queries)
       ? body.queries.map(String).filter(Boolean)
       : Array.isArray(body.searchStringsArray)
         ? body.searchStringsArray.map(String).filter(Boolean)
-        : defaultQueries;
+        : hasDirectInput && typeof body.input.queries === 'string'
+          ? body.input.queries
+              .split('\n')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : defaultQueries;
 
     const searchEnabled = body.search !== false;
     const scrape =
@@ -683,11 +690,18 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
         });
       }
 
-      const searchInputOverride = {
-        ...(Number.isFinite(Number(body.maxResultsPerPage)) ? { maxResultsPerPage: Number(body.maxResultsPerPage) } : {}),
-      };
+      const searchInputOverride = hasDirectInput
+        ? body.input
+        : {
+            ...(Number.isFinite(Number(body.maxResultsPerPage))
+              ? { maxResultsPerPage: Number(body.maxResultsPerPage) }
+              : {}),
+          };
 
-      const run = await apifyActors.runSearch({ queries, input: searchInputOverride });
+      // If caller provides a direct Apify input object, do not auto-map `queries` into other fields.
+      const run = hasDirectInput
+        ? await apifyActors.runSearch({ queries: [], input: searchInputOverride })
+        : await apifyActors.runSearch({ queries, input: searchInputOverride });
       const text = JSON.stringify(run.items || []);
       const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
       search = await upsertDiscoveredCommunities({
