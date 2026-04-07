@@ -150,8 +150,47 @@ function createApifyActors() {
       if (!input.queries.trim()) input.queries = qs.join('\n');
     }
 
-    const started = await startActorRun({ actorId: discoveryActorId, token, input });
-    if (!started.runId) throw new Error('Apify search run did not return runId');
+    async function startWithOptionalRetry(actorInput) {
+      try {
+        const started = await startActorRun({ actorId: discoveryActorId, token, input: actorInput });
+        if (!started.runId) throw new Error('Apify search run did not return runId');
+        return started;
+      } catch (err) {
+        const msg = String(err?.details || err?.message || '');
+        const parsed = jsonParse(err?.details, null);
+        const detailMsg = String(parsed?.error?.message || msg);
+
+        // One-shot compatibility retry for actors that expect nested `input.queries` string.
+        if (
+          detailMsg.toLowerCase().includes('input.queries') &&
+          (detailMsg.toLowerCase().includes('required') || detailMsg.toLowerCase().includes('must be string'))
+        ) {
+          const retryInput = { ...(actorInput || {}) };
+          const nested = retryInput.input && typeof retryInput.input === 'object' && !Array.isArray(retryInput.input)
+            ? { ...retryInput.input }
+            : {};
+
+          const qStr =
+            (typeof nested.queries === 'string' && nested.queries.trim()) ? nested.queries
+              : (typeof retryInput.queries === 'string' && retryInput.queries.trim()) ? retryInput.queries
+                : qs.join('\n');
+
+          nested.queries = qStr;
+          retryInput.input = nested;
+
+          // Ensure we don't keep an array `queries` around (some actors validate it as string).
+          if (Array.isArray(retryInput.queries)) delete retryInput.queries;
+
+          const started = await startActorRun({ actorId: discoveryActorId, token, input: retryInput });
+          if (!started.runId) throw new Error('Apify search run did not return runId');
+          return started;
+        }
+
+        throw err;
+      }
+    }
+
+    const started = await startWithOptionalRetry(input);
 
     const finished = await waitForRun({ runId: started.runId, token, timeoutMs: maxWaitMs });
     const datasetId = finished.datasetId || started.datasetId;
