@@ -3,6 +3,15 @@ const { fetchApifyDatasetItemsWithRetry, normalizeCommunity } = require('./apify
 const { extractSignals } = require('./signalEngine');
 const { getIntelConfig } = require('./intelConfig');
 
+function jsonStringifySafe(value) {
+  try {
+    return JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+  } catch (err) {
+    // Last-resort fallback: store as a JSON string.
+    return JSON.stringify(String(value));
+  }
+}
+
 function stablePostId({ platform, datasetId, item, normalized }) {
   const explicit = String(normalized?.post_id || '').trim();
   if (explicit) return explicit;
@@ -48,11 +57,14 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
   const runDatasets = datasets.slice(0, maxDatasets);
 
   const run = await pool.query(
-    `INSERT INTO intel_runs (datasets, platform) VALUES ($1, $2) RETURNING id`,
-    [runDatasets, platformHint || null]
+    `INSERT INTO intel_runs (datasets, platform) VALUES ($1::jsonb, $2) RETURNING id`,
+    [jsonStringifySafe(runDatasets), platformHint || null]
   );
   const runId = run.rows[0].id;
-  await pool.query(`UPDATE intel_runs SET dataset_ids = $1 WHERE id = $2`, [runDatasets, runId]);
+  await pool.query(`UPDATE intel_runs SET dataset_ids = $1::jsonb WHERE id = $2`, [
+    jsonStringifySafe(runDatasets),
+    runId,
+  ]);
 
   let fetchedItems = 0;
   let insertedPosts = 0;
@@ -104,7 +116,7 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
               platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
               intent_score, engagement_score, frequency_score, raw
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
             ON CONFLICT DO NOTHING
           `,
           [
@@ -119,7 +131,7 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
             signals.intent_score,
             signals.engagement_score,
             signals.frequency_score,
-            item,
+            jsonStringifySafe(item),
           ]
         );
 
@@ -133,7 +145,7 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
               name, platform, member_count, activity_score, keyword_matches,
               intent_score, engagement_score, score, last_seen_at, raw, updated_at
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9,NOW())
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9::jsonb,NOW())
             ON CONFLICT (name, platform)
             DO UPDATE SET
               member_count = EXCLUDED.member_count,
@@ -154,7 +166,7 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
             signals.intent_score,
             signals.engagement_score,
             0,
-            item,
+            jsonStringifySafe(item),
           ]
         );
         if (communityRes.rowCount) communitiesUpdated += 1;

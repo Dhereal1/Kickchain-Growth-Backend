@@ -7,6 +7,14 @@ function isValidHttpUrl(url) {
   }
 }
 
+function jsonStringifySafe(value) {
+  try {
+    return JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+  } catch (err) {
+    return JSON.stringify(String(value));
+  }
+}
+
 async function postJsonWithTimeout(url, payload, { timeoutMs = 4000, headers = {} } = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -46,9 +54,9 @@ async function dispatchIntelWebhooks({ pool, ensureGrowthSchema, payload, runId 
     try {
       const delivery = await pool.query(
         `INSERT INTO webhook_deliveries (webhook_id, run_id, status, attempts, payload)
-         VALUES ($1, $2, 'pending', 0, $3)
+         VALUES ($1, $2, 'pending', 0, $3::jsonb)
          RETURNING id`,
-        [h.id, runId, payload]
+        [h.id, runId, jsonStringifySafe(payload)]
       );
       const deliveryId = delivery.rows[0].id;
 
