@@ -12,6 +12,14 @@ const { registerIntelRoutes } = require('./routes/intelRoutes');
 const { ingestDatasets, aggregateDaily, cleanupOldPosts } = require('./services/intelPipeline');
 const { getIntelConfig } = require('./services/intelConfig');
 const { dispatchIntelWebhooks } = require('./services/intelWebhooks');
+const { createApifyActors } = require('./services/apifyActors');
+const {
+  discoverFromMessageExtraction,
+  scrapeDiscoveredCommunities,
+  computeAndStoreCommunityRankings,
+  getDiscoveryConfigFromEnv,
+  upsertDiscoveredCommunities,
+} = require('./services/communityDiscovery');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -459,6 +467,60 @@ async function ensureGrowthSchema() {
     'CREATE UNIQUE INDEX IF NOT EXISTS intel_webhooks_user_url_uq ON intel_webhooks (user_id, url) WHERE user_id IS NOT NULL'
   );
 
+  // Community discovery + ranking layer (optional)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS discovered_communities (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT,
+      community_name TEXT NOT NULL,
+      source TEXT NOT NULL,
+      meta JSONB,
+      discovered_at TIMESTAMP DEFAULT NOW(),
+      last_scraped_at TIMESTAMP,
+      last_dataset_id TEXT
+    );
+  `);
+  await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS user_id INT");
+  await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS meta JSONB");
+  await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMP");
+  await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS last_dataset_id TEXT");
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS discovered_communities_uq_legacy ON discovered_communities (community_name) WHERE user_id IS NULL'
+  );
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS discovered_communities_user_uq ON discovered_communities (user_id, community_name) WHERE user_id IS NOT NULL'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS community_rankings (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT,
+      day DATE NOT NULL,
+      platform TEXT NOT NULL,
+      community_name TEXT NOT NULL,
+      total_messages INT NOT NULL DEFAULT 0,
+      total_intent INT NOT NULL DEFAULT 0,
+      avg_intent FLOAT NOT NULL DEFAULT 0,
+      community_score NUMERIC NOT NULL DEFAULT 0,
+      category TEXT NOT NULL DEFAULT 'low',
+      computed_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS user_id INT");
+  await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS total_intent INT NOT NULL DEFAULT 0");
+  await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS avg_intent FLOAT NOT NULL DEFAULT 0");
+  await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS community_score NUMERIC NOT NULL DEFAULT 0");
+  await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'low'");
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_rankings_user_day_platform_name_uq ON community_rankings (user_id, day, platform, community_name) WHERE user_id IS NOT NULL'
+  );
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_rankings_day_platform_name_uq ON community_rankings (day, platform, community_name) WHERE user_id IS NULL'
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS community_rankings_rank_idx ON community_rankings (day, community_score DESC)'
+  );
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS webhook_deliveries (
       id BIGSERIAL PRIMARY KEY,
@@ -558,6 +620,84 @@ registerWithApiAlias('get', '/health', async (req, res) => {
     service: 'kickchain-backend',
     time: new Date().toISOString(),
   });
+});
+
+// Optional: discovery + ranking layer pipeline (manual trigger; keep separate from core pipeline).
+registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+
+    const cfg = getDiscoveryConfigFromEnv();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+    const userId = body.user_id ? Number(body.user_id) : null;
+    const platform = String(body.platform || cfg.platform || 'telegram').toLowerCase();
+
+    const apifyActors = createApifyActors();
+
+    const messageExtraction = body.message_extraction !== false;
+    const scrape = body.scrape === true;
+
+    const extraction = messageExtraction
+      ? await discoverFromMessageExtraction({
+          pool,
+          ensureGrowthSchema,
+          userId,
+          windowHours: Number(body.window_hours || cfg.windowHours),
+          maxPosts: Number(body.max_posts || cfg.maxPosts),
+        })
+      : { ok: true, skipped: true };
+
+    const queries = Array.isArray(body.queries) ? body.queries.map(String).filter(Boolean) : [];
+    let search = { ok: true, skipped: true };
+    if (queries.length) {
+      const run = await apifyActors.runSearch({ queries });
+      const text = JSON.stringify(run.items || []);
+      const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
+      search = await upsertDiscoveredCommunities({
+        pool,
+        ensureGrowthSchema,
+        userId,
+        communities: found,
+        source: 'search',
+        meta: { actor: 'apify_search', datasetId: run.datasetId },
+      });
+      search.datasetId = run.datasetId;
+      search.items = (run.items || []).length;
+    }
+
+    let scrapeResult = { ok: true, skipped: true };
+    if (scrape) {
+      scrapeResult = await scrapeDiscoveredCommunities({
+        pool,
+        ensureGrowthSchema,
+        apifyActors,
+        userId,
+        maxScrapes: Number(body.max_scrapes || cfg.maxScrapes),
+        cooldownHours: Number(body.cooldown_hours || cfg.cooldownHours),
+        platform,
+        configOverride: body.configOverride || null,
+      });
+    }
+
+    const rankings = await computeAndStoreCommunityRankings({
+      pool,
+      ensureGrowthSchema,
+      userId,
+      platform,
+    });
+
+    return res.json({ ok: true, extraction, search, scrape: scrapeResult, rankings });
+  } catch (err) {
+    console.error('intel discovery run failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: err?.message || 'discovery_failed' });
+  }
 });
 
 // Telegram webhook (Vercel/serverless friendly)

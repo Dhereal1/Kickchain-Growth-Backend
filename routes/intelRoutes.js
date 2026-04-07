@@ -4,6 +4,10 @@ const { getIntelConfig } = require('../services/intelConfig');
 const { requireApiKey } = require('../middleware/auth');
 const { requireIntelUser } = require('../middleware/intelUser');
 const crypto = require('crypto');
+const {
+  discoverFromMessageExtraction,
+  computeAndStoreCommunityRankings,
+} = require('../services/communityDiscovery');
 
 function computeRecommendations(topCommunities) {
   const recommendations = [];
@@ -559,6 +563,79 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     } catch (err) {
       console.error('opportunities failed:', err?.message || String(err));
       return res.status(500).json({ ok: false, error: 'Failed to load opportunities' });
+    }
+  });
+
+  router.get('/discovered-communities', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+
+      // Always recompute rankings from existing posts (safe, no ingestion changes).
+      await computeAndStoreCommunityRankings({ pool, ensureGrowthSchema, userId, platform: 'telegram' });
+
+      const latestDayRes = await pool.query(
+        `SELECT MAX(day) AS day FROM community_rankings WHERE ($1::int IS NULL OR user_id = $1)`,
+        [userId]
+      );
+      const day = latestDayRes.rows[0]?.day || null;
+      if (!day) return res.json([]);
+
+      const r = await pool.query(
+        `
+          SELECT
+            community_name AS community,
+            community_score AS score,
+            total_messages,
+            total_intent,
+            avg_intent,
+            category,
+            platform,
+            day
+          FROM community_rankings
+          WHERE ($1::int IS NULL OR user_id = $1)
+            AND day = $2
+            AND platform = 'telegram'
+            AND (total_messages > 10 OR total_intent > 3)
+          ORDER BY community_score DESC
+          LIMIT 100
+        `,
+        [userId, day]
+      );
+
+      return res.json(r.rows || []);
+    } catch (err) {
+      console.error('discovered-communities failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load discovered communities' });
+    }
+  });
+
+  router.post('/discovered-communities/refresh', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+
+      const extraction = await discoverFromMessageExtraction({
+        pool,
+        ensureGrowthSchema,
+        userId,
+        windowHours: 72,
+        maxPosts: 5000,
+      });
+
+      const rankings = await computeAndStoreCommunityRankings({
+        pool,
+        ensureGrowthSchema,
+        userId,
+        platform: 'telegram',
+      });
+
+      return res.json({ ok: true, extraction, rankings });
+    } catch (err) {
+      console.error('discovered-communities refresh failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to refresh discovery' });
     }
   });
 
