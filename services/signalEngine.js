@@ -44,6 +44,18 @@ function extractSignals({ text, views, raw, config }) {
   const safeText = String(text || '');
   const lowered = safeText.toLowerCase();
 
+  if (!safeText || safeText.length < 5) {
+    return {
+      keyword_matches: 0,
+      intent_score: 0,
+      promo_score: 0,
+      content_activity_score: 0,
+      engagement_score: 0,
+      frequency_score: 0,
+      signal_score: 0,
+    };
+  }
+
   const keyword_matches = countMatches(safeText, cfg.keywords);
   const promo_score = cfg.promoKeywords.filter((k) => lowered.includes(String(k))).length;
   const content_activity_score = cfg.activityKeywords.filter((k) =>
