@@ -40,9 +40,11 @@ function extractSignals({ text, views, raw, config }) {
         ),
       }
     : base;
-  const keyword_matches = countMatches(text, cfg.keywords);
 
-  const lowered = String(text || '').toLowerCase();
+  const safeText = String(text || '');
+  const lowered = safeText.toLowerCase();
+
+  const keyword_matches = countMatches(safeText, cfg.keywords);
   const promo_score = cfg.promoKeywords.filter((k) => lowered.includes(String(k))).length;
   const content_activity_score = cfg.activityKeywords.filter((k) =>
     lowered.includes(String(k))
