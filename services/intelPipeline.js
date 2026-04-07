@@ -282,9 +282,15 @@ async function ingestDatasets({
 
 function computeCommunityScore({ activity_score, engagement_score, intent_score }) {
   const a = Number(activity_score || 0);
-  const e = Number(engagement_score || 0);
+  const eSum = Number(engagement_score || 0);
   const i = Number(intent_score || 0);
-  const score = a * 0.4 + e * 0.2 + i * 0.4;
+
+  // engagement_score is aggregated as a SUM across posts; use per-post average so
+  // "broadcast channels with views" don't automatically outrank real conversations.
+  const eAvg = a > 0 ? eSum / a : 0;
+
+  // Keep weights aligned with the intended scoring engine, but apply engagement as avg.
+  const score = a * 0.4 + eAvg * 0.2 + i * 0.4;
   return Number.isFinite(score) ? score : 0;
 }
 
