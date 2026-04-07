@@ -253,9 +253,25 @@ async function computeAndStoreCommunityRankings({
     const communityScore = totalMessages * 0.3 + totalIntent * 2 + avgIntent * 5;
     const category = communityScore >= 50 ? 'high_value' : communityScore >= 15 ? 'medium' : 'low';
 
-    // eslint-disable-next-line no-await-in-loop
-    const r = await pool.query(
+    const isLegacy = userId === null || userId === undefined;
+    const sql = isLegacy
+      ? `
+        INSERT INTO community_rankings (
+          user_id, day, platform, community_name,
+          total_messages, total_intent, avg_intent,
+          community_score, category, computed_at
+        )
+        VALUES (NULL,$1,$2,$3,$4,$5,$6,$7,$8,NOW())
+        ON CONFLICT (day, platform, community_name) WHERE user_id IS NULL
+        DO UPDATE SET
+          total_messages = EXCLUDED.total_messages,
+          total_intent = EXCLUDED.total_intent,
+          avg_intent = EXCLUDED.avg_intent,
+          community_score = EXCLUDED.community_score,
+          category = EXCLUDED.category,
+          computed_at = NOW()
       `
+      : `
         INSERT INTO community_rankings (
           user_id, day, platform, community_name,
           total_messages, total_intent, avg_intent,
@@ -270,19 +286,33 @@ async function computeAndStoreCommunityRankings({
           community_score = EXCLUDED.community_score,
           category = EXCLUDED.category,
           computed_at = NOW()
-      `,
-      [
-        userId,
-        targetDay,
-        platform,
-        row.community_name,
-        totalMessages,
-        totalIntent,
-        avgIntent,
-        communityScore,
-        category,
-      ]
-    );
+      `;
+
+    const params = isLegacy
+      ? [
+          targetDay,
+          platform,
+          row.community_name,
+          totalMessages,
+          totalIntent,
+          avgIntent,
+          communityScore,
+          category,
+        ]
+      : [
+          userId,
+          targetDay,
+          platform,
+          row.community_name,
+          totalMessages,
+          totalIntent,
+          avgIntent,
+          communityScore,
+          category,
+        ];
+
+    // eslint-disable-next-line no-await-in-loop
+    const r = await pool.query(sql, params);
 
     upserted += r.rowCount ? 1 : 0;
   }
@@ -317,4 +347,3 @@ module.exports = {
   computeAndStoreCommunityRankings,
   getDiscoveryConfigFromEnv,
 };
-
