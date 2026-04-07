@@ -29,9 +29,15 @@ function extractSignals({ text, views, raw, config }) {
   const cfg = config
     ? {
         keywords: normalizeList(config.keywords, base.keywords),
-        intentKeywords: normalizeList(config.intentKeywords, base.intentKeywords),
-        promoKeywords: normalizeList(config.promoKeywords, base.promoKeywords),
-        activityKeywords: normalizeList(config.activityKeywords, base.activityKeywords),
+        intentKeywords: normalizeList(
+          config.intentKeywords ?? config.intent_keywords,
+          base.intentKeywords
+        ),
+        promoKeywords: normalizeList(config.promoKeywords ?? config.promo_keywords, base.promoKeywords),
+        activityKeywords: normalizeList(
+          config.activityKeywords ?? config.activity_keywords,
+          base.activityKeywords
+        ),
       }
     : base;
   const keyword_matches = countMatches(text, cfg.keywords);
