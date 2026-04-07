@@ -24,8 +24,15 @@ function extractSignals({ text, views, raw }) {
   const keyword_matches = countMatches(text, cfg.keywords);
 
   const lowered = String(text || '').toLowerCase();
+  const promo_score = cfg.promoKeywords.filter((k) => lowered.includes(String(k))).length;
+  const content_activity_score = cfg.activityKeywords.filter((k) =>
+    lowered.includes(String(k))
+  ).length;
   const baseIntent = cfg.intentKeywords.filter((k) => lowered.includes(String(k))).length;
   const intent_score = baseIntent + (lowered.includes('?') ? 1 : 0);
+
+  const signal_score =
+    promo_score * 0.3 + content_activity_score * 0.5 + intent_score * 1.0;
 
   const engagement_score = computeEngagementScore({ views, raw });
 
@@ -35,8 +42,11 @@ function extractSignals({ text, views, raw }) {
   return {
     keyword_matches,
     intent_score,
+    promo_score,
+    content_activity_score,
     engagement_score,
     frequency_score,
+    signal_score,
   };
 }
 

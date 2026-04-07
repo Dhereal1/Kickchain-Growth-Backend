@@ -294,6 +294,32 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         platforms && platforms.length ? [day, intentThreshold, platforms] : [day, intentThreshold]
       );
 
+      const highActivityRes = await pool.query(
+        `
+          SELECT *
+          FROM community_metrics
+          WHERE day = $1
+            AND content_activity_score >= $2
+            ${platforms && platforms.length ? 'AND platform = ANY($3::text[])' : ''}
+          ORDER BY content_activity_score DESC, score DESC
+          LIMIT 10
+        `,
+        platforms && platforms.length ? [day, 5, platforms] : [day, 5]
+      );
+
+      const promoHeavyRes = await pool.query(
+        `
+          SELECT *
+          FROM community_metrics
+          WHERE day = $1
+            AND promo_score >= $2
+            ${platforms && platforms.length ? 'AND platform = ANY($3::text[])' : ''}
+          ORDER BY promo_score DESC, score DESC
+          LIMIT 10
+        `,
+        platforms && platforms.length ? [day, 5, platforms] : [day, 5]
+      );
+
       const trendingRes = await pool.query(
         `
           SELECT
@@ -328,14 +354,21 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       );
 
       const highIntent = highIntentRes.rows || [];
+      const highActivity = highActivityRes.rows || [];
+      const promoHeavy = promoHeavyRes.rows || [];
       const trending = trendingRes.rows || [];
       const hotPosts = hotPostsRes.rows || [];
 
       const totalOpp =
-        highIntent.length + trending.length + hotPosts.length;
+        highIntent.length + highActivity.length + promoHeavy.length + trending.length + hotPosts.length;
 
       const topPlatform =
-        highIntent[0]?.platform || trending[0]?.platform || hotPosts[0]?.platform || null;
+        highIntent[0]?.platform ||
+        highActivity[0]?.platform ||
+        promoHeavy[0]?.platform ||
+        trending[0]?.platform ||
+        hotPosts[0]?.platform ||
+        null;
 
       // Confidence score (client-facing): normalize intent + engagement against caps.
       const intentCap = 10;
@@ -354,6 +387,8 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
 
       const confidence =
         confidenceFromRows(highIntent.slice(0, 10)) ??
+        confidenceFromRows(highActivity.slice(0, 10)) ??
+        confidenceFromRows(promoHeavy.slice(0, 10)) ??
         confidenceFromRows(trending.slice(0, 10)) ??
         Math.min(
           1,
@@ -367,6 +402,8 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         },
         opportunities: {
           high_intent: highIntent,
+          high_activity: highActivity,
+          promo_heavy: promoHeavy,
           trending: trending,
           hot_posts: hotPosts,
         },

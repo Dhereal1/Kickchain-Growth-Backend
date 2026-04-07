@@ -37,6 +37,16 @@ function getIntelConfig() {
       'play with',
     ];
 
+  const promoKeywords =
+    (json.promo_keywords && Array.isArray(json.promo_keywords) ? json.promo_keywords : null) ||
+    (process.env.INTEL_PROMO_KEYWORDS ? parseCsv(process.env.INTEL_PROMO_KEYWORDS) : null) ||
+    ['join', 'play', 'win', 'earn', 'invite', 'reward', 'contest', 'launch', 'airdrop'];
+
+  const activityKeywords =
+    (json.activity_keywords && Array.isArray(json.activity_keywords) ? json.activity_keywords : null) ||
+    (process.env.INTEL_ACTIVITY_KEYWORDS ? parseCsv(process.env.INTEL_ACTIVITY_KEYWORDS) : null) ||
+    ['game', 'play', 'mission', 'race', 'earn', 'token'];
+
   const platforms =
     (json.platforms && Array.isArray(json.platforms) ? json.platforms : null) ||
     (process.env.INTEL_PLATFORMS ? parseCsv(process.env.INTEL_PLATFORMS) : null) ||
@@ -68,6 +78,8 @@ function getIntelConfig() {
   return {
     keywords: keywords.map((k) => String(k).toLowerCase()),
     intentKeywords: intentKeywords.map((k) => String(k).toLowerCase()),
+    promoKeywords: promoKeywords.map((k) => String(k).toLowerCase()),
+    activityKeywords: activityKeywords.map((k) => String(k).toLowerCase()),
     platforms: platforms.map((p) => String(p).toLowerCase()),
     intentThreshold,
     trendingSpikeRatio,

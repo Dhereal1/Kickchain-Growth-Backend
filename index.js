@@ -206,7 +206,10 @@ async function ensureGrowthSchema() {
       activity_score INT,
       keyword_matches INT DEFAULT 0,
       intent_score INT DEFAULT 0,
+      promo_score INT DEFAULT 0,
+      content_activity_score INT DEFAULT 0,
       engagement_score INT DEFAULT 0,
+      signal_score NUMERIC DEFAULT 0,
       score NUMERIC DEFAULT 0,
       last_seen_at TIMESTAMP,
       raw JSONB,
@@ -215,7 +218,10 @@ async function ensureGrowthSchema() {
     );
   `);
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS intent_score INT DEFAULT 0");
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS promo_score INT DEFAULT 0");
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS content_activity_score INT DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS engagement_score INT DEFAULT 0");
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS signal_score NUMERIC DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS score NUMERIC DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP");
   await pool.query(
@@ -235,6 +241,8 @@ async function ensureGrowthSchema() {
       posted_at TIMESTAMP,
       dataset_id TEXT,
       intent_score INT DEFAULT 0,
+      promo_score INT DEFAULT 0,
+      content_activity_score INT DEFAULT 0,
       engagement_score INT DEFAULT 0,
       frequency_score INT DEFAULT 0,
       raw JSONB,
@@ -243,6 +251,8 @@ async function ensureGrowthSchema() {
     );
   `);
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_hash TEXT");
+  await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS promo_score INT DEFAULT 0");
+  await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_activity_score INT DEFAULT 0");
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_hash_uq ON community_posts (platform, content_hash)'
   );
@@ -259,7 +269,10 @@ async function ensureGrowthSchema() {
       total_messages INT NOT NULL,
       activity_score INT NOT NULL,
       intent_score INT NOT NULL,
+      promo_score INT NOT NULL,
+      content_activity_score INT NOT NULL,
       engagement_score INT NOT NULL,
+      signal_score NUMERIC NOT NULL,
       score NUMERIC NOT NULL,
       trend_score INT DEFAULT 0,
       confidence_score FLOAT DEFAULT 0,
@@ -269,6 +282,9 @@ async function ensureGrowthSchema() {
   `);
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS trend_score INT DEFAULT 0");
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS confidence_score FLOAT DEFAULT 0");
+  await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS promo_score INT NOT NULL DEFAULT 0");
+  await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS content_activity_score INT NOT NULL DEFAULT 0");
+  await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS signal_score NUMERIC NOT NULL DEFAULT 0");
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_metrics_rank_idx ON community_metrics (day, score DESC)'
   );

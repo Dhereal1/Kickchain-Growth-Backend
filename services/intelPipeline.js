@@ -114,9 +114,9 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
           `
             INSERT INTO community_posts (
               platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
-              intent_score, engagement_score, frequency_score, raw
+              intent_score, promo_score, content_activity_score, engagement_score, frequency_score, raw
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
             ON CONFLICT DO NOTHING
           `,
           [
@@ -129,6 +129,8 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
             toTimestamp(normalized.posted_at) || toTimestamp(item?.date || item?.timestamp) || null,
             String(datasetId),
             signals.intent_score,
+            signals.promo_score,
+            signals.content_activity_score,
             signals.engagement_score,
             signals.frequency_score,
             jsonStringifySafe(item),
@@ -143,16 +145,20 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
           `
             INSERT INTO communities (
               name, platform, member_count, activity_score, keyword_matches,
-              intent_score, engagement_score, score, last_seen_at, raw, updated_at
+              intent_score, promo_score, content_activity_score, engagement_score, signal_score, score,
+              last_seen_at, raw, updated_at
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9::jsonb,NOW())
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12::jsonb,NOW())
             ON CONFLICT (name, platform)
             DO UPDATE SET
               member_count = EXCLUDED.member_count,
               activity_score = EXCLUDED.activity_score,
               keyword_matches = EXCLUDED.keyword_matches,
               intent_score = GREATEST(communities.intent_score, EXCLUDED.intent_score),
+              promo_score = GREATEST(communities.promo_score, EXCLUDED.promo_score),
+              content_activity_score = GREATEST(communities.content_activity_score, EXCLUDED.content_activity_score),
               engagement_score = GREATEST(communities.engagement_score, EXCLUDED.engagement_score),
+              signal_score = GREATEST(communities.signal_score, EXCLUDED.signal_score),
               last_seen_at = NOW(),
               raw = EXCLUDED.raw,
               updated_at = NOW()
@@ -164,7 +170,10 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
             Number(normalized.activity_score ?? views) || 0,
             signals.keyword_matches,
             signals.intent_score,
+            signals.promo_score,
+            signals.content_activity_score,
             signals.engagement_score,
+            signals.signal_score,
             0,
             jsonStringifySafe(item),
           ]
@@ -231,6 +240,14 @@ function computeCommunityScore({ activity_score, engagement_score, intent_score 
   return Number.isFinite(score) ? score : 0;
 }
 
+function computeSignalScore({ promo_score, content_activity_score, intent_score }) {
+  const p = Number(promo_score || 0);
+  const a = Number(content_activity_score || 0);
+  const i = Number(intent_score || 0);
+  const score = p * 0.3 + a * 0.5 + i * 1.0;
+  return Number.isFinite(score) ? score : 0;
+}
+
 function computeConfidenceScore({ intent_score, engagement_score }) {
   const maxIntent = 5;
   const maxEngagement = 1000;
@@ -281,6 +298,8 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
         COUNT(*)::int AS total_messages,
         COUNT(*)::int AS activity_score,
         COALESCE(SUM(intent_score), 0)::int AS intent_score,
+        COALESCE(SUM(promo_score), 0)::int AS promo_score,
+        COALESCE(SUM(content_activity_score), 0)::int AS content_activity_score,
         COALESCE(SUM(engagement_score), 0)::int AS engagement_score
       FROM window_posts
       GROUP BY platform, community_name
@@ -304,6 +323,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
   let upserted = 0;
   for (const row of aggRes.rows) {
     const score = computeCommunityScore(row);
+    const signalScore = computeSignalScore(row);
     const confidenceScore = computeConfidenceScore(row);
     const prevRes = await pool.query(
       `SELECT activity_score
@@ -317,15 +337,19 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
     const r = await pool.query(
       `
         INSERT INTO community_metrics (
-          day, platform, name, total_messages, activity_score, intent_score, engagement_score, score, trend_score, confidence_score
+          day, platform, name, total_messages, activity_score, intent_score, promo_score, content_activity_score,
+          engagement_score, signal_score, score, trend_score, confidence_score
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         ON CONFLICT (day, platform, name)
         DO UPDATE SET
           total_messages = EXCLUDED.total_messages,
           activity_score = EXCLUDED.activity_score,
           intent_score = EXCLUDED.intent_score,
+          promo_score = EXCLUDED.promo_score,
+          content_activity_score = EXCLUDED.content_activity_score,
           engagement_score = EXCLUDED.engagement_score,
+          signal_score = EXCLUDED.signal_score,
           score = EXCLUDED.score,
           trend_score = EXCLUDED.trend_score,
           confidence_score = EXCLUDED.confidence_score
@@ -337,7 +361,10 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
         row.total_messages,
         row.activity_score,
         row.intent_score,
+        row.promo_score,
+        row.content_activity_score,
         row.engagement_score,
+        signalScore,
         score,
         trendScore,
         confidenceScore,
@@ -348,9 +375,24 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
     // Keep the master row updated with latest score.
     await pool.query(
       `UPDATE communities
-       SET intent_score=$1, engagement_score=$2, score=$3, updated_at=NOW()
-       WHERE name=$4 AND platform=$5`,
-      [row.intent_score, row.engagement_score, score, row.name, row.platform]
+       SET intent_score=$1,
+           promo_score=$2,
+           content_activity_score=$3,
+           engagement_score=$4,
+           signal_score=$5,
+           score=$6,
+           updated_at=NOW()
+       WHERE name=$7 AND platform=$8`,
+      [
+        row.intent_score,
+        row.promo_score,
+        row.content_activity_score,
+        row.engagement_score,
+        signalScore,
+        score,
+        row.name,
+        row.platform,
+      ]
     );
   }
 
@@ -375,4 +417,5 @@ module.exports = {
   cleanupOldPosts,
   computeCommunityScore,
   computeConfidenceScore,
+  computeSignalScore,
 };
