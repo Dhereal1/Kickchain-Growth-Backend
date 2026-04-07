@@ -2,6 +2,8 @@ const express = require('express');
 const { ingestDatasets, aggregateDaily } = require('../services/intelPipeline');
 const { getIntelConfig } = require('../services/intelConfig');
 const { requireApiKey } = require('../middleware/auth');
+const { requireIntelUser } = require('../middleware/intelUser');
+const crypto = require('crypto');
 
 function computeRecommendations(topCommunities) {
   const recommendations = [];
@@ -32,8 +34,36 @@ function computeRecommendations(topCommunities) {
 
 function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
   const router = express.Router();
+  const requireUser = requireIntelUser({ pool, allowAdmin: true });
 
-  router.post('/webhook', requireApiKey, async (req, res) => {
+  // Admin helper: provision an intel user (multi-tenant).
+  router.post('/admin/users', requireApiKey, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const telegramChatId = body.telegram_chat_id ? String(body.telegram_chat_id).trim() : null;
+      const apiKey =
+        (body.api_key ? String(body.api_key).trim() : '') ||
+        `kc_user_${crypto.randomBytes(16).toString('hex')}`;
+
+      const r = await pool.query(
+        `
+          INSERT INTO intel_users (telegram_chat_id, api_key)
+          VALUES ($1, $2)
+          RETURNING id, telegram_chat_id, api_key, created_at
+        `,
+        [telegramChatId ? Number(telegramChatId) : null, apiKey]
+      );
+
+      return res.json({ ok: true, user: r.rows[0] });
+    } catch (err) {
+      console.error('admin create user failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to create user' });
+    }
+  });
+
+  router.post('/webhook', requireUser, async (req, res) => {
     try {
       await ensureGrowthSchema();
 
@@ -45,14 +75,22 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
 
       if (!url) return res.status(400).json({ ok: false, error: 'url is required' });
 
+      const userId = req.intelAuth?.isAdmin
+        ? (body.user_id ? Number(body.user_id) : null)
+        : Number(req.intelAuth?.user?.id);
+
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: 'user_id is required for admin' });
+      }
+
       await pool.query(
         `
-          INSERT INTO intel_webhooks (name, url, secret, enabled, updated_at)
-          VALUES ($1, $2, $3, $4, NOW())
-          ON CONFLICT (url)
+          INSERT INTO intel_webhooks (user_id, name, url, secret, enabled, updated_at)
+          VALUES ($1, $2, $3, $4, $5, NOW())
+          ON CONFLICT (user_id, url)
           DO UPDATE SET name=EXCLUDED.name, secret=EXCLUDED.secret, enabled=EXCLUDED.enabled, updated_at=NOW()
         `,
-        [name, url, secret, enabled]
+        [userId, name, url, secret, enabled]
       );
 
       return res.json({ ok: true });
@@ -62,15 +100,17 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.get('/runs', requireApiKey, async (req, res) => {
+  router.get('/runs', requireUser, async (req, res) => {
     try {
       await ensureGrowthSchema();
 
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
       const r = await pool.query(
         `
           SELECT
             id,
             run_at,
+            user_id,
             datasets,
             dataset_ids,
             platform,
@@ -83,9 +123,11 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             error_message,
             error
           FROM intel_runs
+          WHERE ($1::int IS NULL OR user_id = $1)
           ORDER BY id DESC
           LIMIT 50
-        `
+        `,
+        [userId]
       );
 
       const runs = r.rows || [];
@@ -111,12 +153,14 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.get('/health', requireApiKey, async (req, res) => {
+  router.get('/health', requireUser, async (req, res) => {
     try {
       await ensureGrowthSchema();
       const cfg = getIntelConfig();
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
       const r = await pool.query(
-        `SELECT * FROM intel_runs ORDER BY id DESC LIMIT 1`
+        `SELECT * FROM intel_runs WHERE ($1::int IS NULL OR user_id = $1) ORDER BY id DESC LIMIT 1`,
+        [userId]
       );
       const last = r.rows[0] || null;
       const lastRunAt = last?.run_at ? new Date(last.run_at).toISOString() : null;
@@ -137,6 +181,51 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     } catch (err) {
       console.error('intel health failed:', err?.message || String(err));
       return res.status(500).json({ ok: false, error: 'Health check failed' });
+    }
+  });
+
+  router.post('/config', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+      if (req.intelAuth?.isAdmin) {
+        return res.status(400).json({ ok: false, error: 'use_user_api_key' });
+      }
+
+      const userId = Number(req.intelAuth.user.id);
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+      const datasets = Array.isArray(body.datasets) ? body.datasets.map(String) : null;
+      const keywords = Array.isArray(body.keywords) ? body.keywords.map(String) : null;
+      const intentKeywords = Array.isArray(body.intent_keywords) ? body.intent_keywords.map(String) : null;
+      const promoKeywords = Array.isArray(body.promo_keywords) ? body.promo_keywords.map(String) : null;
+      const activityKeywords = Array.isArray(body.activity_keywords) ? body.activity_keywords.map(String) : null;
+      const platforms = Array.isArray(body.platforms) ? body.platforms.map(String) : null;
+      const thresholds = body.thresholds && typeof body.thresholds === 'object' ? body.thresholds : null;
+
+      await pool.query(
+        `
+          INSERT INTO intel_user_configs (
+            user_id, datasets, keywords, intent_keywords, promo_keywords, activity_keywords, platforms, thresholds, updated_at
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+          ON CONFLICT (user_id)
+          DO UPDATE SET
+            datasets=COALESCE(EXCLUDED.datasets, intel_user_configs.datasets),
+            keywords=COALESCE(EXCLUDED.keywords, intel_user_configs.keywords),
+            intent_keywords=COALESCE(EXCLUDED.intent_keywords, intel_user_configs.intent_keywords),
+            promo_keywords=COALESCE(EXCLUDED.promo_keywords, intel_user_configs.promo_keywords),
+            activity_keywords=COALESCE(EXCLUDED.activity_keywords, intel_user_configs.activity_keywords),
+            platforms=COALESCE(EXCLUDED.platforms, intel_user_configs.platforms),
+            thresholds=COALESCE(EXCLUDED.thresholds, intel_user_configs.thresholds),
+            updated_at=NOW()
+        `,
+        [userId, datasets, keywords, intentKeywords, promoKeywords, activityKeywords, platforms, thresholds]
+      );
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('intel config failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to save config' });
     }
   });
 
@@ -189,10 +278,15 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         ensureGrowthSchema,
         datasets: cleanedDatasets,
         platform,
+        userId: req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id),
       });
 
       // Aggregate for today after ingestion.
-      const aggregate = await aggregateDaily({ pool, ensureGrowthSchema });
+      const aggregate = await aggregateDaily({
+        pool,
+        ensureGrowthSchema,
+        userId: req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id),
+      });
 
       return res.json({ ok: true, ingest, aggregate });
     } catch (err) {
@@ -201,19 +295,21 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   };
 
-  router.get('/sync-communities', syncHandler);
-  router.post('/sync-communities', syncHandler);
+  router.get('/sync-communities', requireUser, syncHandler);
+  router.post('/sync-communities', requireUser, syncHandler);
 
-  router.get('/today', async (req, res) => {
+  router.get('/today', requireUser, async (req, res) => {
     try {
       await ensureGrowthSchema();
 
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
       const result = await pool.query(`
         WITH latest_day AS (
-          SELECT MAX(day) AS day FROM community_metrics
+          SELECT MAX(day) AS day FROM community_metrics WHERE ($1::int IS NULL OR user_id = $1)
         )
         SELECT
           m.day,
+          m.user_id,
           m.platform,
           m.name,
           m.total_messages,
@@ -224,9 +320,10 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           m.score
         FROM community_metrics m
         JOIN latest_day d ON m.day = d.day
+        WHERE ($1::int IS NULL OR m.user_id = $1)
         ORDER BY m.score DESC
         LIMIT 10
-      `);
+      `, [userId]);
 
       const topCommunities = result.rows || [];
 
@@ -240,7 +337,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.get('/opportunities', requireApiKey, async (req, res) => {
+  router.get('/opportunities', requireUser, async (req, res) => {
     try {
       await ensureGrowthSchema();
 
@@ -249,6 +346,8 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           summary: { total_opportunities: 3, top_platform: 'telegram' },
           opportunities: {
             high_intent: [{ name: '@demo_channel', platform: 'telegram', intent_score: 5, engagement_score: 20, activity_score: 10, trend_score: 5, score: 12 }],
+            high_activity: [{ name: '@demo_activity', platform: 'telegram', content_activity_score: 8, score: 9 }],
+            promo_heavy: [{ name: '@demo_promo', platform: 'telegram', promo_score: 7, score: 8 }],
             trending: [{ name: '@demo_trending', platform: 'telegram', trend_score: 15, activity_score: 20, score: 10 }],
             hot_posts: [{ platform: 'telegram', community_name: '@demo_channel', post_id: 'demo', intent_score: 3, engagement_score: 10, views: 100, posted_at: new Date().toISOString() }],
           },
@@ -257,13 +356,23 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       }
 
       const cfg = getIntelConfig();
-      const clientId = req.query.client_id ? Number(req.query.client_id) : null;
+      const userId = req.intelAuth?.isAdmin
+        ? (req.query.user_id ? Number(req.query.user_id) : null)
+        : Number(req.intelAuth?.user?.id);
+
+      if (!userId && !req.intelAuth?.isAdmin) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+      }
 
       let intentThreshold = cfg.intentThreshold;
       let platforms = cfg.platforms;
-      if (clientId && Number.isFinite(clientId)) {
-        const cr = await pool.query(`SELECT * FROM client_configs WHERE id = $1`, [clientId]);
-        const c = cr.rows[0];
+
+      if (userId) {
+        const uc = await pool.query(
+          `SELECT * FROM intel_user_configs WHERE user_id = $1 LIMIT 1`,
+          [userId]
+        );
+        const c = uc.rows[0];
         if (c?.thresholds?.intent_threshold) {
           intentThreshold = Number(c.thresholds.intent_threshold) || intentThreshold;
         }
@@ -272,12 +381,15 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         }
       }
 
-      const latestDayRes = await pool.query(`SELECT MAX(day) AS day FROM community_metrics`);
+      const latestDayRes = await pool.query(
+        `SELECT MAX(day) AS day FROM community_metrics WHERE user_id = $1`,
+        [userId]
+      );
       const day = latestDayRes.rows[0]?.day;
       if (!day) {
         return res.json({
           summary: { total_opportunities: 0, top_platform: null },
-          opportunities: { high_intent: [], trending: [], hot_posts: [] },
+          opportunities: { high_intent: [], high_activity: [], promo_heavy: [], trending: [], hot_posts: [] },
           metadata: { generated_at: new Date().toISOString(), confidence_score: 0 },
         });
       }
@@ -286,38 +398,40 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         `
           SELECT *
           FROM community_metrics
-          WHERE day = $1 AND intent_score >= $2
-          ${platforms && platforms.length ? 'AND platform = ANY($3::text[])' : ''}
+          WHERE user_id = $1 AND day = $2 AND intent_score >= $3
+          ${platforms && platforms.length ? 'AND platform = ANY($4::text[])' : ''}
           ORDER BY score DESC
           LIMIT 10
         `,
-        platforms && platforms.length ? [day, intentThreshold, platforms] : [day, intentThreshold]
+        platforms && platforms.length
+          ? [userId, day, intentThreshold, platforms]
+          : [userId, day, intentThreshold]
       );
 
       const highActivityRes = await pool.query(
         `
           SELECT *
           FROM community_metrics
-          WHERE day = $1
-            AND content_activity_score >= $2
-            ${platforms && platforms.length ? 'AND platform = ANY($3::text[])' : ''}
+          WHERE user_id = $1 AND day = $2
+            AND content_activity_score >= $3
+            ${platforms && platforms.length ? 'AND platform = ANY($4::text[])' : ''}
           ORDER BY content_activity_score DESC, score DESC
           LIMIT 10
         `,
-        platforms && platforms.length ? [day, 5, platforms] : [day, 5]
+        platforms && platforms.length ? [userId, day, 5, platforms] : [userId, day, 5]
       );
 
       const promoHeavyRes = await pool.query(
         `
           SELECT *
           FROM community_metrics
-          WHERE day = $1
-            AND promo_score >= $2
-            ${platforms && platforms.length ? 'AND platform = ANY($3::text[])' : ''}
+          WHERE user_id = $1 AND day = $2
+            AND promo_score >= $3
+            ${platforms && platforms.length ? 'AND platform = ANY($4::text[])' : ''}
           ORDER BY promo_score DESC, score DESC
           LIMIT 10
         `,
-        platforms && platforms.length ? [day, 5, platforms] : [day, 5]
+        platforms && platforms.length ? [userId, day, 5, platforms] : [userId, day, 5]
       );
 
       const trendingRes = await pool.query(
@@ -325,12 +439,12 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           SELECT
             *
           FROM community_metrics m
-          WHERE m.day = $1 AND m.activity_score >= 1
-          ${platforms && platforms.length ? 'AND m.platform = ANY($2::text[])' : ''}
+          WHERE m.user_id = $1 AND m.day = $2 AND m.activity_score >= 1
+          ${platforms && platforms.length ? 'AND m.platform = ANY($3::text[])' : ''}
           ORDER BY m.trend_score DESC, m.score DESC
           LIMIT 10
         `,
-        platforms && platforms.length ? [day, platforms] : [day]
+        platforms && platforms.length ? [userId, day, platforms] : [userId, day]
       );
 
       const hotPostsRes = await pool.query(
@@ -341,16 +455,18 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             post_id,
             views,
             intent_score,
+            promo_score,
+            content_activity_score,
             engagement_score,
             posted_at
           FROM community_posts
-          WHERE posted_at >= NOW() - INTERVAL '24 hours'
-            ${platforms && platforms.length ? 'AND platform = ANY($1::text[])' : ''}
+          WHERE user_id = $1 AND COALESCE(posted_at, ingested_at) >= NOW() - INTERVAL '24 hours'
+            ${platforms && platforms.length ? 'AND platform = ANY($2::text[])' : ''}
           ORDER BY (intent_score * 2 + engagement_score) DESC, views DESC
           LIMIT 10
         `
         ,
-        platforms && platforms.length ? [platforms] : []
+        platforms && platforms.length ? [userId, platforms] : [userId]
       );
 
       const highIntent = highIntentRes.rows || [];

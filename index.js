@@ -200,6 +200,7 @@ async function ensureGrowthSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS communities (
       id SERIAL PRIMARY KEY,
+      user_id INT,
       name TEXT,
       platform TEXT,
       member_count INT,
@@ -217,6 +218,7 @@ async function ensureGrowthSchema() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS intent_score INT DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS promo_score INT DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS content_activity_score INT DEFAULT 0");
@@ -224,14 +226,21 @@ async function ensureGrowthSchema() {
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS signal_score NUMERIC DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS score NUMERIC DEFAULT 0");
   await pool.query("ALTER TABLE communities ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP");
+  // Legacy unique index (single-tenant). Keep it for existing rows with NULL user_id.
+  await pool.query('DROP INDEX IF EXISTS communities_name_platform_uq');
   await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS communities_name_platform_uq ON communities (name, platform)'
+    'CREATE UNIQUE INDEX IF NOT EXISTS communities_name_platform_uq ON communities (name, platform) WHERE user_id IS NULL'
+  );
+  // Multi-tenant unique index.
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS communities_user_name_platform_uq ON communities (user_id, name, platform) WHERE user_id IS NOT NULL'
   );
   await pool.query('DROP INDEX IF EXISTS communities_platform_name_uq');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS community_posts (
       id BIGSERIAL PRIMARY KEY,
+      user_id INT,
       platform TEXT NOT NULL,
       community_name TEXT NOT NULL,
       post_id TEXT NOT NULL,
@@ -250,11 +259,26 @@ async function ensureGrowthSchema() {
       UNIQUE(platform, post_id)
     );
   `);
+  // Allow multi-tenant dedupe (unique per user), keep legacy behavior via partial indexes.
+  await pool.query('ALTER TABLE community_posts DROP CONSTRAINT IF EXISTS community_posts_platform_post_id_key');
+  await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_hash TEXT");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS promo_score INT DEFAULT 0");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_activity_score INT DEFAULT 0");
+  // Legacy uniques (single-tenant). Keep them for NULL user_id rows.
+  await pool.query('DROP INDEX IF EXISTS community_posts_platform_hash_uq');
   await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_hash_uq ON community_posts (platform, content_hash)'
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_post_uq ON community_posts (platform, post_id) WHERE user_id IS NULL'
+  );
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_hash_uq ON community_posts (platform, content_hash) WHERE user_id IS NULL'
+  );
+  // Multi-tenant uniques.
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_user_platform_post_uq ON community_posts (user_id, platform, post_id) WHERE user_id IS NOT NULL'
+  );
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_user_platform_hash_uq ON community_posts (user_id, platform, content_hash) WHERE user_id IS NOT NULL'
   );
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_posts_lookup_idx ON community_posts (platform, community_name, posted_at)'
@@ -263,6 +287,7 @@ async function ensureGrowthSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS community_metrics (
       id BIGSERIAL PRIMARY KEY,
+      user_id INT,
       day DATE NOT NULL,
       platform TEXT NOT NULL,
       name TEXT NOT NULL,
@@ -280,6 +305,9 @@ async function ensureGrowthSchema() {
       UNIQUE(day, platform, name)
     );
   `);
+  // Allow multi-tenant metrics (unique per user).
+  await pool.query('ALTER TABLE community_metrics DROP CONSTRAINT IF EXISTS community_metrics_day_platform_name_key');
+  await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS trend_score INT DEFAULT 0");
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS confidence_score FLOAT DEFAULT 0");
   await pool.query("ALTER TABLE community_metrics ADD COLUMN IF NOT EXISTS promo_score INT NOT NULL DEFAULT 0");
@@ -288,11 +316,20 @@ async function ensureGrowthSchema() {
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_metrics_rank_idx ON community_metrics (day, score DESC)'
   );
+  // Multi-tenant unique index for metrics.
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_metrics_user_day_platform_name_uq ON community_metrics (user_id, day, platform, name) WHERE user_id IS NOT NULL'
+  );
+  // Legacy metrics unique (NULL user_id).
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_metrics_day_platform_name_uq ON community_metrics (day, platform, name) WHERE user_id IS NULL'
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS intel_runs (
       id BIGSERIAL PRIMARY KEY,
       run_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      user_id INT,
       datasets JSONB,
       dataset_ids JSONB,
       platform TEXT,
@@ -306,12 +343,40 @@ async function ensureGrowthSchema() {
       error TEXT
     );
   `);
+  await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS dataset_ids JSONB");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS error_message TEXT");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS deduped_posts INT DEFAULT 0");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS communities_updated INT DEFAULT 0");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS duration_ms INT DEFAULT 0");
   await pool.query("ALTER TABLE intel_runs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'running'");
+
+  // Multi-tenant intel users/configs (separate from game users table).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_users (
+      id SERIAL PRIMARY KEY,
+      telegram_chat_id BIGINT,
+      api_key TEXT UNIQUE NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_user_configs (
+      id SERIAL PRIMARY KEY,
+      user_id INT NOT NULL REFERENCES intel_users(id) ON DELETE CASCADE,
+      datasets TEXT[],
+      keywords TEXT[],
+      intent_keywords TEXT[],
+      promo_keywords TEXT[],
+      activity_keywords TEXT[],
+      platforms TEXT[],
+      thresholds JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id)
+    );
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS client_configs (
@@ -328,6 +393,7 @@ async function ensureGrowthSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS intel_webhooks (
       id SERIAL PRIMARY KEY,
+      user_id INT,
       name TEXT,
       url TEXT UNIQUE NOT NULL,
       secret TEXT,
@@ -337,12 +403,19 @@ async function ensureGrowthSchema() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query("ALTER TABLE intel_webhooks ADD COLUMN IF NOT EXISTS user_id INT");
+  // Drop global-unique constraint so multiple users can use the same URL.
+  await pool.query("ALTER TABLE intel_webhooks DROP CONSTRAINT IF EXISTS intel_webhooks_url_key");
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS intel_webhooks_user_url_uq ON intel_webhooks (user_id, url) WHERE user_id IS NOT NULL'
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS webhook_deliveries (
       id BIGSERIAL PRIMARY KEY,
       webhook_id INT NOT NULL REFERENCES intel_webhooks(id) ON DELETE CASCADE,
       run_id BIGINT REFERENCES intel_runs(id) ON DELETE SET NULL,
+      user_id INT,
       status TEXT NOT NULL DEFAULT 'pending',
       attempts INT NOT NULL DEFAULT 0,
       last_status_code INT,
@@ -352,6 +425,7 @@ async function ensureGrowthSchema() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query("ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query(
     'CREATE INDEX IF NOT EXISTS webhook_deliveries_run_idx ON webhook_deliveries (run_id, created_at DESC)'
   );
@@ -669,35 +743,85 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
       return res.json({ ok: true, sandbox: true });
     }
 
+    await ensureGrowthSchema();
     const cfg = getIntelConfig();
-    const datasets =
-      (req.query.datasets ? String(req.query.datasets).split(',') : null) ||
-      cfg.datasetsDefault;
 
-    const platform =
-      String(req.query.platform || '').trim().toLowerCase() ||
-      cfg.platforms[0] ||
-      'telegram';
+    const usersRes = await pool.query(
+      'SELECT id, telegram_chat_id FROM intel_users ORDER BY id ASC'
+    );
+    const intelUsers = usersRes.rows || [];
 
-    const cleanedDatasets = (datasets || [])
-      .map((d) => String(d).trim())
-      .filter(Boolean);
+    // Legacy single-tenant fallback when no intel users exist yet.
+    if (!intelUsers.length) {
+      const datasets =
+        (req.query.datasets ? String(req.query.datasets).split(',') : null) ||
+        cfg.datasetsDefault;
 
-    if (!cleanedDatasets.length) {
-      return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
+      const platform =
+        String(req.query.platform || '').trim().toLowerCase() ||
+        cfg.platforms[0] ||
+        'telegram';
+
+      const cleanedDatasets = (datasets || [])
+        .map((d) => String(d).trim())
+        .filter(Boolean);
+
+      if (!cleanedDatasets.length) {
+        return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
+      }
+
+      const ingest = await ingestDatasets({
+        pool,
+        ensureGrowthSchema,
+        datasets: cleanedDatasets,
+        platform,
+        userId: null,
+      });
+
+      const aggregate = await aggregateDaily({ pool, ensureGrowthSchema, userId: null });
+      const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema, userId: null });
+
+      return res.json({ ok: true, legacy: true, ingest, aggregate, cleanup });
     }
 
-    const ingest = await ingestDatasets({
-      pool,
-      ensureGrowthSchema,
-      datasets: cleanedDatasets,
-      platform,
-    });
+    const results = [];
+    for (const u of intelUsers) {
+      const uc = await pool.query(
+        'SELECT * FROM intel_user_configs WHERE user_id = $1 LIMIT 1',
+        [u.id]
+      );
+      const c = uc.rows[0] || {};
 
-    const aggregate = await aggregateDaily({ pool, ensureGrowthSchema });
-    const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema });
+      const datasets = Array.isArray(c.datasets) && c.datasets.length ? c.datasets : cfg.datasetsDefault;
+      const platform = Array.isArray(c.platforms) && c.platforms.length ? String(c.platforms[0]).toLowerCase() : (cfg.platforms[0] || 'telegram');
+      const configOverride = {
+        keywords: c.keywords,
+        intentKeywords: c.intent_keywords,
+        promoKeywords: c.promo_keywords,
+        activityKeywords: c.activity_keywords,
+      };
 
-    return res.json({ ok: true, ingest, aggregate, cleanup });
+      const cleanedDatasets = (datasets || []).map((d) => String(d).trim()).filter(Boolean);
+      if (!cleanedDatasets.length) {
+        results.push({ user_id: u.id, ok: false, error: 'missing_datasets' });
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+
+      const ingest = await ingestDatasets({
+        pool,
+        ensureGrowthSchema,
+        datasets: cleanedDatasets,
+        platform,
+        userId: u.id,
+        configOverride,
+      });
+      const aggregate = await aggregateDaily({ pool, ensureGrowthSchema, userId: u.id });
+      const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema, userId: u.id });
+      results.push({ user_id: u.id, ok: true, ingest, aggregate, cleanup });
+    }
+
+    return res.json({ ok: true, users: results });
   } catch (err) {
     console.error('intel-sync cron failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: 'Cron sync failed' });
@@ -721,105 +845,132 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
       return res.json({ ok: true, sandbox: true });
     }
 
+    await ensureGrowthSchema();
     const cfg = getIntelConfig();
-    const datasets = cfg.datasetsDefault;
-    if (!datasets.length) {
-      return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
-    }
 
-    const platform = cfg.platforms[0] || 'telegram';
+    const usersRes = await pool.query(
+      'SELECT id, telegram_chat_id FROM intel_users ORDER BY id ASC'
+    );
+    const intelUsers = usersRes.rows || [];
 
-    const ingest = await ingestDatasets({
-      pool,
-      ensureGrowthSchema,
-      datasets,
-      platform,
-    });
-    const aggregate = await aggregateDaily({ pool, ensureGrowthSchema });
-    const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema });
+    const results = [];
 
-    // Client webhook output (SaaS-ready)
-    let webhookResult = null;
-    try {
+    // Legacy single-tenant fallback when no intel users exist yet.
+    if (!intelUsers.length) {
+      const datasets = cfg.datasetsDefault;
+      if (!datasets.length) {
+        return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
+      }
+      const platform = cfg.platforms[0] || 'telegram';
+
+      const ingest = await ingestDatasets({ pool, ensureGrowthSchema, datasets, platform, userId: null });
+      const aggregate = await aggregateDaily({ pool, ensureGrowthSchema, userId: null });
+      const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema, userId: null });
+
       const oppRes = await pool.query(
         `
-          WITH latest_day AS (SELECT MAX(day) AS day FROM community_metrics)
+          WITH latest_day AS (SELECT MAX(day) AS day FROM community_metrics WHERE user_id IS NULL)
           SELECT *
           FROM community_metrics
-          WHERE day = (SELECT day FROM latest_day)
+          WHERE user_id IS NULL AND day = (SELECT day FROM latest_day)
           ORDER BY score DESC
           LIMIT 10
         `
       );
       const top = oppRes.rows || [];
-      const payload = {
-        timestamp: new Date().toISOString(),
-        top_opportunities: top,
-      };
-      webhookResult = await dispatchIntelWebhooks({
+
+      const payload = { timestamp: new Date().toISOString(), top_opportunities: top };
+      const webhookResult = await dispatchIntelWebhooks({
         pool,
         ensureGrowthSchema,
         payload,
         runId: ingest?.runId || null,
+        userId: null,
       });
-    } catch (err) {
-      console.error('intel webhook dispatch failed:', err?.message || String(err));
-      webhookResult = { sent: 0, failed: 1 };
+
+      return res.json({ ok: true, legacy: true, ingest, aggregate, cleanup, webhooks: webhookResult });
     }
 
-    // Internal alert system (Telegram only; no user DMs)
-    const alertChatId = String(process.env.INTEL_ALERT_TELEGRAM_CHAT_ID || '').trim();
-    const botUsername = String(process.env.BOT_USERNAME || '').trim();
-    if (alertChatId) {
-      try {
-        const opp = await pool.query(
-          `
-            WITH latest_day AS (SELECT MAX(day) AS day FROM community_metrics)
-            SELECT *
-            FROM community_metrics
-            WHERE day = (SELECT day FROM latest_day)
-            ORDER BY score DESC
-            LIMIT 5
-          `
-        );
+    for (const u of intelUsers) {
+      const uc = await pool.query(
+        'SELECT * FROM intel_user_configs WHERE user_id = $1 LIMIT 1',
+        [u.id]
+      );
+      const c = uc.rows[0] || {};
 
-        const lines = [];
-        lines.push('🔥 Daily Intel Report');
-        lines.push('');
+      const datasets = Array.isArray(c.datasets) && c.datasets.length ? c.datasets : cfg.datasetsDefault;
+      const platform = Array.isArray(c.platforms) && c.platforms.length ? String(c.platforms[0]).toLowerCase() : (cfg.platforms[0] || 'telegram');
 
-        const top = opp.rows || [];
-        if (!top.length) {
-          lines.push('No communities ranked yet.');
-        } else {
-          lines.push('Top Opportunities:');
-          for (const c of top) {
-            lines.push(
-              `- ${c.name} (${c.platform}) — intent ${c.intent_score}, engagement ${c.engagement_score}, activity ${c.activity_score}`
-            );
-          }
-        }
-
-        lines.push('');
-        lines.push('→ Suggested action: engage manually (no automation).');
-        if (botUsername) {
-          lines.push(`Intel API: https://t.me/${botUsername}`);
-        }
-
-        // Use internal notifier; this sends to a single admin chat only.
-        await sendToUsers([alertChatId], lines.join('\n'));
-      } catch (err) {
-        console.error('intel alert failed:', err?.message || String(err));
+      const cleanedDatasets = (datasets || []).map((d) => String(d).trim()).filter(Boolean);
+      if (!cleanedDatasets.length) {
+        results.push({ user_id: u.id, ok: false, error: 'missing_datasets' });
+        // eslint-disable-next-line no-continue
+        continue;
       }
+
+      const ingest = await ingestDatasets({
+        pool,
+        ensureGrowthSchema,
+        datasets: cleanedDatasets,
+        platform,
+        userId: u.id,
+        configOverride,
+      });
+      const aggregate = await aggregateDaily({ pool, ensureGrowthSchema, userId: u.id });
+      const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema, userId: u.id });
+
+      const oppRes = await pool.query(
+        `
+          WITH latest_day AS (SELECT MAX(day) AS day FROM community_metrics WHERE user_id = $1)
+          SELECT *
+          FROM community_metrics
+          WHERE user_id = $1 AND day = (SELECT day FROM latest_day)
+          ORDER BY score DESC
+          LIMIT 10
+        `,
+        [u.id]
+      );
+      const top = oppRes.rows || [];
+
+      const payload = { timestamp: new Date().toISOString(), top_opportunities: top };
+      const webhooks = await dispatchIntelWebhooks({
+        pool,
+        ensureGrowthSchema,
+        payload,
+        runId: ingest?.runId || null,
+        userId: u.id,
+      });
+
+      // Alert user via Telegram if configured
+      let alerted = false;
+      if (u.telegram_chat_id) {
+        try {
+          const lines = [];
+          lines.push('🔥 Daily Intel Report');
+          lines.push('');
+          if (!top.length) {
+            lines.push('No communities ranked yet.');
+          } else {
+            lines.push('Top Opportunities:');
+            for (const row of top.slice(0, 5)) {
+              lines.push(
+                `- ${row.name} (${row.platform}) — intent ${row.intent_score}, activity ${row.content_activity_score}, promo ${row.promo_score}`
+              );
+            }
+          }
+          lines.push('');
+          lines.push('→ Suggested action: engage manually (no automation).');
+          await sendToUsers([u.telegram_chat_id], lines.join('\n'));
+          alerted = true;
+        } catch (err) {
+          console.error('intel user alert failed:', err?.message || String(err));
+        }
+      }
+
+      results.push({ user_id: u.id, ok: true, ingest, aggregate, cleanup, webhooks, alerted });
     }
 
-    return res.json({
-      ok: true,
-      ingest,
-      aggregate,
-      cleanup,
-      webhooks: webhookResult,
-      alerted: !!alertChatId,
-    });
+    return res.json({ ok: true, users: results });
   } catch (err) {
     console.error('intel-full-pipeline cron failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: 'Cron pipeline failed' });

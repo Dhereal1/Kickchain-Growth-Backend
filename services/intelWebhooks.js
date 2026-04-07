@@ -34,11 +34,15 @@ async function postJsonWithTimeout(url, payload, { timeoutMs = 4000, headers = {
   }
 }
 
-async function dispatchIntelWebhooks({ pool, ensureGrowthSchema, payload, runId = null }) {
+async function dispatchIntelWebhooks({ pool, ensureGrowthSchema, payload, runId = null, userId = null }) {
   await ensureGrowthSchema();
 
   const hooks = await pool.query(
-    `SELECT id, url, secret FROM intel_webhooks WHERE enabled = TRUE ORDER BY id ASC`
+    `SELECT id, url, secret
+     FROM intel_webhooks
+     WHERE enabled = TRUE AND ($1::int IS NULL OR user_id = $1)
+     ORDER BY id ASC`,
+    [userId]
   );
 
   const results = { sent: 0, failed: 0 };
@@ -53,10 +57,10 @@ async function dispatchIntelWebhooks({ pool, ensureGrowthSchema, payload, runId 
 
     try {
       const delivery = await pool.query(
-        `INSERT INTO webhook_deliveries (webhook_id, run_id, status, attempts, payload)
-         VALUES ($1, $2, 'pending', 0, $3::jsonb)
+        `INSERT INTO webhook_deliveries (webhook_id, run_id, user_id, status, attempts, payload)
+         VALUES ($1, $2, $3, 'pending', 0, $4::jsonb)
          RETURNING id`,
-        [h.id, runId, jsonStringifySafe(payload)]
+        [h.id, runId, userId, jsonStringifySafe(payload)]
       );
       const deliveryId = delivery.rows[0].id;
 

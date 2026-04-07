@@ -19,8 +19,21 @@ function computeEngagementScore({ views, raw }) {
   return Math.max(0, Math.min(100, score));
 }
 
-function extractSignals({ text, views, raw }) {
-  const cfg = getIntelConfig();
+function normalizeList(values, fallback) {
+  if (!Array.isArray(values) || !values.length) return fallback;
+  return values.map((v) => String(v).toLowerCase()).filter(Boolean);
+}
+
+function extractSignals({ text, views, raw, config }) {
+  const base = getIntelConfig();
+  const cfg = config
+    ? {
+        keywords: normalizeList(config.keywords, base.keywords),
+        intentKeywords: normalizeList(config.intentKeywords, base.intentKeywords),
+        promoKeywords: normalizeList(config.promoKeywords, base.promoKeywords),
+        activityKeywords: normalizeList(config.activityKeywords, base.activityKeywords),
+      }
+    : base;
   const keyword_matches = countMatches(text, cfg.keywords);
 
   const lowered = String(text || '').toLowerCase();

@@ -42,7 +42,14 @@ function toTimestamp(value) {
   return d.toISOString();
 }
 
-async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) {
+async function ingestDatasets({
+  pool,
+  ensureGrowthSchema,
+  datasets,
+  platform,
+  userId = null,
+  configOverride = null,
+}) {
   const token = String(process.env.APIFY_API_TOKEN || '').trim();
   if (!token) throw new Error('APIFY_API_TOKEN is required');
 
@@ -57,8 +64,8 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
   const runDatasets = datasets.slice(0, maxDatasets);
 
   const run = await pool.query(
-    `INSERT INTO intel_runs (datasets, platform) VALUES ($1::jsonb, $2) RETURNING id`,
-    [jsonStringifySafe(runDatasets), platformHint || null]
+    `INSERT INTO intel_runs (user_id, datasets, platform) VALUES ($1, $2::jsonb, $3) RETURNING id`,
+    [userId, jsonStringifySafe(runDatasets), platformHint || null]
   );
   const runId = run.rows[0].id;
   await pool.query(`UPDATE intel_runs SET dataset_ids = $1::jsonb WHERE id = $2`, [
@@ -106,20 +113,21 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
         const text = String(normalized.text || item?.text || '');
         const views = Number(normalized.views ?? item?.views ?? item?.viewCount ?? 0) || 0;
 
-        const signals = extractSignals({ text, views, raw: item });
+        const signals = extractSignals({ text, views, raw: item, config: configOverride });
         const chash = contentHash({ text, communityName: normalized.name });
 
         // Posts table (dedup by platform+post_id)
         const postRes = await pool.query(
           `
             INSERT INTO community_posts (
-              platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
+              user_id, platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
               intent_score, promo_score, content_activity_score, engagement_score, frequency_score, raw
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
             ON CONFLICT DO NOTHING
           `,
           [
+            userId,
             normalized.platform,
             normalized.name,
             postId,
@@ -140,15 +148,16 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
         if (postRes.rowCount) insertedPosts += 1;
         else dedupedPosts += 1;
 
-        // Communities master list (upsert)
-        const communityRes = await pool.query(
-          `
+        // Communities master list (upsert) - handle legacy NULL user_id and multi-tenant user_id.
+        const isLegacy = userId === null || userId === undefined;
+        const communitySql = isLegacy
+          ? `
             INSERT INTO communities (
-              name, platform, member_count, activity_score, keyword_matches,
+              user_id, name, platform, member_count, activity_score, keyword_matches,
               intent_score, promo_score, content_activity_score, engagement_score, signal_score, score,
               last_seen_at, raw, updated_at
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12::jsonb,NOW())
+            VALUES (NULL,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12::jsonb,NOW())
             ON CONFLICT (name, platform)
             DO UPDATE SET
               member_count = EXCLUDED.member_count,
@@ -162,22 +171,61 @@ async function ingestDatasets({ pool, ensureGrowthSchema, datasets, platform }) 
               last_seen_at = NOW(),
               raw = EXCLUDED.raw,
               updated_at = NOW()
-          `,
-          [
-            normalized.name,
-            normalized.platform,
-            Number(normalized.member_count ?? views) || 0,
-            Number(normalized.activity_score ?? views) || 0,
-            signals.keyword_matches,
-            signals.intent_score,
-            signals.promo_score,
-            signals.content_activity_score,
-            signals.engagement_score,
-            signals.signal_score,
-            0,
-            jsonStringifySafe(item),
-          ]
-        );
+          `
+          : `
+            INSERT INTO communities (
+              user_id, name, platform, member_count, activity_score, keyword_matches,
+              intent_score, promo_score, content_activity_score, engagement_score, signal_score, score,
+              last_seen_at, raw, updated_at
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13::jsonb,NOW())
+            ON CONFLICT (user_id, name, platform)
+            DO UPDATE SET
+              member_count = EXCLUDED.member_count,
+              activity_score = EXCLUDED.activity_score,
+              keyword_matches = EXCLUDED.keyword_matches,
+              intent_score = GREATEST(communities.intent_score, EXCLUDED.intent_score),
+              promo_score = GREATEST(communities.promo_score, EXCLUDED.promo_score),
+              content_activity_score = GREATEST(communities.content_activity_score, EXCLUDED.content_activity_score),
+              engagement_score = GREATEST(communities.engagement_score, EXCLUDED.engagement_score),
+              signal_score = GREATEST(communities.signal_score, EXCLUDED.signal_score),
+              last_seen_at = NOW(),
+              raw = EXCLUDED.raw,
+              updated_at = NOW()
+          `;
+
+        const communityParams = isLegacy
+          ? [
+              normalized.name,
+              normalized.platform,
+              Number(normalized.member_count ?? views) || 0,
+              Number(normalized.activity_score ?? views) || 0,
+              signals.keyword_matches,
+              signals.intent_score,
+              signals.promo_score,
+              signals.content_activity_score,
+              signals.engagement_score,
+              signals.signal_score,
+              0,
+              jsonStringifySafe(item),
+            ]
+          : [
+              userId,
+              normalized.name,
+              normalized.platform,
+              Number(normalized.member_count ?? views) || 0,
+              Number(normalized.activity_score ?? views) || 0,
+              signals.keyword_matches,
+              signals.intent_score,
+              signals.promo_score,
+              signals.content_activity_score,
+              signals.engagement_score,
+              signals.signal_score,
+              0,
+              jsonStringifySafe(item),
+            ];
+
+        const communityRes = await pool.query(communitySql, communityParams);
         if (communityRes.rowCount) communitiesUpdated += 1;
       }
     }
@@ -262,7 +310,7 @@ function computeConfidenceScore({ intent_score, engagement_score }) {
   return Number.isFinite(confidence) ? confidence : 0;
 }
 
-async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
+async function aggregateDaily({ pool, ensureGrowthSchema, day, userId = null }) {
   await ensureGrowthSchema();
 
   const debug = String(process.env.INTEL_DEBUG || '').trim().toLowerCase() === 'true';
@@ -285,12 +333,18 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
 
   const params = dayDate ? [targetDay] : [];
 
+  const userWhere =
+    userId === null || userId === undefined
+      ? 'user_id IS NULL'
+      : 'user_id = $' + (params.length + 1);
+  const aggParams = userId === null || userId === undefined ? params : [...params, userId];
+
   const aggRes = await pool.query(
     `
       WITH window_posts AS (
         SELECT *
         FROM community_posts
-        WHERE ${filterSql}
+        WHERE ${filterSql} AND ${userWhere}
       )
       SELECT
         platform,
@@ -304,14 +358,14 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
       FROM window_posts
       GROUP BY platform, community_name
     `,
-    params
+    aggParams
   );
 
   if (debug) {
     try {
       const countRes = await pool.query(
-        `SELECT COUNT(*)::int AS c FROM community_posts WHERE ${filterSql}`,
-        params
+        `SELECT COUNT(*)::int AS c FROM community_posts WHERE ${filterSql} AND ${userWhere}`,
+        aggParams
       );
       console.log('INTEL_DEBUG post_count_window:', countRes.rows[0]?.c ?? 0);
       console.log('INTEL_DEBUG aggregated_rows:', aggRes.rows.length);
@@ -328,19 +382,22 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
     const prevRes = await pool.query(
       `SELECT activity_score
        FROM community_metrics
-       WHERE day = $1::date - INTERVAL '1 day' AND platform=$2 AND name=$3`,
-      [targetDay, row.platform, row.name]
+       WHERE (($1::int IS NULL AND user_id IS NULL) OR user_id = $1)
+         AND day = $2::date - INTERVAL '1 day'
+         AND platform=$3 AND name=$4`,
+      [userId, targetDay, row.platform, row.name]
     );
     const prevActivity = Number(prevRes.rows[0]?.activity_score || 0);
     const trendScore = Number(row.activity_score || 0) - prevActivity;
 
-    const r = await pool.query(
-      `
+    const isLegacy = userId === null || userId === undefined;
+    const metricsSql = isLegacy
+      ? `
         INSERT INTO community_metrics (
-          day, platform, name, total_messages, activity_score, intent_score, promo_score, content_activity_score,
+          user_id, day, platform, name, total_messages, activity_score, intent_score, promo_score, content_activity_score,
           engagement_score, signal_score, score, trend_score, confidence_score
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        VALUES (NULL,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         ON CONFLICT (day, platform, name)
         DO UPDATE SET
           total_messages = EXCLUDED.total_messages,
@@ -353,23 +410,61 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
           score = EXCLUDED.score,
           trend_score = EXCLUDED.trend_score,
           confidence_score = EXCLUDED.confidence_score
-      `,
-      [
-        targetDay,
-        row.platform,
-        row.name,
-        row.total_messages,
-        row.activity_score,
-        row.intent_score,
-        row.promo_score,
-        row.content_activity_score,
-        row.engagement_score,
-        signalScore,
-        score,
-        trendScore,
-        confidenceScore,
-      ]
-    );
+      `
+      : `
+        INSERT INTO community_metrics (
+          user_id, day, platform, name, total_messages, activity_score, intent_score, promo_score, content_activity_score,
+          engagement_score, signal_score, score, trend_score, confidence_score
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        ON CONFLICT (user_id, day, platform, name)
+        DO UPDATE SET
+          total_messages = EXCLUDED.total_messages,
+          activity_score = EXCLUDED.activity_score,
+          intent_score = EXCLUDED.intent_score,
+          promo_score = EXCLUDED.promo_score,
+          content_activity_score = EXCLUDED.content_activity_score,
+          engagement_score = EXCLUDED.engagement_score,
+          signal_score = EXCLUDED.signal_score,
+          score = EXCLUDED.score,
+          trend_score = EXCLUDED.trend_score,
+          confidence_score = EXCLUDED.confidence_score
+      `;
+
+    const metricsParams = isLegacy
+      ? [
+          targetDay,
+          row.platform,
+          row.name,
+          row.total_messages,
+          row.activity_score,
+          row.intent_score,
+          row.promo_score,
+          row.content_activity_score,
+          row.engagement_score,
+          signalScore,
+          score,
+          trendScore,
+          confidenceScore,
+        ]
+      : [
+          userId,
+          targetDay,
+          row.platform,
+          row.name,
+          row.total_messages,
+          row.activity_score,
+          row.intent_score,
+          row.promo_score,
+          row.content_activity_score,
+          row.engagement_score,
+          signalScore,
+          score,
+          trendScore,
+          confidenceScore,
+        ];
+
+    const r = await pool.query(metricsSql, metricsParams);
     upserted += r.rowCount ? 1 : 0;
 
     // Keep the master row updated with latest score.
@@ -382,7 +477,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
            signal_score=$5,
            score=$6,
            updated_at=NOW()
-       WHERE name=$7 AND platform=$8`,
+       WHERE (($7::int IS NULL AND user_id IS NULL) OR user_id=$7) AND name=$8 AND platform=$9`,
       [
         row.intent_score,
         row.promo_score,
@@ -390,6 +485,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
         row.engagement_score,
         signalScore,
         score,
+        userId,
         row.name,
         row.platform,
       ]
@@ -399,14 +495,16 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day }) {
   return { day: targetDay, communitiesAggregated: upserted };
 }
 
-async function cleanupOldPosts({ pool, ensureGrowthSchema }) {
+async function cleanupOldPosts({ pool, ensureGrowthSchema, userId = null }) {
   await ensureGrowthSchema();
   const cfg = getIntelConfig();
 
   const ttlDays = Math.max(1, Number(cfg.postTtlDays) || 30);
   const r = await pool.query(
-    `DELETE FROM community_posts WHERE ingested_at < NOW() - ($1::int * INTERVAL '1 day')`,
-    [ttlDays]
+    `DELETE FROM community_posts
+     WHERE ingested_at < NOW() - ($1::int * INTERVAL '1 day')
+       AND ($2::int IS NULL OR user_id = $2)`,
+    [ttlDays, userId]
   );
   return { deletedPosts: r.rowCount || 0, ttlDays };
 }
