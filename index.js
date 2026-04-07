@@ -854,7 +854,7 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
         datasets: cleanedDatasets,
         platform,
         userId: u.id,
-        configOverride,
+        configOverride: c,
       });
       const aggregate = await aggregateDaily({ pool, ensureGrowthSchema, userId: u.id });
       const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema, userId: u.id });
