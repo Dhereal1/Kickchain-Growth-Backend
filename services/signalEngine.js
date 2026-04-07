@@ -50,7 +50,18 @@ function extractSignals({ text, views, raw, config }) {
     lowered.includes(String(k))
   ).length;
   const baseIntent = cfg.intentKeywords.filter((k) => lowered.includes(String(k))).length;
-  const intent_score = baseIntent + (lowered.includes('?') ? 1 : 0);
+
+  // Strong "real conversation" intent rule (transactional / request language).
+  const hasRealIntent =
+    lowered.includes('mua') || // buy (VN)
+    lowered.includes('bán') || // sell (VN)
+    lowered.includes('buy') ||
+    lowered.includes('sell') ||
+    lowered.includes('looking for') ||
+    lowered.includes('need') ||
+    lowered.includes('anyone');
+
+  const intent_score = hasRealIntent ? 5 : baseIntent + (lowered.includes('?') ? 1 : 0);
 
   const signal_score =
     promo_score * 0.3 + content_activity_score * 0.5 + intent_score * 1.0;
