@@ -142,10 +142,12 @@ function createApifyActors() {
       input.searchStringsArray = qs;
     }
 
-    if (Array.isArray(input.queries)) {
-      // Keep env-provided input if present.
-    } else if (qs.length) {
-      input.queries = qs;
+    // IMPORTANT: Do NOT auto-set `input.queries` to an array.
+    // Some Apify actors (including popular search actors) define `queries` as a single string
+    // (often newline-separated). Sending an array triggers "input.queries must be string".
+    if (typeof input.queries === 'string' && qs.length) {
+      // If user provided an empty string, populate it; otherwise leave as-is.
+      if (!input.queries.trim()) input.queries = qs.join('\n');
     }
 
     const started = await startActorRun({ actorId: discoveryActorId, token, input });
