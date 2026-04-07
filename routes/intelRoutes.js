@@ -87,7 +87,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         `
           INSERT INTO intel_webhooks (user_id, name, url, secret, enabled, updated_at)
           VALUES ($1, $2, $3, $4, $5, NOW())
-          ON CONFLICT (user_id, url)
+          ON CONFLICT (user_id, url) WHERE user_id IS NOT NULL
           DO UPDATE SET name=EXCLUDED.name, secret=EXCLUDED.secret, enabled=EXCLUDED.enabled, updated_at=NOW()
         `,
         [userId, name, url, secret, enabled]

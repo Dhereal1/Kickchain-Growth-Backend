@@ -158,7 +158,7 @@ async function ingestDatasets({
               last_seen_at, raw, updated_at
             )
             VALUES (NULL,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12::jsonb,NOW())
-            ON CONFLICT (name, platform)
+            ON CONFLICT (name, platform) WHERE user_id IS NULL
             DO UPDATE SET
               member_count = EXCLUDED.member_count,
               activity_score = EXCLUDED.activity_score,
@@ -179,7 +179,7 @@ async function ingestDatasets({
               last_seen_at, raw, updated_at
             )
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13::jsonb,NOW())
-            ON CONFLICT (user_id, name, platform)
+            ON CONFLICT (user_id, name, platform) WHERE user_id IS NOT NULL
             DO UPDATE SET
               member_count = EXCLUDED.member_count,
               activity_score = EXCLUDED.activity_score,
@@ -406,7 +406,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day, userId = null }) 
           engagement_score, signal_score, score, trend_score, confidence_score
         )
         VALUES (NULL,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (day, platform, name)
+        ON CONFLICT (day, platform, name) WHERE user_id IS NULL
         DO UPDATE SET
           total_messages = EXCLUDED.total_messages,
           activity_score = EXCLUDED.activity_score,
@@ -425,7 +425,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day, userId = null }) 
           engagement_score, signal_score, score, trend_score, confidence_score
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-        ON CONFLICT (user_id, day, platform, name)
+        ON CONFLICT (user_id, day, platform, name) WHERE user_id IS NOT NULL
         DO UPDATE SET
           total_messages = EXCLUDED.total_messages,
           activity_score = EXCLUDED.activity_score,
