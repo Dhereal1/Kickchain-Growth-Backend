@@ -24,7 +24,18 @@ function getIntelConfig() {
   const intentKeywords =
     (json.intent_keywords && Array.isArray(json.intent_keywords) ? json.intent_keywords : null) ||
     (process.env.INTEL_INTENT_KEYWORDS ? parseCsv(process.env.INTEL_INTENT_KEYWORDS) : null) ||
-    ['any game', 'recommend', 'looking for', 'what to play'];
+    [
+      'any game',
+      'recommend',
+      'what to play',
+      'looking for',
+      'who plays',
+      'new game',
+      'suggest',
+      'need a game',
+      'any bot',
+      'play with',
+    ];
 
   const platforms =
     (json.platforms && Array.isArray(json.platforms) ? json.platforms : null) ||

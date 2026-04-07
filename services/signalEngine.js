@@ -22,7 +22,11 @@ function computeEngagementScore({ views, raw }) {
 function extractSignals({ text, views, raw }) {
   const cfg = getIntelConfig();
   const keyword_matches = countMatches(text, cfg.keywords);
-  const intent_score = countMatches(text, cfg.intentKeywords);
+
+  const lowered = String(text || '').toLowerCase();
+  const baseIntent = cfg.intentKeywords.filter((k) => lowered.includes(String(k))).length;
+  const intent_score = baseIntent + (lowered.includes('?') ? 1 : 0);
+
   const engagement_score = computeEngagementScore({ views, raw });
 
   // frequency_score is per-post and becomes meaningful when aggregated.
@@ -39,4 +43,3 @@ function extractSignals({ text, views, raw }) {
 module.exports = {
   extractSignals,
 };
-
