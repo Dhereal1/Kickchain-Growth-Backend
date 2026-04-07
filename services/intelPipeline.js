@@ -103,6 +103,16 @@ async function ingestDatasets({
         const normalized = normalizeCommunity(item, platformHint);
         if (!normalized?.name || !normalized?.platform || normalized.platform === 'unknown') continue;
 
+        // Telegram: focus on groups/chats (conversation sources) and ignore channel-style broadcasts.
+        // Prefer explicit type hints from the dataset when present, otherwise fall back to a stable heuristic:
+        // Telegram "views" are typically channel-only; group messages usually have 0/undefined views.
+        if (normalized.platform === 'telegram') {
+          const rawType = String(item?.type || item?.chatType || item?.chat_type || '').toLowerCase();
+          const viewsHint = Number(normalized.views ?? item?.views ?? item?.viewCount ?? 0) || 0;
+          const isChannel = rawType === 'channel' || viewsHint > 0;
+          if (isChannel) continue;
+        }
+
         const postId = stablePostId({
           platform: normalized.platform,
           datasetId,
