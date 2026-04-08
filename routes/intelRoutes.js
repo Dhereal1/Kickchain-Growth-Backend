@@ -8,6 +8,12 @@ const {
   discoverFromMessageExtraction,
   computeAndStoreCommunityRankings,
 } = require('../services/communityDiscovery');
+const {
+  analyzeCommunity,
+  computeMessagesHash,
+  getCachedCommunityAnalysis,
+  upsertCommunityAnalysis,
+} = require('../services/aiAnalysis');
 
 function computeRecommendations(topCommunities) {
   const recommendations = [];
@@ -571,6 +577,11 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       await ensureGrowthSchema();
 
       const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+      const includeAi =
+        String(req.query.include_ai || req.query.ai || '').trim() === '1' ||
+        String(req.query.include_ai || req.query.ai || '').toLowerCase() === 'true';
+      const aiLimitRaw = req.query.ai_limit != null ? Number(req.query.ai_limit) : 10;
+      const aiLimit = Math.max(0, Math.min(50, Number.isFinite(aiLimitRaw) ? aiLimitRaw : 10));
 
       // Always recompute rankings from existing posts (safe, no ingestion changes).
       await computeAndStoreCommunityRankings({ pool, ensureGrowthSchema, userId, platform: 'telegram' });
@@ -604,10 +615,136 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         [userId, day]
       );
 
-      return res.json(r.rows || []);
+      const rows = r.rows || [];
+      if (!includeAi) return res.json(rows);
+
+      const keyPresent = !!String(process.env.OPENAI_API_KEY || '').trim();
+      if (!keyPresent) return res.json(rows.map((x) => ({ ...x, ai: { skipped: true, reason: 'OPENAI_API_KEY missing' } })));
+
+      const analyzed = [];
+      for (let i = 0; i < rows.length; i += 1) {
+        const row = rows[i];
+        if (aiLimit && analyzed.length >= aiLimit) {
+          analyzed.push({ ...row, ai: { skipped: true, reason: 'ai_limit' } });
+          continue;
+        }
+
+        const comm = String(row.community || '').trim();
+        if (!comm) {
+          analyzed.push({ ...row, ai: { skipped: true, reason: 'missing_community' } });
+          continue;
+        }
+
+        // Pull up to 10 recent messages (lightweight, post-processing only).
+        const m = await pool.query(
+          `
+            SELECT text
+            FROM community_posts
+            WHERE platform = 'telegram'
+              AND community_name = $1
+              AND ($2::int IS NULL OR user_id = $2)
+            ORDER BY posted_at DESC NULLS LAST, ingested_at DESC
+            LIMIT 10
+          `,
+          [comm, userId]
+        );
+        const messages = (m.rows || []).map((x) => x.text).filter(Boolean);
+        if (!messages.length) {
+          analyzed.push({ ...row, ai: { skipped: true, reason: 'no_messages' } });
+          continue;
+        }
+
+        const model = String(process.env.OPENAI_MODEL || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+        const messagesHash = computeMessagesHash(messages);
+        const cached = await getCachedCommunityAnalysis({
+          pool,
+          ensureGrowthSchema,
+          userId,
+          platform: 'telegram',
+          communityName: comm,
+          messagesHash,
+        });
+
+        if (cached?.analysis) {
+          analyzed.push({ ...row, ai: { ...cached.analysis, cached: true } });
+          continue;
+        }
+
+        try {
+          const ai = await analyzeCommunity({ communityName: comm, messages, model });
+          await upsertCommunityAnalysis({
+            pool,
+            ensureGrowthSchema,
+            userId,
+            platform: 'telegram',
+            communityName: comm,
+            messagesHash,
+            model,
+            analysis: ai,
+          });
+          analyzed.push({ ...row, ai: { ...ai, cached: false } });
+        } catch (err) {
+          analyzed.push({ ...row, ai: { skipped: true, reason: err?.message || 'analysis_failed' } });
+        }
+      }
+
+      return res.json(analyzed);
     } catch (err) {
       console.error('discovered-communities failed:', err?.message || String(err));
       return res.status(500).json({ ok: false, error: 'Failed to load discovered communities' });
+    }
+  });
+
+  router.post('/analyze-community', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const community = String(body.community || '').trim();
+      const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+      const messages = rawMessages.slice(0, 10);
+
+      if (!community) return res.status(400).json({ ok: false, error: 'community is required' });
+      if (!messages.length) return res.status(400).json({ ok: false, error: 'messages must be a non-empty array' });
+
+      const userId = req.intelAuth?.isAdmin
+        ? (body.user_id ? Number(body.user_id) : null)
+        : Number(req.intelAuth?.user?.id);
+
+      const model = String(process.env.OPENAI_MODEL || body.model || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+      const messagesHash = computeMessagesHash(messages);
+
+      const cached = await getCachedCommunityAnalysis({
+        pool,
+        ensureGrowthSchema,
+        userId,
+        platform: 'telegram',
+        communityName: community,
+        messagesHash,
+      });
+
+      if (cached?.analysis) {
+        return res.json({ ok: true, community, ai: cached.analysis, cached: true });
+      }
+
+      const ai = await analyzeCommunity({ communityName: community, messages, model });
+      await upsertCommunityAnalysis({
+        pool,
+        ensureGrowthSchema,
+        userId,
+        platform: 'telegram',
+        communityName: community,
+        messagesHash,
+        model,
+        analysis: ai,
+      });
+
+      return res.json({ ok: true, community, ai, cached: false });
+    } catch (err) {
+      console.error('analyze-community failed:', err?.message || String(err));
+      const msg = String(err?.message || 'Failed to analyze community');
+      const status = err?.code === 'OPENAI_KEY_MISSING' ? 503 : 500;
+      return res.status(status).json({ ok: false, error: msg });
     }
   });
 

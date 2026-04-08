@@ -522,6 +522,43 @@ async function ensureGrowthSchema() {
   );
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS community_ai_analyses (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT,
+      platform TEXT NOT NULL,
+      community_name TEXT NOT NULL,
+      model TEXT,
+      messages_hash TEXT,
+      quality_score FLOAT,
+      intent_detected BOOLEAN,
+      category TEXT,
+      recommended_action TEXT,
+      summary TEXT,
+      analysis JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS user_id INT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS model TEXT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS messages_hash TEXT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS quality_score FLOAT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS intent_detected BOOLEAN");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS category TEXT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS recommended_action TEXT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS summary TEXT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS analysis JSONB NOT NULL DEFAULT '{}'::jsonb");
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_ai_analyses_user_uq ON community_ai_analyses (user_id, platform, community_name) WHERE user_id IS NOT NULL'
+  );
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_ai_analyses_legacy_uq ON community_ai_analyses (platform, community_name) WHERE user_id IS NULL'
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS community_ai_analyses_lookup_idx ON community_ai_analyses (platform, community_name, updated_at DESC)'
+  );
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS webhook_deliveries (
       id BIGSERIAL PRIMARY KEY,
       webhook_id INT NOT NULL REFERENCES intel_webhooks(id) ON DELETE CASCADE,
