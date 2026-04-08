@@ -663,9 +663,23 @@ registerWithApiAlias('get', '/health', async (req, res) => {
 registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
   const auth = String(req.headers.authorization || '');
   const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
-  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  const adminKey = String(process.env.INTEL_API_KEY || '').trim();
+
+  let isAdmin = false;
+  let authUser = null;
+
+  if (token && adminKey && token === adminKey) {
+    isAdmin = true;
+  } else if (token) {
+    try {
+      const u = await pool.query(`SELECT id, api_key FROM intel_users WHERE api_key = $1 LIMIT 1`, [token]);
+      authUser = u.rows[0] || null;
+    } catch (err) {
+      console.error('discovery auth lookup failed:', err?.message || String(err));
+    }
   }
+
+  if (!isAdmin && !authUser) return res.status(401).json({ ok: false, error: 'unauthorized' });
 
   try {
     await ensureGrowthSchema();
@@ -673,7 +687,7 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
     const cfg = getDiscoveryConfigFromEnv();
     const body = req.body && typeof req.body === 'object' ? req.body : {};
 
-    const userId = body.user_id ? Number(body.user_id) : null;
+    const userId = isAdmin ? (body.user_id ? Number(body.user_id) : null) : Number(authUser.id);
     const platform = String(body.platform || cfg.platform || 'telegram').toLowerCase();
 
     const apifyActors = createApifyActors();
@@ -681,13 +695,30 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
     const messageExtraction = body.message_extraction !== false;
 
     // Default discovery search queries (keep simple; safe defaults).
-    const defaultQueries = [
+    let defaultQueries = [
       'telegram crypto group',
       'telegram betting group',
       'web3 gaming telegram group',
       'telegram gambling chat',
       'telegram crypto signals group',
     ];
+
+    // If the user saved discovery queries in config thresholds, use them as defaults.
+    if (userId) {
+      try {
+        const uc = await pool.query(
+          `SELECT thresholds FROM intel_user_configs WHERE user_id = $1 LIMIT 1`,
+          [Number(userId)]
+        );
+        const thresholds = uc.rows[0]?.thresholds;
+        const saved = thresholds && typeof thresholds === 'object' ? thresholds.discovery_queries : null;
+        if (Array.isArray(saved) && saved.length) {
+          defaultQueries = saved.map(String).filter(Boolean).slice(0, 25);
+        }
+      } catch {
+        // ignore config lookup failures (keep env defaults)
+      }
+    }
 
     const extraction = messageExtraction
       ? await discoverFromMessageExtraction({

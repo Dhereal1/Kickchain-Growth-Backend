@@ -194,6 +194,57 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
+  router.get('/config', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const isAdmin = !!req.intelAuth?.isAdmin;
+      const userId = isAdmin
+        ? (req.query.user_id ? Number(req.query.user_id) : null)
+        : Number(req.intelAuth?.user?.id);
+
+      if (isAdmin && !userId) {
+        return res.status(400).json({ ok: false, error: 'user_id is required for admin' });
+      }
+
+      const r = await pool.query(
+        `
+          SELECT
+            user_id,
+            datasets,
+            keywords,
+            intent_keywords,
+            promo_keywords,
+            activity_keywords,
+            platforms,
+            thresholds,
+            updated_at
+          FROM intel_user_configs
+          WHERE user_id = $1
+          LIMIT 1
+        `,
+        [userId]
+      );
+
+      const row = r.rows[0] || null;
+      return res.json({
+        ok: true,
+        user_id: userId,
+        datasets: row?.datasets || null,
+        keywords: row?.keywords || null,
+        intent_keywords: row?.intent_keywords || null,
+        promo_keywords: row?.promo_keywords || null,
+        activity_keywords: row?.activity_keywords || null,
+        platforms: row?.platforms || null,
+        thresholds: row?.thresholds || null,
+        updated_at: row?.updated_at ? new Date(row.updated_at).toISOString() : null,
+      });
+    } catch (err) {
+      console.error('intel config get failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load config' });
+    }
+  });
+
   router.post('/config', requireUser, async (req, res) => {
     try {
       await ensureGrowthSchema();
