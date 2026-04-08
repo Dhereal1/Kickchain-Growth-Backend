@@ -5,21 +5,17 @@ import { useEffect, useMemo, useState } from 'react';
 import { Search, PlugZap } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
-import { useAuthStore } from '@/lib/authStore';
+import { loadIntelSettings } from '@/lib/settings';
 
 export function Topbar() {
-  const { auth, hydrate } = useAuthStore();
   const [connected, setConnected] = useState(false);
   const [base, setBase] = useState<string | null>(null);
 
   useEffect(() => {
-    hydrate();
-  }, [hydrate]);
-
-  useEffect(() => {
-    setConnected(!!auth);
-    setBase(auth?.apiBaseUrl || null);
-  }, [auth]);
+    const s = loadIntelSettings();
+    setConnected(!!s);
+    setBase(s?.apiBaseUrl || null);
+  }, []);
 
   const label = useMemo(() => {
     if (!connected) return 'Not connected';
@@ -48,14 +44,15 @@ export function Topbar() {
         <div className="flex items-center gap-2">
           <Badge variant={connected ? 'success' : 'warning'}>{label}</Badge>
           <Link
-            href={connected ? '/settings' : '/connect'}
+            href="/settings"
             className="inline-flex items-center gap-2 rounded-lg border border-border bg-panel/40 px-3 py-2 text-sm hover:bg-muted"
           >
             <PlugZap className="h-4 w-4" />
-            {connected ? 'Settings' : 'Connect'}
+            Settings
           </Link>
         </div>
       </div>
     </header>
   );
 }
+

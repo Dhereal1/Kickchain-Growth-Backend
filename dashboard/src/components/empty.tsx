@@ -13,13 +13,14 @@ export function NotConnected() {
         </div>
         <div className="mt-3">
           <Link
-            href="/connect"
+            href="/settings"
             className="inline-flex rounded-lg border border-border bg-muted px-3 py-2 text-sm hover:bg-muted/80"
           >
-            Connect
+            Open Settings
           </Link>
         </div>
       </CardContent>
     </Card>
   );
 }
+

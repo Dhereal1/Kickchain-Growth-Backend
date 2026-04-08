@@ -1,4 +1,4 @@
-import { loadIntelAuth } from './authStorage';
+import { loadIntelSettings } from './settings';
 
 export type IntelOpportunitiesResponse = {
   summary: {
@@ -26,8 +26,8 @@ export type IntelRunsResponse = {
 };
 
 function getAuthHeaders() {
-  const s = loadIntelAuth();
-  if (!s) throw new Error('Not connected. Go to /connect.');
+  const s = loadIntelSettings();
+  if (!s) throw new Error('Not connected. Set API Base URL + API Key in Settings.');
   return { baseUrl: s.apiBaseUrl, headers: { Authorization: `Bearer ${s.apiKey}` } };
 }
 
@@ -84,3 +84,4 @@ export const intelApi = {
   createWebhook: (body: { url: string; name?: string; secret?: string; enabled?: boolean }) =>
     fetchJson<{ ok: boolean }>('/api/intel/webhook', { method: 'POST', body: JSON.stringify(body) }),
 };
+
