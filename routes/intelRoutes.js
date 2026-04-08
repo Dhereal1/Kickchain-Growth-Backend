@@ -566,6 +566,187 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
+  // Timeseries (for dashboards): daily totals for the last N days.
+  router.get('/metrics', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+      const days = Math.min(30, Math.max(1, Number(req.query.days || 7) || 7));
+
+      const r = await pool.query(
+        `
+          SELECT
+            day,
+            SUM(activity_score)::int AS activity,
+            SUM(intent_score)::int AS intent,
+            SUM(engagement_score)::int AS engagement
+          FROM community_metrics
+          WHERE ($1::int IS NULL OR user_id = $1)
+            AND day >= (NOW() AT TIME ZONE 'UTC')::date - ($2::int * INTERVAL '1 day')
+          GROUP BY day
+          ORDER BY day ASC
+        `,
+        [userId, days]
+      );
+
+      return res.json({ ok: true, days, series: r.rows || [] });
+    } catch (err) {
+      console.error('metrics failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load metrics' });
+    }
+  });
+
+  router.get('/communities', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50) || 50));
+      const platform = req.query.platform ? String(req.query.platform).toLowerCase() : null;
+
+      const r = await pool.query(
+        `
+          SELECT
+            id,
+            user_id,
+            name,
+            platform,
+            member_count,
+            activity_score,
+            intent_score,
+            promo_score,
+            content_activity_score,
+            engagement_score,
+            signal_score,
+            score,
+            last_seen_at,
+            updated_at
+          FROM communities
+          WHERE ($1::int IS NULL OR user_id = $1)
+            AND ($2::text IS NULL OR platform = $2)
+          ORDER BY score DESC NULLS LAST, updated_at DESC
+          LIMIT $3
+        `,
+        [userId, platform, limit]
+      );
+
+      return res.json({ ok: true, items: r.rows || [] });
+    } catch (err) {
+      console.error('communities failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load communities' });
+    }
+  });
+
+  router.get('/posts', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50) || 50));
+      const platform = req.query.platform ? String(req.query.platform).toLowerCase() : null;
+      const minIntent = Number(req.query.min_intent || 0) || 0;
+
+      const r = await pool.query(
+        `
+          SELECT
+            platform,
+            community_name,
+            post_id,
+            text,
+            views,
+            intent_score,
+            promo_score,
+            content_activity_score,
+            engagement_score,
+            posted_at,
+            ingested_at
+          FROM community_posts
+          WHERE ($1::int IS NULL OR user_id = $1)
+            AND ($2::text IS NULL OR platform = $2)
+            AND intent_score >= $3
+            AND COALESCE(posted_at, ingested_at) >= NOW() - INTERVAL '7 days'
+          ORDER BY (intent_score * 2 + engagement_score) DESC, COALESCE(posted_at, ingested_at) DESC
+          LIMIT $4
+        `,
+        [userId, platform, minIntent, limit]
+      );
+
+      return res.json({ ok: true, items: r.rows || [] });
+    } catch (err) {
+      console.error('posts failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load posts' });
+    }
+  });
+
+  router.get('/webhooks', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+      const r = await pool.query(
+        `
+          SELECT
+            id,
+            user_id,
+            name,
+            url,
+            enabled,
+            last_sent_at,
+            created_at,
+            updated_at
+          FROM intel_webhooks
+          WHERE ($1::int IS NULL OR user_id = $1)
+          ORDER BY id DESC
+          LIMIT 200
+        `,
+        [userId]
+      );
+
+      return res.json({ ok: true, items: r.rows || [] });
+    } catch (err) {
+      console.error('webhooks failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load webhooks' });
+    }
+  });
+
+  router.get('/webhook-deliveries', requireUser, async (req, res) => {
+    try {
+      await ensureGrowthSchema();
+
+      const userId = req.intelAuth?.isAdmin ? null : Number(req.intelAuth?.user?.id);
+      const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50) || 50));
+
+      const r = await pool.query(
+        `
+          SELECT
+            d.id,
+            d.user_id,
+            d.run_id,
+            d.status,
+            d.attempts,
+            d.last_status_code,
+            d.last_error,
+            d.created_at,
+            d.updated_at,
+            w.url AS webhook_url,
+            w.name AS webhook_name
+          FROM webhook_deliveries d
+          JOIN intel_webhooks w ON w.id = d.webhook_id
+          WHERE ($1::int IS NULL OR d.user_id = $1)
+          ORDER BY d.id DESC
+          LIMIT $2
+        `,
+        [userId, limit]
+      );
+
+      return res.json({ ok: true, items: r.rows || [] });
+    } catch (err) {
+      console.error('webhook deliveries failed:', err?.message || String(err));
+      return res.status(500).json({ ok: false, error: 'Failed to load webhook deliveries' });
+    }
+  });
+
   router.get('/discovered-communities', requireUser, async (req, res) => {
     try {
       await ensureGrowthSchema();
