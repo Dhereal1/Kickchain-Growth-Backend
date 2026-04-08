@@ -14,6 +14,11 @@ const {
   getCachedCommunityAnalysis,
   upsertCommunityAnalysis,
 } = require('../services/aiAnalysis');
+const {
+  getCommunityDecision,
+  getCommunityReason,
+  computeConfidenceScore,
+} = require('../services/decisionLayer');
 
 function computeRecommendations(topCommunities) {
   const recommendations = [];
@@ -633,6 +638,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         String(req.query.include_ai || req.query.ai || '').toLowerCase() === 'true';
       const aiLimitRaw = req.query.ai_limit != null ? Number(req.query.ai_limit) : 10;
       const aiLimit = Math.max(0, Math.min(50, Number.isFinite(aiLimitRaw) ? aiLimitRaw : 10));
+      const format = String(req.query.format || '').trim().toLowerCase();
 
       // Always recompute rankings from existing posts (safe, no ingestion changes).
       await computeAndStoreCommunityRankings({ pool, ensureGrowthSchema, userId, platform: 'telegram' });
@@ -666,23 +672,107 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         [userId, day]
       );
 
-      const rows = r.rows || [];
-      if (!includeAi) return res.json(rows);
+      const rows = (r.rows || []).map((x) => ({
+        ...x,
+        community_name: x.community,
+      }));
+
+      const communities = rows.map((x) => String(x.community || '').trim()).filter(Boolean);
+      const engagementByCommunity = new Map();
+      if (communities.length) {
+        const agg = await pool.query(
+          `
+            SELECT
+              community_name,
+              AVG(engagement_score) AS avg_engagement_score
+            FROM community_posts
+            WHERE platform = 'telegram'
+              AND community_name = ANY($1::text[])
+              AND ($2::int IS NULL OR user_id = $2)
+              AND ingested_at >= NOW() - INTERVAL '72 hours'
+            GROUP BY community_name
+          `,
+          [communities, userId]
+        );
+        for (const row of agg.rows || []) {
+          engagementByCommunity.set(String(row.community_name), Number(row.avg_engagement_score || 0));
+        }
+      }
+
+      const baseItems = rows.map((row) => {
+        const activityScore = Number(row.total_messages || 0);
+        const intentScore = Number(row.total_intent || 0);
+        const avgEngagement = engagementByCommunity.get(String(row.community)) || 0;
+
+        const decision = getCommunityDecision({ intent_score: intentScore, activity_score: activityScore });
+        const confidence = computeConfidenceScore({
+          intentScore,
+          activityScore,
+          avgEngagementScore: avgEngagement,
+        });
+
+        const item = {
+          ...row,
+          activity_score: activityScore,
+          intent_score: intentScore,
+          avg_engagement_score: avgEngagement,
+          decision,
+          confidence_score: Number(confidence.toFixed(2)),
+          reason: getCommunityReason({
+            intent_score: intentScore,
+            activity_score: activityScore,
+            avg_engagement_score: avgEngagement,
+          }),
+        };
+
+        return item;
+      });
+
+      if (!includeAi) {
+        if (format === 'team') {
+          const lines = ['🔥 Top Communities:', ''];
+          for (let i = 0; i < Math.min(10, baseItems.length); i += 1) {
+            const it = baseItems[i];
+            lines.push(`${i + 1}. ${it.community_name} — ${it.decision}`);
+            lines.push(`   Reason: ${it.reason}`);
+            lines.push('');
+          }
+          return res.json({ ok: true, items: baseItems, team_output: lines.join('\n').trim() });
+        }
+        return res.json(baseItems);
+      }
 
       const keyPresent = !!String(process.env.OPENAI_API_KEY || '').trim();
-      if (!keyPresent) return res.json(rows.map((x) => ({ ...x, ai: { skipped: true, reason: 'OPENAI_API_KEY missing' } })));
+      if (!keyPresent) {
+        const out = baseItems.map((x) => ({
+          ...x,
+          ai_summary: null,
+          ai: { skipped: true, reason: 'OPENAI_API_KEY missing' },
+        }));
+        if (format === 'team') {
+          const lines = ['🔥 Top Communities:', ''];
+          for (let i = 0; i < Math.min(10, out.length); i += 1) {
+            const it = out[i];
+            lines.push(`${i + 1}. ${it.community_name} — ${it.decision}`);
+            lines.push(`   Reason: ${it.reason}`);
+            lines.push('');
+          }
+          return res.json({ ok: true, items: out, team_output: lines.join('\n').trim() });
+        }
+        return res.json(out);
+      }
 
       const analyzed = [];
-      for (let i = 0; i < rows.length; i += 1) {
-        const row = rows[i];
+      for (let i = 0; i < baseItems.length; i += 1) {
+        const row = baseItems[i];
         if (aiLimit && analyzed.length >= aiLimit) {
-          analyzed.push({ ...row, ai: { skipped: true, reason: 'ai_limit' } });
+          analyzed.push({ ...row, ai_summary: null, ai: { skipped: true, reason: 'ai_limit' } });
           continue;
         }
 
         const comm = String(row.community || '').trim();
         if (!comm) {
-          analyzed.push({ ...row, ai: { skipped: true, reason: 'missing_community' } });
+          analyzed.push({ ...row, ai_summary: null, ai: { skipped: true, reason: 'missing_community' } });
           continue;
         }
 
@@ -701,7 +791,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         );
         const messages = (m.rows || []).map((x) => x.text).filter(Boolean);
         if (!messages.length) {
-          analyzed.push({ ...row, ai: { skipped: true, reason: 'no_messages' } });
+          analyzed.push({ ...row, ai_summary: null, ai: { skipped: true, reason: 'no_messages' } });
           continue;
         }
 
@@ -717,7 +807,11 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         });
 
         if (cached?.analysis) {
-          analyzed.push({ ...row, ai: { ...cached.analysis, cached: true } });
+          analyzed.push({
+            ...row,
+            ai_summary: cached.analysis?.summary || null,
+            ai: { ...cached.analysis, cached: true },
+          });
           continue;
         }
 
@@ -733,10 +827,22 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             model,
             analysis: ai,
           });
-          analyzed.push({ ...row, ai: { ...ai, cached: false } });
+          analyzed.push({ ...row, ai_summary: ai?.summary || null, ai: { ...ai, cached: false } });
         } catch (err) {
-          analyzed.push({ ...row, ai: { skipped: true, reason: err?.message || 'analysis_failed' } });
+          analyzed.push({ ...row, ai_summary: null, ai: { skipped: true, reason: err?.message || 'analysis_failed' } });
         }
+      }
+
+      if (format === 'team') {
+        const lines = ['🔥 Top Communities:', ''];
+        for (let i = 0; i < Math.min(10, analyzed.length); i += 1) {
+          const it = analyzed[i];
+          lines.push(`${i + 1}. ${it.community_name} — ${it.decision}`);
+          lines.push(`   Reason: ${it.reason}`);
+          if (it.ai_summary) lines.push(`   AI: ${String(it.ai_summary).trim()}`);
+          lines.push('');
+        }
+        return res.json({ ok: true, items: analyzed, team_output: lines.join('\n').trim() });
       }
 
       return res.json(analyzed);

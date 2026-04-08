@@ -5,11 +5,16 @@ import { apiFetch } from "@/lib/api";
 
 type Row = {
   community: string;
+  community_name?: string;
   score: number;
+  decision?: "JOIN" | "MONITOR" | "IGNORE";
+  confidence_score?: number;
+  reason?: string;
   total_messages?: number;
   total_intent?: number;
   avg_intent?: number;
   category?: string;
+  ai_summary?: string | null;
   ai?: {
     quality_score?: number;
     recommended_action?: "join" | "monitor" | "ignore";
@@ -81,20 +86,23 @@ export function ResultsTable() {
               <th className="py-3 px-3 font-medium">Community</th>
               <th className="py-3 px-3 font-medium text-right">Score</th>
               <th className="py-3 px-3 font-medium text-right">AI Quality</th>
-              <th className="py-3 px-3 font-medium">Action</th>
-              <th className="py-3 px-3 font-medium">Summary</th>
+              <th className="py-3 px-3 font-medium">Decision</th>
+              <th className="py-3 px-3 font-medium">Reason</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((r) => {
-              const action = r.ai?.recommended_action || "";
+              const name = r.community_name || r.community;
+              const action = String(r.decision || r.ai?.recommended_action || "");
               const q = r.ai?.quality_score;
               return (
-                <tr key={r.community} className="border-b border-zinc-900 hover:bg-zinc-900/30">
+                <tr key={name} className="border-b border-zinc-900 hover:bg-zinc-900/30">
                   <td className="py-3 px-3">
-                    <div className="font-medium text-zinc-100">{r.community}</div>
+                    <div className="font-medium text-zinc-100">{name}</div>
                     <div className="text-xs text-zinc-500">
-                      msgs {Number(r.total_messages || 0)} • intent {Number(r.total_intent || 0)}
+                      score {Number(r.score || 0).toFixed(1)} • confidence{" "}
+                      {typeof r.confidence_score === "number" ? r.confidence_score.toFixed(2) : "—"} • msgs{" "}
+                      {Number(r.total_messages || 0)} • intent {Number(r.total_intent || 0)}
                       {r.ai?.cached ? <span className="ml-2 text-emerald-300/80">cached</span> : null}
                       {r.ai?.skipped ? <span className="ml-2 text-amber-300/80">{r.ai?.reason || "skipped"}</span> : null}
                     </div>
@@ -111,9 +119,10 @@ export function ResultsTable() {
                     </span>
                   </td>
                   <td className="py-3 px-3 text-zinc-300">
-                    <div className="max-w-[680px] truncate">
-                      {r.ai?.summary || (r.ai?.skipped ? "AI skipped for this community." : "—")}
-                    </div>
+                    <div className="max-w-[680px] truncate">{r.reason || "—"}</div>
+                    {r.ai_summary ? (
+                      <div className="max-w-[680px] truncate text-xs text-zinc-500 mt-0.5">AI: {r.ai_summary}</div>
+                    ) : null}
                   </td>
                 </tr>
               );
@@ -135,4 +144,3 @@ export function ResultsTable() {
     </div>
   );
 }
-
