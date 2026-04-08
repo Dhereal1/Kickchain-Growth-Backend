@@ -171,6 +171,7 @@ async function getCachedCommunityAnalysis({
   pool,
   ensureGrowthSchema,
   userId,
+  workspaceId,
   platform,
   communityName,
   messagesHash,
@@ -178,11 +179,15 @@ async function getCachedCommunityAnalysis({
 }) {
   await ensureGrowthSchema();
 
+  const wsId = workspaceId === null || workspaceId === undefined ? null : Number(workspaceId);
+  const uId = wsId ? null : (userId === null || userId === undefined ? null : Number(userId));
+
   const r = await pool.query(
     `
       SELECT
         id,
         user_id,
+        workspace_id,
         platform,
         community_name,
         analysis,
@@ -191,10 +196,10 @@ async function getCachedCommunityAnalysis({
       FROM community_ai_analyses
       WHERE platform = $1
         AND community_name = $2
-        AND (($3::int IS NULL AND user_id IS NULL) OR user_id = $3)
+        AND (($3::int IS NULL OR workspace_id = $3) AND ($4::int IS NULL OR user_id = $4))
       LIMIT 1
     `,
-    [platform, communityName, userId == null ? null : Number(userId)]
+    [platform, communityName, wsId, uId]
   );
 
   const row = r.rows[0] || null;
@@ -214,6 +219,7 @@ async function upsertCommunityAnalysis({
   pool,
   ensureGrowthSchema,
   userId,
+  workspaceId,
   platform,
   communityName,
   messagesHash,
@@ -229,9 +235,11 @@ async function upsertCommunityAnalysis({
   const recommendedAction = a.recommended_action ? String(a.recommended_action) : null;
   const summary = a.summary ? String(a.summary) : null;
 
-  const id = userId == null ? null : Number(userId);
+  const wsId = workspaceId === null || workspaceId === undefined ? null : Number(workspaceId);
+  const id = wsId ? null : (userId == null ? null : Number(userId));
   const params = [
     id,
+    wsId,
     platform,
     communityName,
     model,
@@ -244,11 +252,12 @@ async function upsertCommunityAnalysis({
     JSON.stringify(analysis || {}),
   ];
 
-  if (id == null) {
+  if (wsId != null) {
     await pool.query(
       `
         INSERT INTO community_ai_analyses (
           user_id,
+          workspace_id,
           platform,
           community_name,
           model,
@@ -261,8 +270,44 @@ async function upsertCommunityAnalysis({
           analysis,
           updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW())
-        ON CONFLICT (platform, community_name) WHERE user_id IS NULL
+        VALUES (NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, NOW())
+        ON CONFLICT (workspace_id, platform, community_name) WHERE workspace_id IS NOT NULL
+        DO UPDATE SET
+          model = EXCLUDED.model,
+          messages_hash = EXCLUDED.messages_hash,
+          quality_score = EXCLUDED.quality_score,
+          intent_detected = EXCLUDED.intent_detected,
+          category = EXCLUDED.category,
+          recommended_action = EXCLUDED.recommended_action,
+          summary = EXCLUDED.summary,
+          analysis = EXCLUDED.analysis,
+          updated_at = NOW()
+      `,
+      params
+    );
+    return;
+  }
+
+  if (id == null) {
+    await pool.query(
+      `
+        INSERT INTO community_ai_analyses (
+          user_id,
+          workspace_id,
+          platform,
+          community_name,
+          model,
+          messages_hash,
+          quality_score,
+          intent_detected,
+          category,
+          recommended_action,
+          summary,
+          analysis,
+          updated_at
+        )
+        VALUES (NULL, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, NOW())
+        ON CONFLICT (platform, community_name) WHERE user_id IS NULL AND workspace_id IS NULL
         DO UPDATE SET
           model = EXCLUDED.model,
           messages_hash = EXCLUDED.messages_hash,
@@ -283,6 +328,7 @@ async function upsertCommunityAnalysis({
     `
       INSERT INTO community_ai_analyses (
         user_id,
+        workspace_id,
         platform,
         community_name,
         model,
@@ -295,8 +341,8 @@ async function upsertCommunityAnalysis({
         analysis,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW())
-      ON CONFLICT (user_id, platform, community_name) WHERE user_id IS NOT NULL
+      VALUES ($1, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, NOW())
+      ON CONFLICT (user_id, platform, community_name) WHERE user_id IS NOT NULL AND workspace_id IS NULL
       DO UPDATE SET
         model = EXCLUDED.model,
         messages_hash = EXCLUDED.messages_hash,

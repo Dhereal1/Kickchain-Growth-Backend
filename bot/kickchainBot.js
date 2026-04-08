@@ -30,6 +30,8 @@ function createKickchainBot(options) {
     return { bot: null, error: 'Missing BOT_TOKEN or BACKEND_URL' };
   }
 
+  const intelAdminKey = String(process.env.INTEL_API_KEY || '').trim();
+
   const groupId = normalizeGroupId(rawGroupId);
   let runtimeGroupId = '';
 
@@ -476,6 +478,62 @@ function createKickchainBot(options) {
     await ctx.reply(
       `chat_id: ${ctx.chat?.id}\nchat_type: ${ctx.chat?.type || 'unknown'}`
     );
+  });
+
+  // Workspace intelligence commands (group = workspace)
+  bot.command('run', async (ctx) => {
+    try {
+      if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
+        return ctx.reply('Use /run inside a Telegram group workspace.');
+      }
+      if (!intelAdminKey) {
+        return ctx.reply('Intel admin key is not configured on the backend.');
+      }
+
+      const chatId = String(ctx.chat.id);
+      const title = ctx.chat.title || null;
+
+      await ctx.reply('⏳ Running workspace intel… this can take ~30–60 seconds.');
+
+      const r = await axios.post(
+        `${backendUrl}/intel/workspace/run`,
+        { telegram_chat_id: chatId, name: title },
+        { headers: { Authorization: `Bearer ${intelAdminKey}` } }
+      );
+
+      const team = r.data?.team_output || null;
+      if (team) return ctx.reply(team);
+      return ctx.reply('✅ Run completed. Use /top to view results.');
+    } catch (err) {
+      const msg = err?.response?.data?.error || err?.message || 'Run failed';
+      console.error('intel /run failed:', msg);
+      return ctx.reply(`❌ Intel run failed: ${String(msg).slice(0, 180)}`);
+    }
+  });
+
+  bot.command('top', async (ctx) => {
+    try {
+      if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
+        return ctx.reply('Use /top inside a Telegram group workspace.');
+      }
+      if (!intelAdminKey) {
+        return ctx.reply('Intel admin key is not configured on the backend.');
+      }
+
+      const chatId = String(ctx.chat.id);
+      const r = await axios.get(`${backendUrl}/intel/workspace/top`, {
+        headers: { Authorization: `Bearer ${intelAdminKey}` },
+        params: { telegram_chat_id: chatId, format: 'team' },
+      });
+
+      const team = r.data?.team_output || null;
+      if (team) return ctx.reply(team);
+      return ctx.reply('No workspace results yet. Run /run first.');
+    } catch (err) {
+      const msg = err?.response?.data?.error || err?.message || 'Failed';
+      console.error('intel /top failed:', msg);
+      return ctx.reply(`❌ Failed to load top: ${String(msg).slice(0, 180)}`);
+    }
   });
 
   return {

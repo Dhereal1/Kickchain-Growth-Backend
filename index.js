@@ -20,6 +20,12 @@ const {
   getDiscoveryConfigFromEnv,
   upsertDiscoveredCommunities,
 } = require('./services/communityDiscovery');
+const { getOrCreateWorkspace, getWorkspaceConfig } = require('./services/intelWorkspace');
+const {
+  getCommunityDecision,
+  getCommunityReason,
+  computeConfidenceScore: computeDecisionConfidence,
+} = require('./services/decisionLayer');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -276,6 +282,7 @@ async function ensureGrowthSchema() {
     CREATE TABLE IF NOT EXISTS community_posts (
       id BIGSERIAL PRIMARY KEY,
       user_id INT,
+      workspace_id INT,
       platform TEXT NOT NULL,
       community_name TEXT NOT NULL,
       post_id TEXT NOT NULL,
@@ -302,23 +309,33 @@ async function ensureGrowthSchema() {
     'DROP INDEX IF EXISTS community_posts_user_platform_hash_uq',
   ]);
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS user_id INT");
+  await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS workspace_id INT");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_hash TEXT");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS promo_score INT DEFAULT 0");
   await pool.query("ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_activity_score INT DEFAULT 0");
-  // Legacy uniques (single-tenant). Keep them for NULL user_id rows.
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_post_uq ON community_posts (platform, post_id) WHERE user_id IS NULL'
-  );
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_hash_uq ON community_posts (platform, content_hash) WHERE user_id IS NULL'
-  );
-  // Multi-tenant uniques.
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_user_platform_post_uq ON community_posts (user_id, platform, post_id) WHERE user_id IS NOT NULL'
-  );
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_user_platform_hash_uq ON community_posts (user_id, platform, content_hash) WHERE user_id IS NOT NULL'
-  );
+
+  // Workspace tenancy adds additional uniqueness dimensions. Rebuild indexes to avoid collisions
+  // between legacy (NULL user_id/workspace_id), user, and workspace rows.
+  await runOnce('2026-04-08_workspace_posts_uniques', [
+    'DROP INDEX IF EXISTS community_posts_platform_post_uq',
+    'DROP INDEX IF EXISTS community_posts_platform_hash_uq',
+    'DROP INDEX IF EXISTS community_posts_user_platform_post_uq',
+    'DROP INDEX IF EXISTS community_posts_user_platform_hash_uq',
+    'DROP INDEX IF EXISTS community_posts_workspace_platform_post_uq',
+    'DROP INDEX IF EXISTS community_posts_workspace_platform_hash_uq',
+
+    // Legacy uniques (single-tenant): only rows with no tenant id.
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_post_uq ON community_posts (platform, post_id) WHERE user_id IS NULL AND workspace_id IS NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_platform_hash_uq ON community_posts (platform, content_hash) WHERE user_id IS NULL AND workspace_id IS NULL',
+
+    // User tenant uniques (only if not attached to a workspace).
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_user_platform_post_uq ON community_posts (user_id, platform, post_id) WHERE user_id IS NOT NULL AND workspace_id IS NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_user_platform_hash_uq ON community_posts (user_id, platform, content_hash) WHERE user_id IS NOT NULL AND workspace_id IS NULL',
+
+    // Workspace tenant uniques.
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_workspace_platform_post_uq ON community_posts (workspace_id, platform, post_id) WHERE workspace_id IS NOT NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_posts_workspace_platform_hash_uq ON community_posts (workspace_id, platform, content_hash) WHERE workspace_id IS NOT NULL',
+  ]);
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_posts_lookup_idx ON community_posts (platform, community_name, posted_at)'
   );
@@ -472,6 +489,7 @@ async function ensureGrowthSchema() {
     CREATE TABLE IF NOT EXISTS discovered_communities (
       id BIGSERIAL PRIMARY KEY,
       user_id INT,
+      workspace_id INT,
       community_name TEXT NOT NULL,
       source TEXT NOT NULL,
       meta JSONB,
@@ -481,20 +499,25 @@ async function ensureGrowthSchema() {
     );
   `);
   await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS user_id INT");
+  await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS workspace_id INT");
   await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS meta JSONB");
   await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMP");
   await pool.query("ALTER TABLE discovered_communities ADD COLUMN IF NOT EXISTS last_dataset_id TEXT");
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS discovered_communities_uq_legacy ON discovered_communities (community_name) WHERE user_id IS NULL'
-  );
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS discovered_communities_user_uq ON discovered_communities (user_id, community_name) WHERE user_id IS NOT NULL'
-  );
+  await runOnce('2026-04-08_workspace_discovered_uniques', [
+    'DROP INDEX IF EXISTS discovered_communities_uq_legacy',
+    'DROP INDEX IF EXISTS discovered_communities_user_uq',
+    'DROP INDEX IF EXISTS discovered_communities_workspace_uq',
+
+    'CREATE UNIQUE INDEX IF NOT EXISTS discovered_communities_uq_legacy ON discovered_communities (community_name) WHERE user_id IS NULL AND workspace_id IS NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS discovered_communities_user_uq ON discovered_communities (user_id, community_name) WHERE user_id IS NOT NULL AND workspace_id IS NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS discovered_communities_workspace_uq ON discovered_communities (workspace_id, community_name) WHERE workspace_id IS NOT NULL',
+  ]);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS community_rankings (
       id BIGSERIAL PRIMARY KEY,
       user_id INT,
+      workspace_id INT,
       day DATE NOT NULL,
       platform TEXT NOT NULL,
       community_name TEXT NOT NULL,
@@ -507,24 +530,48 @@ async function ensureGrowthSchema() {
     );
   `);
   await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS user_id INT");
+  await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS workspace_id INT");
   await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS total_intent INT NOT NULL DEFAULT 0");
   await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS avg_intent FLOAT NOT NULL DEFAULT 0");
   await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS community_score NUMERIC NOT NULL DEFAULT 0");
   await pool.query("ALTER TABLE community_rankings ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'low'");
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_rankings_user_day_platform_name_uq ON community_rankings (user_id, day, platform, community_name) WHERE user_id IS NOT NULL'
-  );
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_rankings_day_platform_name_uq ON community_rankings (day, platform, community_name) WHERE user_id IS NULL'
-  );
+  await runOnce('2026-04-08_workspace_rankings_uniques', [
+    'DROP INDEX IF EXISTS community_rankings_user_day_platform_name_uq',
+    'DROP INDEX IF EXISTS community_rankings_workspace_day_platform_name_uq',
+    'DROP INDEX IF EXISTS community_rankings_day_platform_name_uq',
+
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_rankings_user_day_platform_name_uq ON community_rankings (user_id, day, platform, community_name) WHERE user_id IS NOT NULL AND workspace_id IS NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_rankings_workspace_day_platform_name_uq ON community_rankings (workspace_id, day, platform, community_name) WHERE workspace_id IS NOT NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_rankings_day_platform_name_uq ON community_rankings (day, platform, community_name) WHERE user_id IS NULL AND workspace_id IS NULL',
+  ]);
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_rankings_rank_idx ON community_rankings (day, community_score DESC)'
   );
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_workspaces (
+      id SERIAL PRIMARY KEY,
+      name TEXT,
+      telegram_chat_id TEXT UNIQUE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_workspace_configs (
+      workspace_id INT PRIMARY KEY REFERENCES intel_workspaces(id) ON DELETE CASCADE,
+      datasets TEXT[],
+      keywords TEXT[],
+      thresholds JSONB,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS community_ai_analyses (
       id BIGSERIAL PRIMARY KEY,
       user_id INT,
+      workspace_id INT,
       platform TEXT NOT NULL,
       community_name TEXT NOT NULL,
       model TEXT,
@@ -540,6 +587,7 @@ async function ensureGrowthSchema() {
     );
   `);
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS user_id INT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS workspace_id INT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS model TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS messages_hash TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS quality_score FLOAT");
@@ -548,12 +596,15 @@ async function ensureGrowthSchema() {
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS recommended_action TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS summary TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS analysis JSONB NOT NULL DEFAULT '{}'::jsonb");
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_ai_analyses_user_uq ON community_ai_analyses (user_id, platform, community_name) WHERE user_id IS NOT NULL'
-  );
-  await pool.query(
-    'CREATE UNIQUE INDEX IF NOT EXISTS community_ai_analyses_legacy_uq ON community_ai_analyses (platform, community_name) WHERE user_id IS NULL'
-  );
+  await runOnce('2026-04-08_workspace_ai_analysis_uniques', [
+    'DROP INDEX IF EXISTS community_ai_analyses_user_uq',
+    'DROP INDEX IF EXISTS community_ai_analyses_workspace_uq',
+    'DROP INDEX IF EXISTS community_ai_analyses_legacy_uq',
+
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_ai_analyses_user_uq ON community_ai_analyses (user_id, platform, community_name) WHERE user_id IS NOT NULL AND workspace_id IS NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_ai_analyses_workspace_uq ON community_ai_analyses (workspace_id, platform, community_name) WHERE workspace_id IS NOT NULL',
+    'CREATE UNIQUE INDEX IF NOT EXISTS community_ai_analyses_legacy_uq ON community_ai_analyses (platform, community_name) WHERE user_id IS NULL AND workspace_id IS NULL',
+  ]);
   await pool.query(
     'CREATE INDEX IF NOT EXISTS community_ai_analyses_lookup_idx ON community_ai_analyses (platform, community_name, updated_at DESC)'
   );
@@ -832,6 +883,245 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
       error: err?.message || 'discovery_failed',
       details: err?.details ? String(err.details).slice(0, 2000) : undefined,
     });
+  }
+});
+
+function formatTeamOutput(items) {
+  const lines = ['🔥 Top Communities:', ''];
+  const list = Array.isArray(items) ? items : [];
+  for (let i = 0; i < Math.min(10, list.length); i += 1) {
+    const it = list[i];
+    lines.push(`${i + 1}. ${it.community_name} — ${it.decision}`);
+    lines.push(`   Reason: ${it.reason}`);
+    lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+async function getWorkspaceTop({ workspaceId, limit = 10 }) {
+  const latestDayRes = await pool.query(
+    `SELECT MAX(day) AS day FROM community_rankings WHERE workspace_id = $1`,
+    [Number(workspaceId)]
+  );
+  const day = latestDayRes.rows[0]?.day || null;
+  if (!day) return { day: null, items: [] };
+
+  const r = await pool.query(
+    `
+      SELECT
+        community_name,
+        community_score AS score,
+        total_messages,
+        total_intent,
+        avg_intent,
+        category,
+        platform,
+        day
+      FROM community_rankings
+      WHERE workspace_id = $1
+        AND day = $2
+      ORDER BY community_score DESC
+      LIMIT $3
+    `,
+    [Number(workspaceId), day, Math.max(1, Math.min(50, Number(limit) || 10))]
+  );
+
+  const rows = r.rows || [];
+  const names = rows.map((x) => String(x.community_name || '').trim()).filter(Boolean);
+  const engagementByCommunity = new Map();
+  if (names.length) {
+    const agg = await pool.query(
+      `
+        SELECT community_name, AVG(engagement_score)::float AS avg_engagement_score
+        FROM community_posts
+        WHERE workspace_id = $1
+          AND platform = 'telegram'
+          AND community_name = ANY($2::text[])
+          AND ingested_at >= NOW() - INTERVAL '72 hours'
+        GROUP BY community_name
+      `,
+      [Number(workspaceId), names]
+    );
+    for (const row of agg.rows || []) {
+      engagementByCommunity.set(String(row.community_name), Number(row.avg_engagement_score || 0));
+    }
+  }
+
+  const items = rows.map((row) => {
+    const activityScore = Number(row.total_messages || 0);
+    const intentScore = Number(row.total_intent || 0);
+    const avgEngagement = engagementByCommunity.get(String(row.community_name)) || 0;
+
+    const decision = getCommunityDecision({ intent_score: intentScore, activity_score: activityScore });
+    const confidence = computeDecisionConfidence({
+      intentScore,
+      activityScore,
+      avgEngagementScore: avgEngagement,
+    });
+
+    return {
+      ...row,
+      activity_score: activityScore,
+      intent_score: intentScore,
+      avg_engagement_score: avgEngagement,
+      decision,
+      confidence_score: Number(confidence.toFixed(2)),
+      reason: getCommunityReason({
+        intent_score: intentScore,
+        activity_score: activityScore,
+        avg_engagement_score: avgEngagement,
+      }),
+    };
+  });
+
+  return { day, items };
+}
+
+// Workspace (Telegram group) multi-tenancy endpoints (admin-only; used by the bot).
+registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+    const telegramChatId = body.telegram_chat_id != null ? String(body.telegram_chat_id).trim() : '';
+    const workspaceName = body.name != null ? String(body.name).trim() : null;
+    if (!telegramChatId) return res.status(400).json({ ok: false, error: 'telegram_chat_id is required' });
+
+    const workspace = await getOrCreateWorkspace({
+      pool,
+      ensureGrowthSchema,
+      telegramChatId,
+      name: workspaceName,
+    });
+
+    const cfg = getDiscoveryConfigFromEnv();
+    const wsCfg = await getWorkspaceConfig({ pool, ensureGrowthSchema, workspaceId: workspace.id });
+    const thresholds = wsCfg?.thresholds && typeof wsCfg.thresholds === 'object' ? wsCfg.thresholds : {};
+
+    const defaultQueries = Array.isArray(thresholds.discovery_queries) && thresholds.discovery_queries.length
+      ? thresholds.discovery_queries.map(String).filter(Boolean).slice(0, 25)
+      : [
+          'telegram crypto group',
+          'telegram betting group',
+          'web3 gaming telegram group',
+          'telegram gambling chat',
+          'telegram crypto signals group',
+        ];
+
+    const queries = Array.isArray(body.queries) ? body.queries.map(String).filter(Boolean) : defaultQueries;
+    const platform = String(body.platform || cfg.platform || 'telegram').toLowerCase();
+
+    const apifyActors = createApifyActors();
+
+    const extraction = body.message_extraction === false
+      ? { ok: true, skipped: true }
+      : await discoverFromMessageExtraction({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          windowHours: Number(body.window_hours || cfg.windowHours),
+          maxPosts: Number(body.max_posts || cfg.maxPosts),
+        });
+
+    let search = { ok: true, skipped: true };
+    const searchEnabled = body.search !== false;
+    if (searchEnabled && queries.length) {
+      if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
+        return res.status(400).json({ ok: false, error: 'APIFY_DISCOVERY_ACTOR_ID is required for search discovery' });
+      }
+
+      const run = await apifyActors.runSearch({ queries, input: {} });
+      const text = JSON.stringify(run.items || []);
+      const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
+      search = await upsertDiscoveredCommunities({
+        pool,
+        ensureGrowthSchema,
+        workspaceId: workspace.id,
+        communities: found,
+        source: 'search',
+        meta: { actor: 'apify_search', datasetId: run.datasetId },
+      });
+      search.datasetId = run.datasetId;
+      search.items = (run.items || []).length;
+      search.queries = queries;
+    }
+
+    const scrapeEnabled = body.scrape !== false;
+    const scrape = scrapeEnabled
+      ? await scrapeDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          apifyActors,
+          workspaceId: workspace.id,
+          maxScrapes: Number(body.max_scrapes || cfg.maxScrapes),
+          cooldownHours: Number(body.cooldown_hours || cfg.cooldownHours),
+          platform,
+          configOverride: body.configOverride || null,
+        })
+      : { ok: true, skipped: true };
+
+    const rankings = await computeAndStoreCommunityRankings({
+      pool,
+      ensureGrowthSchema,
+      workspaceId: workspace.id,
+      platform,
+    });
+
+    const top = await getWorkspaceTop({ workspaceId: workspace.id, limit: 10 });
+
+    return res.json({
+      ok: true,
+      workspace,
+      extraction,
+      search,
+      scrape,
+      rankings,
+      top: top.items,
+      team_output: formatTeamOutput(top.items),
+    });
+  } catch (err) {
+    console.error('workspace run failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: err?.message || 'workspace_run_failed' });
+  }
+});
+
+registerWithApiAlias('get', '/intel/workspace/top', async (req, res) => {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+    const chatId = req.query.telegram_chat_id != null ? String(req.query.telegram_chat_id).trim() : '';
+    if (!chatId) return res.status(400).json({ ok: false, error: 'telegram_chat_id is required' });
+
+    const workspace = await getOrCreateWorkspace({ pool, ensureGrowthSchema, telegramChatId: chatId, name: null });
+    const limit = req.query.limit != null ? Number(req.query.limit) : 10;
+    const top = await getWorkspaceTop({ workspaceId: workspace.id, limit });
+
+    const format = String(req.query.format || '').trim().toLowerCase();
+    if (format === 'team') {
+      return res.json({
+        ok: true,
+        workspace,
+        day: top.day,
+        items: top.items,
+        team_output: formatTeamOutput(top.items),
+      });
+    }
+
+    return res.json({ ok: true, workspace, day: top.day, items: top.items });
+  } catch (err) {
+    console.error('workspace top failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: err?.message || 'workspace_top_failed' });
   }
 });
 

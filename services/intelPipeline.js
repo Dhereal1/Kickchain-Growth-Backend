@@ -48,6 +48,7 @@ async function ingestDatasets({
   datasets,
   platform,
   userId = null,
+  workspaceId = null,
   configOverride = null,
 }) {
   const token = String(process.env.APIFY_API_TOKEN || '').trim();
@@ -58,6 +59,9 @@ async function ingestDatasets({
 
   await ensureGrowthSchema();
 
+  const wsId = workspaceId === null || workspaceId === undefined ? null : Number(workspaceId);
+  const effectiveUserId = wsId ? null : userId;
+
   const startedAt = Date.now();
   const maxDatasets = Math.max(1, Number(cfg.maxDatasetsPerRun) || 5);
   const timeoutMs = Math.max(1000, Number(cfg.pipelineTimeoutMs) || 8000);
@@ -65,7 +69,7 @@ async function ingestDatasets({
 
   const run = await pool.query(
     `INSERT INTO intel_runs (user_id, datasets, platform) VALUES ($1, $2::jsonb, $3) RETURNING id`,
-    [userId, jsonStringifySafe(runDatasets), platformHint || null]
+    [effectiveUserId, jsonStringifySafe(runDatasets), platformHint || null]
   );
   const runId = run.rows[0].id;
   await pool.query(`UPDATE intel_runs SET dataset_ids = $1::jsonb WHERE id = $2`, [
@@ -130,14 +134,15 @@ async function ingestDatasets({
         const postRes = await pool.query(
           `
             INSERT INTO community_posts (
-              user_id, platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
+              user_id, workspace_id, platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
               intent_score, promo_score, content_activity_score, engagement_score, frequency_score, raw
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
             ON CONFLICT DO NOTHING
           `,
           [
-            userId,
+            effectiveUserId,
+            wsId,
             normalized.platform,
             normalized.name,
             postId,
@@ -158,8 +163,12 @@ async function ingestDatasets({
         if (postRes.rowCount) insertedPosts += 1;
         else dedupedPosts += 1;
 
-        // Communities master list (upsert) - handle legacy NULL user_id and multi-tenant user_id.
-        const isLegacy = userId === null || userId === undefined;
+        // Communities master list: keep this user-scoped only for now.
+        // Workspace discovery runs write to community_posts and rankings, but should not
+        // mutate global/user community registries.
+        if (wsId) continue;
+
+        const isLegacy = effectiveUserId === null || effectiveUserId === undefined;
         const communitySql = isLegacy
           ? `
             INSERT INTO communities (
@@ -220,7 +229,7 @@ async function ingestDatasets({
               jsonStringifySafe(item),
             ]
           : [
-              userId,
+              effectiveUserId,
               normalized.name,
               normalized.platform,
               Number(normalized.member_count ?? views) || 0,
