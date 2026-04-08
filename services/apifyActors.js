@@ -95,6 +95,30 @@ function buildInputFromTemplate({ templateJson, vars }) {
   return jsonParse(rendered, null);
 }
 
+function buildTelegramScraperInputForActor({ actorId, community }) {
+  const a = String(actorId || '').trim();
+  const c = String(community || '').trim();
+  if (!a || !c) return null;
+
+  // Known actor presets (minimal, optional). This is intentionally small and easy to reason about.
+  // tri_angle/telegram-scraper — expects `profiles` array.
+  if (a === 'GEHKCq8O4orlPjLFf') {
+    return {
+      profiles: [c],
+      collectMessages: true,
+    };
+  }
+
+  // cheapget/telegram-profile — expects `telegramUrl` array.
+  if (a === 'awbKkk1w2CKtNBScC') {
+    return {
+      telegramUrl: [c],
+    };
+  }
+
+  return null;
+}
+
 function getTelegramScraperActorCandidates() {
   const primary =
     String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_PRIMARY || '').trim() ||
@@ -242,8 +266,11 @@ function createApifyActors() {
       vars: { community: username },
     });
 
+    const presetInput = buildTelegramScraperInputForActor({ actorId: actor, community: username });
+
     const input =
       inputFromTpl ||
+      presetInput ||
       jsonParse(process.env.APIFY_TELEGRAM_SCRAPER_INPUT_JSON, null) || {
         startUrls: [
           {
