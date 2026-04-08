@@ -5,24 +5,29 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
-import { clearIntelSettings, loadIntelSettings, normalizeApiBaseUrl, saveIntelSettings } from '@/lib/settings';
+import { defaultIntelBaseUrl, loadIntelAuth } from '@/lib/authStorage';
+import { useAuthStore } from '@/lib/authStore';
 
 export default function SettingsPage() {
+  const { auth, connect, disconnect, hydrate } = useAuthStore();
   const [apiBaseUrl, setApiBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [remember, setRemember] = useState(true);
   const [status, setStatus] = useState<'idle' | 'ok' | 'fail'>('idle');
   const [message, setMessage] = useState<string>('');
 
   useEffect(() => {
-    const s = loadIntelSettings();
+    hydrate();
+    const s = loadIntelAuth();
     if (s) {
       setApiBaseUrl(s.apiBaseUrl);
       setApiKey(s.apiKey);
     }
+    if (!s) setApiBaseUrl(defaultIntelBaseUrl());
   }, []);
 
   async function testConnection(nextBase: string, nextKey: string) {
-    const base = normalizeApiBaseUrl(nextBase);
+    const base = String(nextBase || '').trim().replace(/\/+$/, '');
     const key = String(nextKey || '').trim();
     if (!base || !key) {
       setStatus('fail');
@@ -90,9 +95,9 @@ export default function SettingsPage() {
             <Button
               variant="primary"
               onClick={async () => {
-                const base = normalizeApiBaseUrl(apiBaseUrl);
+                const base = String(apiBaseUrl || '').trim().replace(/\/+$/, '');
                 const key = String(apiKey || '').trim();
-                saveIntelSettings({ apiBaseUrl: base, apiKey: key });
+                connect({ apiBaseUrl: base, apiKey: key, remember });
                 await testConnection(base, key);
               }}
             >
@@ -109,8 +114,8 @@ export default function SettingsPage() {
             <Button
               variant="ghost"
               onClick={() => {
-                clearIntelSettings();
-                setApiBaseUrl('');
+                disconnect();
+                setApiBaseUrl(defaultIntelBaseUrl());
                 setApiKey('');
                 setStatus('idle');
                 setMessage('');
@@ -119,6 +124,16 @@ export default function SettingsPage() {
               Clear
             </Button>
           </div>
+
+          <label className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+              className="h-4 w-4 accent-[var(--primary)]"
+            />
+            Remember this device
+          </label>
 
           {message && (
             <div className="mt-3 text-sm text-muted-foreground">
@@ -135,7 +150,10 @@ export default function SettingsPage() {
         <CardContent>
           <ul className="text-sm text-muted-foreground list-disc pl-5 space-y-1">
             <li>All endpoints are read-only except webhook creation and discovery refresh.</li>
-            <li>For production, store secrets in Vercel env vars and use SSO. LocalStorage is for internal ops MVP.</li>
+            <li>
+              Keys are stored in memory + session storage. If you enable “Remember”, they are also stored in local
+              storage.
+            </li>
             <li>Scraping is public-metadata only; no auto-messaging is implemented.</li>
           </ul>
         </CardContent>
@@ -143,4 +161,3 @@ export default function SettingsPage() {
     </div>
   );
 }
-
