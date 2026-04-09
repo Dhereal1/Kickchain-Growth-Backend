@@ -19,6 +19,7 @@ const {
   getCommunityReason,
   computeConfidenceScore,
 } = require('../services/decisionLayer');
+const { getFinalDecision, toUpperDecision } = require('../services/finalDecision');
 
 function computeRecommendations(topCommunities) {
   const recommendations = [];
@@ -733,7 +734,10 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           const lines = ['🔥 Top Communities:', ''];
           for (let i = 0; i < Math.min(10, baseItems.length); i += 1) {
             const it = baseItems[i];
-            lines.push(`${i + 1}. ${it.community_name} — ${it.decision}`);
+            const finalDecision = toUpperDecision(
+              getFinalDecision({ signals: { intent_score: it.intent_score, activity_score: it.activity_score }, ai: null })
+            );
+            lines.push(`${i + 1}. ${it.community_name} — ${finalDecision}`);
             lines.push(`   Reason: ${it.reason}`);
             lines.push('');
           }
@@ -746,6 +750,13 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       if (!keyPresent) {
         const out = baseItems.map((x) => ({
           ...x,
+          final_decision: toUpperDecision(
+            getFinalDecision({
+              signals: { intent_score: x.intent_score, activity_score: x.activity_score },
+              ai: null,
+            })
+          ),
+          final_reason: x.reason,
           ai_summary: null,
           ai: { skipped: true, reason: 'OPENAI_API_KEY missing' },
         }));
@@ -753,8 +764,8 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           const lines = ['🔥 Top Communities:', ''];
           for (let i = 0; i < Math.min(10, out.length); i += 1) {
             const it = out[i];
-            lines.push(`${i + 1}. ${it.community_name} — ${it.decision}`);
-            lines.push(`   Reason: ${it.reason}`);
+            lines.push(`${i + 1}. ${it.community_name} — ${it.final_decision || it.decision}`);
+            lines.push(`   Reason: ${it.final_reason || it.reason}`);
             lines.push('');
           }
           return res.json({ ok: true, items: out, team_output: lines.join('\n').trim() });
@@ -807,8 +818,17 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         });
 
         if (cached?.analysis) {
+          const finalDecision = toUpperDecision(
+            getFinalDecision({
+              signals: { intent_score: row.intent_score, activity_score: row.activity_score },
+              ai: cached.analysis,
+            })
+          );
+          const finalReason = cached.analysis?.summary || row.reason;
           analyzed.push({
             ...row,
+            final_decision: finalDecision,
+            final_reason: finalReason,
             ai_summary: cached.analysis?.summary || null,
             ai: { ...cached.analysis, cached: true },
           });
@@ -827,9 +847,33 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             model,
             analysis: ai,
           });
-          analyzed.push({ ...row, ai_summary: ai?.summary || null, ai: { ...ai, cached: false } });
+          const finalDecision = toUpperDecision(
+            getFinalDecision({
+              signals: { intent_score: row.intent_score, activity_score: row.activity_score },
+              ai,
+            })
+          );
+          const finalReason = ai?.summary || row.reason;
+          analyzed.push({
+            ...row,
+            final_decision: finalDecision,
+            final_reason: finalReason,
+            ai_summary: ai?.summary || null,
+            ai: { ...ai, cached: false },
+          });
         } catch (err) {
-          analyzed.push({ ...row, ai_summary: null, ai: { skipped: true, reason: err?.message || 'analysis_failed' } });
+          analyzed.push({
+            ...row,
+            final_decision: toUpperDecision(
+              getFinalDecision({
+                signals: { intent_score: row.intent_score, activity_score: row.activity_score },
+                ai: null,
+              })
+            ),
+            final_reason: row.reason,
+            ai_summary: null,
+            ai: { skipped: true, reason: err?.message || 'analysis_failed' },
+          });
         }
       }
 
@@ -837,9 +881,8 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         const lines = ['🔥 Top Communities:', ''];
         for (let i = 0; i < Math.min(10, analyzed.length); i += 1) {
           const it = analyzed[i];
-          lines.push(`${i + 1}. ${it.community_name} — ${it.decision}`);
-          lines.push(`   Reason: ${it.reason}`);
-          if (it.ai_summary) lines.push(`   AI: ${String(it.ai_summary).trim()}`);
+          lines.push(`${i + 1}. ${it.community_name} — ${it.final_decision || it.decision}`);
+          lines.push(`   Reason: ${it.final_reason || it.reason}`);
           lines.push('');
         }
         return res.json({ ok: true, items: analyzed, team_output: lines.join('\n').trim() });
