@@ -1384,12 +1384,20 @@ registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
   const secret = String(process.env.CRON_SECRET || '').trim();
   if (secret) {
     // Vercel Cron requests include this header. If present, allow without sharing a secret in the URL.
-    const isVercelCron = String(req.headers['x-vercel-cron'] || '').trim() === '1';
+    const cronHeader = String(req.headers['x-vercel-cron'] || '').trim().toLowerCase();
+    const isVercelCron = cronHeader && cronHeader !== '0' && cronHeader !== 'false';
     if (isVercelCron) {
       // ok
     } else {
     const provided = String(req.query?.secret || req.headers['x-cron-secret'] || '').trim();
-    if (provided !== secret) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    if (provided !== secret) {
+      console.warn('workspace runner unauthorized', {
+        has_secret: !!secret,
+        has_provided: !!provided,
+        x_vercel_cron: cronHeader || null,
+      });
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
     }
   }
 
