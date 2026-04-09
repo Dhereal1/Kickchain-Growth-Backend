@@ -600,48 +600,33 @@ function createKickchainBot(options) {
       const title = ctx.chat.title || null;
 
       console.info('Intel /run starting', { chat_id: chatId, title });
-      await ctx.reply('⏳ Running workspace intel… this can take ~30–60 seconds.');
-      // Do not block the Telegram webhook while the intel pipeline runs.
-      // Run in background and post results to the group when ready.
-      Promise.resolve()
-        .then(async () => {
-          const r = await axios.post(
-            `${backendUrl}/intel/workspace/run`,
-            {
-              telegram_chat_id: chatId,
-              name: title,
-              // Keep the run serverless-safe by default; can be overridden via manual API calls.
-              message_extraction: false,
-              max_scrapes: 1,
-            },
-            { headers: { Authorization: `Bearer ${intelAdminKey}` } }
-          );
+      await ctx.reply('🚀 Running discovery… results will be posted shortly.');
 
-          const team = r.data?.team_output || null;
-          console.info('Intel /run completed', {
-            chat_id: chatId,
-            ok: !!r.data?.ok,
-            has_team_output: !!team,
-          });
-          if (team) {
-            await ctx.telegram.sendMessage(chatId, team);
-          } else {
-            await ctx.telegram.sendMessage(chatId, '✅ Run completed. Use /top to view results.');
-          }
-        })
-        .catch(async (err) => {
-          const status = err?.response?.status;
-          const apiErr = err?.response?.data?.error;
-          const apiDetails = err?.response?.data?.details;
-          const msg = apiErr || err?.message || 'Run failed';
-          console.error('intel /run failed (async):', { status, msg, details: apiDetails });
-          const extra = apiDetails ? `\nDetails: ${String(apiDetails).slice(0, 180)}` : '';
-          try {
-            await ctx.telegram.sendMessage(chatId, `❌ Intel run failed: ${String(msg).slice(0, 180)}${extra}`);
-          } catch (sendErr) {
-            console.error('failed to send async /run error message:', sendErr?.message || String(sendErr));
-          }
-        });
+      // Queue a durable job on the backend (serverless-safe).
+      const enqueue = await axios.post(
+        `${backendUrl}/intel/workspace/enqueue-run`,
+        {
+          telegram_chat_id: chatId,
+          name: title,
+          requested_by: ctx.from?.id,
+          requested_by_username: ctx.from?.username || null,
+          options: {
+            // Keep the run serverless-safe by default; can be overridden via manual API calls.
+            message_extraction: false,
+            max_scrapes: 1,
+          },
+        },
+        { headers: { Authorization: `Bearer ${intelAdminKey}` } }
+      );
+
+      const preview = Array.isArray(enqueue.data?.preview) ? enqueue.data.preview : [];
+      if (preview.length) {
+        const lines = ['⚡ Quick Results (Instant)', ''];
+        for (let i = 0; i < Math.min(3, preview.length); i += 1) {
+          lines.push(`${i + 1}. ${preview[i]}`);
+        }
+        await ctx.reply(lines.join('\n').trim());
+      }
 
       return;
     } catch (err) {

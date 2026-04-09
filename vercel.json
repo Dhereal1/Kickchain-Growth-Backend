@@ -10,6 +10,7 @@
   "crons": [
     { "path": "/api/cron/weekly-leaderboard", "schedule": "0 18 * * 0" },
     { "path": "/api/cron/daily-nudge", "schedule": "0 12 * * *" },
+    { "path": "/api/cron/workspace-runner", "schedule": "*/1 * * * *" },
     { "path": "/api/cron/workspace-daily-run", "schedule": "30 9 * * *" },
     { "path": "/api/cron/intel-sync", "schedule": "0 9 * * *" },
     { "path": "/api/cron/intel-full-pipeline", "schedule": "10 9 * * *" }

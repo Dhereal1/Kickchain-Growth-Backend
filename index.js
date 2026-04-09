@@ -579,6 +579,27 @@ async function ensureGrowthSchema() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  // Workspace run jobs (durable async /run)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_workspace_run_jobs (
+      id BIGSERIAL PRIMARY KEY,
+      workspace_id INT NOT NULL REFERENCES intel_workspaces(id) ON DELETE CASCADE,
+      telegram_chat_id TEXT NOT NULL,
+      requested_by BIGINT,
+      requested_by_username TEXT,
+      status TEXT NOT NULL DEFAULT 'queued', -- queued | running | success | failed
+      options JSONB,
+      result JSONB,
+      error_message TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      started_at TIMESTAMP,
+      finished_at TIMESTAMP
+    );
+  `);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS intel_workspace_run_jobs_status_idx ON intel_workspace_run_jobs (status, created_at)'
+  );
   await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS workspace_id INT");
   await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS user_id BIGINT");
   await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS username TEXT");
@@ -922,6 +943,163 @@ function formatTeamOutput(items) {
   return lines.join('\n').trim();
 }
 
+async function telegramSendMessage({ chatId, text }) {
+  const botToken = String(process.env.BOT_TOKEN || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!botToken) throw new Error('BOT_TOKEN missing');
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const body = {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true,
+  };
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j?.ok) {
+    const msg = j?.description || `telegram sendMessage failed (${r.status})`;
+    const e = new Error(msg);
+    e.details = JSON.stringify(j || {});
+    throw e;
+  }
+  return j;
+}
+
+async function getQuickPreviewCommunities({ workspaceId, limit = 3 }) {
+  const r = await pool.query(
+    `
+      SELECT community_name
+      FROM discovered_communities
+      WHERE workspace_id = $1
+      ORDER BY discovered_at DESC
+      LIMIT $2
+    `,
+    [Number(workspaceId), Number(limit)]
+  );
+  return (r.rows || []).map((x) => x.community_name).filter(Boolean);
+}
+
+async function runWorkspaceDiscoveryJob({
+  jobId,
+  workspace,
+  platform,
+  options,
+}) {
+  const startedAt = new Date();
+  await pool.query(
+    `UPDATE intel_workspace_run_jobs
+     SET status = 'running', started_at = NOW()
+     WHERE id = $1`,
+    [Number(jobId)]
+  );
+
+  try {
+    const cfg = getDiscoveryConfigFromEnv();
+    const wsCfg = await getWorkspaceConfig({ pool, ensureGrowthSchema, workspaceId: workspace.id });
+    const thresholds = wsCfg?.thresholds && typeof wsCfg.thresholds === 'object' ? wsCfg.thresholds : {};
+
+    const defaultQueries = Array.isArray(thresholds.discovery_queries) && thresholds.discovery_queries.length
+      ? thresholds.discovery_queries.map(String).filter(Boolean).slice(0, 25)
+      : [
+          'telegram crypto group',
+          'telegram betting group',
+          'web3 gaming telegram group',
+          'telegram gambling chat',
+          'telegram crypto signals group',
+        ];
+
+    const queries = Array.isArray(options?.queries) ? options.queries.map(String).filter(Boolean) : defaultQueries;
+
+    const apifyActors = createApifyActors();
+
+    const extraction = options?.message_extraction === false
+      ? { ok: true, skipped: true }
+      : await discoverFromMessageExtraction({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          windowHours: Number(options?.window_hours || cfg.windowHours),
+          maxPosts: Number(options?.max_posts || cfg.maxPosts),
+        });
+
+    let search = { ok: true, skipped: true };
+    const searchEnabled = options?.search !== false;
+    if (searchEnabled && queries.length) {
+      if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
+        throw new Error('APIFY_DISCOVERY_ACTOR_ID is required for search discovery');
+      }
+      const run = await apifyActors.runSearch({ queries, input: options?.input && typeof options.input === 'object' ? options.input : {} });
+      const text = JSON.stringify(run.items || []);
+      const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
+      search = await upsertDiscoveredCommunities({
+        pool,
+        ensureGrowthSchema,
+        workspaceId: workspace.id,
+        communities: found,
+        source: 'search',
+        meta: { actor: 'apify_search', datasetId: run.datasetId },
+      });
+      search.datasetId = run.datasetId;
+      search.items = (run.items || []).length;
+      search.queries = queries;
+    }
+
+    const scrapeEnabled = options?.scrape !== false;
+    const scrape = scrapeEnabled
+      ? await scrapeDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          apifyActors,
+          workspaceId: workspace.id,
+          maxScrapes: Number(options?.max_scrapes || cfg.maxScrapes),
+          cooldownHours: Number(options?.cooldown_hours || cfg.cooldownHours),
+          platform,
+          configOverride: options?.configOverride || null,
+        })
+      : { ok: true, skipped: true };
+
+    const rankings = await computeAndStoreCommunityRankings({
+      pool,
+      ensureGrowthSchema,
+      workspaceId: workspace.id,
+      platform,
+    });
+
+    const top = await getWorkspaceTop({ workspaceId: workspace.id, limit: 10 });
+    const team_output = formatTeamOutput(top.items);
+
+    const durationMs = Date.now() - startedAt.getTime();
+    const result = { ok: true, extraction, search, scrape, rankings, top: top.items, team_output, duration_ms: durationMs };
+
+    await pool.query(
+      `UPDATE intel_workspace_run_jobs
+       SET status = 'success', finished_at = NOW(), result = $2::jsonb
+       WHERE id = $1`,
+      [Number(jobId), JSON.stringify(result)]
+    );
+
+    await telegramSendMessage({ chatId: workspace.telegram_chat_id, text: `🔥 Full Results (Deep Scan)\n\n${team_output}` });
+
+    return result;
+  } catch (err) {
+    const msg = err?.message || String(err);
+    await pool.query(
+      `UPDATE intel_workspace_run_jobs
+       SET status = 'failed', finished_at = NOW(), error_message = $2
+       WHERE id = $1`,
+      [Number(jobId), String(msg).slice(0, 2000)]
+    );
+    try {
+      await telegramSendMessage({ chatId: workspace.telegram_chat_id, text: '❌ Discovery failed, try again later' });
+    } catch (sendErr) {
+      console.error('failed to send discovery failed message:', sendErr?.message || String(sendErr));
+    }
+    throw err;
+  }
+}
+
 async function getWorkspaceTop({ workspaceId, limit = 10 }) {
   const latestDayRes = await pool.query(
     `SELECT MAX(day) AS day FROM community_rankings WHERE workspace_id = $1`,
@@ -1140,6 +1318,140 @@ registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
       error: err?.message || 'workspace_run_failed',
       details: err?.details ? String(err.details).slice(0, 2000) : undefined,
     });
+  }
+});
+
+// Enqueue an async workspace discovery run (recommended for Telegram /run)
+registerWithApiAlias('post', '/intel/workspace/enqueue-run', async (req, res) => {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const telegramChatId = body.telegram_chat_id != null ? String(body.telegram_chat_id).trim() : '';
+    const workspaceName = body.name != null ? String(body.name).trim() : null;
+    if (!telegramChatId) return res.status(400).json({ ok: false, error: 'telegram_chat_id is required' });
+
+    const requestedBy = body.requested_by != null ? Number(body.requested_by) : null;
+    const requestedByUsername = body.requested_by_username != null ? String(body.requested_by_username).trim() : null;
+
+    const workspace = await getOrCreateWorkspace({
+      pool,
+      ensureGrowthSchema,
+      telegramChatId,
+      name: workspaceName,
+    });
+
+    const platform = String(body.platform || 'telegram').toLowerCase();
+    const options = body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {};
+
+    const r = await pool.query(
+      `
+        INSERT INTO intel_workspace_run_jobs (workspace_id, telegram_chat_id, requested_by, requested_by_username, status, options)
+        VALUES ($1, $2, $3, $4, 'queued', $5::jsonb)
+        RETURNING id, status, created_at
+      `,
+      [
+        Number(workspace.id),
+        String(workspace.telegram_chat_id),
+        Number.isFinite(requestedBy) ? requestedBy : null,
+        requestedByUsername || null,
+        JSON.stringify({ ...options, platform }),
+      ]
+    );
+
+    const preview = await getQuickPreviewCommunities({ workspaceId: workspace.id, limit: 3 });
+
+    return res.json({
+      ok: true,
+      job: r.rows[0],
+      workspace,
+      preview,
+      note: 'Job queued. Results will be posted to the group shortly.',
+    });
+  } catch (err) {
+    console.error('enqueue workspace run failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: err?.message || 'enqueue_failed' });
+  }
+});
+
+// Job runner (cron-safe): processes at most 1 queued job per invocation
+registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
+  const secret = String(process.env.CRON_SECRET || '').trim();
+  if (secret) {
+    const provided = String(req.query?.secret || req.headers['x-cron-secret'] || '').trim();
+    if (provided !== secret) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+
+    // Mark stuck jobs as failed (e.g., function timeout mid-run).
+    await pool.query(
+      `
+        UPDATE intel_workspace_run_jobs
+        SET status = 'failed', finished_at = NOW(), error_message = COALESCE(error_message, 'runner_timeout_or_abort')
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < NOW() - INTERVAL '15 minutes'
+      `
+    );
+
+    await pool.query('BEGIN');
+    const jobRes = await pool.query(
+      `
+        SELECT id, workspace_id, telegram_chat_id, options
+        FROM intel_workspace_run_jobs
+        WHERE status = 'queued'
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      `
+    );
+
+    const job = jobRes.rows[0] || null;
+    if (!job) {
+      await pool.query('COMMIT');
+      return res.json({ ok: true, processed: 0 });
+    }
+
+    // Claim job
+    await pool.query(
+      `UPDATE intel_workspace_run_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
+      [Number(job.id)]
+    );
+    await pool.query('COMMIT');
+
+    const wsRes = await pool.query(
+      `SELECT id, name, telegram_chat_id FROM intel_workspaces WHERE id = $1 LIMIT 1`,
+      [Number(job.workspace_id)]
+    );
+    const workspace = wsRes.rows[0];
+    if (!workspace) {
+      await pool.query(
+        `UPDATE intel_workspace_run_jobs SET status = 'failed', finished_at = NOW(), error_message = 'workspace not found' WHERE id = $1`,
+        [Number(job.id)]
+      );
+      return res.json({ ok: true, processed: 1, status: 'failed', reason: 'workspace_not_found' });
+    }
+
+    const options = job.options && typeof job.options === 'object' ? job.options : {};
+    const platform = String(options.platform || 'telegram').toLowerCase();
+
+    await runWorkspaceDiscoveryJob({ jobId: job.id, workspace, platform, options });
+    return res.json({ ok: true, processed: 1, status: 'success', job_id: job.id });
+  } catch (err) {
+    try {
+      await pool.query('ROLLBACK');
+    } catch {
+      // ignore
+    }
+    console.error('workspace runner failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: err?.message || 'runner_failed' });
   }
 });
 
