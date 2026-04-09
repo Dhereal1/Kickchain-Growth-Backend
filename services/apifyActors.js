@@ -16,11 +16,15 @@ function jsonStringifySafe(value) {
 }
 
 async function apifyFetchJson(url, { method = 'GET', body = null } = {}) {
+  const timeoutMs = Number(process.env.APIFY_HTTP_TIMEOUT_MS || 12000) || 12000;
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
   const r = await fetch(url, {
     method,
     headers: body ? { 'content-type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
-  });
+    signal: controller.signal,
+  }).finally(() => clearTimeout(t));
   const txt = await r.text().catch(() => '');
   if (!r.ok) {
     const e = new Error(`Apify API error: ${r.status}`);
@@ -77,7 +81,10 @@ async function fetchDatasetItems({ datasetId, token, limit = 200, offset = 0 }) 
   params.set('token', token);
 
   const url = `https://api.apify.com/v2/datasets/${encodeURIComponent(datasetId)}/items?${params.toString()}`;
-  const r = await fetch(url, { method: 'GET' });
+  const timeoutMs = Number(process.env.APIFY_HTTP_TIMEOUT_MS || 12000) || 12000;
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  const r = await fetch(url, { method: 'GET', signal: controller.signal }).finally(() => clearTimeout(t));
   if (!r.ok) {
     const t = await r.text().catch(() => '');
     const e = new Error(`Apify dataset error: ${r.status}`);
