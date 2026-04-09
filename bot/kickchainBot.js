@@ -617,9 +617,13 @@ function createKickchainBot(options) {
       if (team) return ctx.reply(team);
       return ctx.reply('✅ Run completed. Use /top to view results.');
     } catch (err) {
-      const msg = err?.response?.data?.error || err?.message || 'Run failed';
-      console.error('intel /run failed:', msg);
-      return ctx.reply(`❌ Intel run failed: ${String(msg).slice(0, 180)}`);
+      const status = err?.response?.status;
+      const apiErr = err?.response?.data?.error;
+      const apiDetails = err?.response?.data?.details;
+      const msg = apiErr || err?.message || 'Run failed';
+      console.error('intel /run failed:', { status, msg, details: apiDetails });
+      const extra = apiDetails ? `\nDetails: ${String(apiDetails).slice(0, 180)}` : '';
+      return ctx.reply(`❌ Intel run failed: ${String(msg).slice(0, 180)}${extra}`);
     }
   });
 

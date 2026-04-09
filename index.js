@@ -1038,7 +1038,17 @@ registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
           'telegram crypto signals group',
         ];
 
-    const queries = Array.isArray(body.queries) ? body.queries.map(String).filter(Boolean) : defaultQueries;
+    const hasDirectInput = body.input && typeof body.input === 'object' && !Array.isArray(body.input);
+    const queries = Array.isArray(body.queries)
+      ? body.queries.map(String).filter(Boolean)
+      : Array.isArray(body.searchStringsArray)
+        ? body.searchStringsArray.map(String).filter(Boolean)
+        : hasDirectInput && typeof body.input.queries === 'string'
+          ? body.input.queries
+              .split('\n')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : defaultQueries;
     const platform = String(body.platform || cfg.platform || 'telegram').toLowerCase();
 
     const apifyActors = createApifyActors();
@@ -1060,7 +1070,18 @@ registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
         return res.status(400).json({ ok: false, error: 'APIFY_DISCOVERY_ACTOR_ID is required for search discovery' });
       }
 
-      const run = await apifyActors.runSearch({ queries, input: {} });
+      const searchInputOverride = hasDirectInput
+        ? body.input
+        : {
+            ...(Number.isFinite(Number(body.maxResultsPerPage))
+              ? { maxResultsPerPage: Number(body.maxResultsPerPage) }
+              : {}),
+          };
+
+      // If caller provides a direct Apify input object, do not auto-map `queries` into other fields.
+      const run = hasDirectInput
+        ? await apifyActors.runSearch({ queries: [], input: searchInputOverride })
+        : await apifyActors.runSearch({ queries, input: searchInputOverride });
       const text = JSON.stringify(run.items || []);
       const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
       search = await upsertDiscoveredCommunities({
@@ -1111,7 +1132,14 @@ registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
     });
   } catch (err) {
     console.error('workspace run failed:', err?.message || String(err));
-    return res.status(500).json({ ok: false, error: err?.message || 'workspace_run_failed' });
+    if (err?.details) {
+      console.error('workspace run apify details:', String(err.details).slice(0, 2000));
+    }
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || 'workspace_run_failed',
+      details: err?.details ? String(err.details).slice(0, 2000) : undefined,
+    });
   }
 });
 

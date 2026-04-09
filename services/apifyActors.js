@@ -167,6 +167,39 @@ function createApifyActors() {
   const maxWaitMs = Number(process.env.APIFY_ACTOR_MAX_WAIT_MS || 25000) || 25000;
   const datasetFetchLimit = Number(process.env.APIFY_DISCOVERY_DATASET_LIMIT || 200) || 200;
 
+  function coerceQueriesToString(value) {
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map(String).filter(Boolean).join('\n');
+    return '';
+  }
+
+  function sanitizeQueriesFields({ input, qs }) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return;
+
+    // Some actors validate `queries` strictly as a string. If env templates provide an array, coerce it.
+    if (Array.isArray(input.queries)) {
+      const joined = coerceQueriesToString(input.queries);
+      if (joined) input.queries = joined;
+      else delete input.queries;
+    }
+
+    // Nested schema compatibility: `input: { queries: "..." }`
+    if (input.input && typeof input.input === 'object' && !Array.isArray(input.input)) {
+      if (Array.isArray(input.input.queries)) {
+        const joined = coerceQueriesToString(input.input.queries);
+        if (joined) input.input.queries = joined;
+        else delete input.input.queries;
+      }
+      if ((input.input.queries == null || String(input.input.queries).trim() === '') && qs.length) {
+        input.input.queries = qs.join('\n');
+      }
+    }
+
+    if ((input.queries == null || String(input.queries).trim() === '') && qs.length && typeof input.queries === 'string') {
+      input.queries = qs.join('\n');
+    }
+  }
+
   async function runSearch({ queries, input: inputOverride = null } = {}) {
     if (!discoveryActorId) {
       throw new Error('APIFY_DISCOVERY_ACTOR_ID is not set');
@@ -186,19 +219,21 @@ function createApifyActors() {
       ...overrideObj,
     };
 
-    // Best-effort mapping: support either `searchStringsArray` (common) or `queries` (custom actors).
-    if (Array.isArray(input.searchStringsArray)) {
-      // Keep env-provided input if present.
-    } else if (qs.length) {
-      input.searchStringsArray = qs;
-    }
+    sanitizeQueriesFields({ input, qs });
 
-    // IMPORTANT: Do NOT auto-set `input.queries` to an array.
-    // Some Apify actors (including popular search actors) define `queries` as a single string
-    // (often newline-separated). Sending an array triggers "input.queries must be string".
-    if (typeof input.queries === 'string' && qs.length) {
-      // If user provided an empty string, populate it; otherwise leave as-is.
-      if (!input.queries.trim()) input.queries = qs.join('\n');
+    // Best-effort mapping:
+    // - Prefer env-provided shape (some actors use `input.queries` or nested `input.queries`).
+    // - If neither is present, fall back to `searchStringsArray` (common for Google search actors).
+    const hasQueriesField =
+      input.queries != null ||
+      (input.input && typeof input.input === 'object' && !Array.isArray(input.input) && input.input.queries != null);
+
+    if (!hasQueriesField) {
+      if (Array.isArray(input.searchStringsArray)) {
+        // Keep env-provided input if present.
+      } else if (qs.length) {
+        input.searchStringsArray = qs;
+      }
     }
 
     async function startWithOptionalRetry(actorInput) {
@@ -231,6 +266,7 @@ function createApifyActors() {
 
           // Ensure we don't keep an array `queries` around (some actors validate it as string).
           if (Array.isArray(retryInput.queries)) delete retryInput.queries;
+          if (Array.isArray(retryInput.searchStringsArray)) delete retryInput.searchStringsArray;
 
           const started = await startActorRun({ actorId: discoveryActorId, token, input: retryInput });
           if (!started.runId) throw new Error('Apify search run did not return runId');
