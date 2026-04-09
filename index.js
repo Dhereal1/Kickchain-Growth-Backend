@@ -1762,17 +1762,30 @@ registerWithApiAlias('get', '/telegram/webhook', async (req, res) => {
 });
 
 registerWithApiAlias('post', '/telegram/webhook', async (req, res) => {
+  // CRITICAL: Telegram expects a fast 200 OK. Never block on bot processing here.
   try {
     if (!isValidTelegramWebhook(req)) return res.sendStatus(401);
+    res.sendStatus(200);
 
     const bot = getBot();
-    if (!bot) return res.status(503).json({ ok: false, error: 'Bot disabled' });
+    if (!bot) {
+      console.warn('Telegram webhook received but bot is disabled (missing BOT_TOKEN)');
+      return;
+    }
 
-    await bot.handleUpdate(req.body);
-    return res.sendStatus(200);
+    Promise.resolve()
+      .then(() => bot.handleUpdate(req.body))
+      .catch((err) => {
+        console.error('Telegram webhook async handler failed:', err?.message || String(err));
+      });
   } catch (err) {
-    console.error('Telegram webhook failed:', err?.message || String(err));
-    return res.sendStatus(200);
+    // Response may already be sent; keep this path side-effect only.
+    console.error('Telegram webhook handler crashed:', err?.message || String(err));
+    try {
+      if (!res.headersSent) res.sendStatus(200);
+    } catch {
+      // ignore
+    }
   }
 });
 
