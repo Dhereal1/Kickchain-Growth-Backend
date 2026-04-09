@@ -1381,25 +1381,9 @@ registerWithApiAlias('post', '/intel/workspace/enqueue-run', async (req, res) =>
 
 // Job runner (cron-safe): processes at most 1 queued job per invocation
 registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
-  const secret = String(process.env.CRON_SECRET || '').trim();
-  if (secret) {
-    // Vercel Cron requests include this header. If present, allow without sharing a secret in the URL.
-    const cronHeader = String(req.headers['x-vercel-cron'] || '').trim().toLowerCase();
-    const isVercelCron = cronHeader && cronHeader !== '0' && cronHeader !== 'false';
-    if (isVercelCron) {
-      // ok
-    } else {
-    const provided = String(req.query?.secret || req.headers['x-cron-secret'] || '').trim();
-    if (provided !== secret) {
-      console.warn('workspace runner unauthorized', {
-        has_secret: !!secret,
-        has_provided: !!provided,
-        x_vercel_cron: cronHeader || null,
-      });
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
-    }
-    }
-  }
+  // NOTE: This endpoint is intentionally not protected by CRON_SECRET.
+  // Reason: It does not enqueue work or expose data. Only `/intel/workspace/enqueue-run` (admin-key protected)
+  // can create jobs. Without queued jobs, this endpoint is effectively a no-op.
 
   try {
     await ensureGrowthSchema();
