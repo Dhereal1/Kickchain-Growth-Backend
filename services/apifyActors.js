@@ -251,26 +251,50 @@ function createApifyActors() {
           detailMsg.toLowerCase().includes('input.queries') &&
           (detailMsg.toLowerCase().includes('required') || detailMsg.toLowerCase().includes('must be string'))
         ) {
-          const retryInput = { ...(actorInput || {}) };
-          const nested = retryInput.input && typeof retryInput.input === 'object' && !Array.isArray(retryInput.input)
-            ? { ...retryInput.input }
-            : {};
+          const firstRetry = { ...(actorInput || {}) };
+          const nested =
+            firstRetry.input && typeof firstRetry.input === 'object' && !Array.isArray(firstRetry.input)
+              ? { ...firstRetry.input }
+              : {};
 
           const qStr =
-            (typeof nested.queries === 'string' && nested.queries.trim()) ? nested.queries
-              : (typeof retryInput.queries === 'string' && retryInput.queries.trim()) ? retryInput.queries
+            (typeof nested.queries === 'string' && nested.queries.trim())
+              ? nested.queries
+              : (typeof firstRetry.queries === 'string' && firstRetry.queries.trim())
+                ? firstRetry.queries
                 : qs.join('\n');
 
           nested.queries = qStr;
-          retryInput.input = nested;
+          firstRetry.input = nested;
 
-          // Ensure we don't keep an array `queries` around (some actors validate it as string).
-          if (Array.isArray(retryInput.queries)) delete retryInput.queries;
-          if (Array.isArray(retryInput.searchStringsArray)) delete retryInput.searchStringsArray;
+          // Ensure we don't keep conflicting query fields around.
+          if ('queries' in firstRetry) delete firstRetry.queries;
+          if ('searchStringsArray' in firstRetry) delete firstRetry.searchStringsArray;
 
-          const started = await startActorRun({ actorId: discoveryActorId, token, input: retryInput });
-          if (!started.runId) throw new Error('Apify search run did not return runId');
-          return started;
+          try {
+            const started = await startActorRun({ actorId: discoveryActorId, token, input: firstRetry });
+            if (!started.runId) throw new Error('Apify search run did not return runId');
+            return started;
+          } catch (err2) {
+            // Some actors define *all* fields inside `input` (and reject root-level fields).
+            // Pack any remaining root fields into `input` and try once more.
+            const packedNested =
+              firstRetry.input && typeof firstRetry.input === 'object' && !Array.isArray(firstRetry.input)
+                ? { ...firstRetry.input }
+                : { queries: qStr };
+            for (const [k, v] of Object.entries(firstRetry)) {
+              if (k === 'input') continue;
+              if (packedNested[k] === undefined) packedNested[k] = v;
+            }
+            if (packedNested.queries == null || String(packedNested.queries).trim() === '') {
+              packedNested.queries = qStr;
+            }
+            const packedRetry = { input: packedNested };
+
+            const started = await startActorRun({ actorId: discoveryActorId, token, input: packedRetry });
+            if (!started.runId) throw new Error('Apify search run did not return runId');
+            return started;
+          }
         }
 
         throw err;
