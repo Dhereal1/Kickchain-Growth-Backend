@@ -955,28 +955,43 @@ async function telegramSendMessage({ chatId, text }) {
   const botToken = String(process.env.BOT_TOKEN || '').trim().replace(/^['"]|['"]$/g, '');
   if (!botToken) throw new Error('BOT_TOKEN missing');
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const body = {
-    chat_id: chatId,
-    text,
-    disable_web_page_preview: true,
-  };
-  const timeoutMs = Math.max(2000, Number(process.env.TELEGRAM_HTTP_TIMEOUT_MS || 8000) || 8000);
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: controller.signal,
-  }).finally(() => clearTimeout(t));
-  const j = await r.json().catch(() => null);
-  if (!r.ok || !j?.ok) {
-    const msg = j?.description || `telegram sendMessage failed (${r.status})`;
-    const e = new Error(msg);
-    e.details = JSON.stringify(j || {});
-    throw e;
+  const safeText = String(text || '');
+  // Telegram message limit is 4096 chars. Keep a buffer for formatting.
+  const MAX = 3900;
+  const chunks = [];
+  for (let i = 0; i < safeText.length; i += MAX) {
+    chunks.push(safeText.slice(i, i + MAX));
   }
-  return j;
+  if (!chunks.length) chunks.push('');
+
+  const timeoutMs = Math.max(2000, Number(process.env.TELEGRAM_HTTP_TIMEOUT_MS || 8000) || 8000);
+  let last = null;
+  for (const part of chunks) {
+    const body = {
+      chat_id: chatId,
+      text: part,
+      disable_web_page_preview: true,
+    };
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    // eslint-disable-next-line no-await-in-loop
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(t));
+    // eslint-disable-next-line no-await-in-loop
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j?.ok) {
+      const msg = j?.description || `telegram sendMessage failed (${r.status})`;
+      const e = new Error(msg);
+      e.details = JSON.stringify(j || {});
+      throw e;
+    }
+    last = j;
+  }
+  return last;
 }
 
 async function getQuickPreviewCommunities({ workspaceId, limit = 3 }) {
@@ -1003,6 +1018,12 @@ async function runWorkspaceDiscoveryJob({
   // Status is set to `running` by the runner when claiming the job.
 
   try {
+    console.info('workspace job started', {
+      job_id: Number(jobId),
+      workspace_id: Number(workspace.id),
+      telegram_chat_id: String(workspace.telegram_chat_id),
+      platform,
+    });
     const cfg = getDiscoveryConfigFromEnv();
     const wsCfg = await getWorkspaceConfig({ pool, ensureGrowthSchema, workspaceId: workspace.id });
     const thresholds = wsCfg?.thresholds && typeof wsCfg.thresholds === 'object' ? wsCfg.thresholds : {};
@@ -1087,11 +1108,16 @@ async function runWorkspaceDiscoveryJob({
       [Number(jobId), JSON.stringify(result)]
     );
 
-    await telegramSendMessage({ chatId: workspace.telegram_chat_id, text: `🔥 Full Results (Deep Scan)\n\n${team_output}` });
+    await telegramSendMessage({
+      chatId: workspace.telegram_chat_id,
+      text: `🔥 Full Results (Deep Scan)\n\n${team_output}`,
+    });
+    console.info('workspace job success', { job_id: Number(jobId), duration_ms: durationMs });
 
     return result;
   } catch (err) {
     const msg = err?.message || String(err);
+    console.error('workspace job failed', { job_id: Number(jobId), error: msg, details: err?.details || null });
     await pool.query(
       `UPDATE intel_workspace_run_jobs
        SET status = 'failed', finished_at = NOW(), error_message = $2
@@ -1394,6 +1420,45 @@ registerWithApiAlias('post', '/intel/workspace/enqueue-run', async (req, res) =>
   } catch (err) {
     console.error('enqueue workspace run failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: err?.message || 'enqueue_failed' });
+  }
+});
+
+// Inspect last jobs for a workspace (admin-only; debugging/ops)
+registerWithApiAlias('get', '/intel/workspace/jobs', async (req, res) => {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+    const chatId = req.query.telegram_chat_id != null ? String(req.query.telegram_chat_id).trim() : '';
+    if (!chatId) return res.status(400).json({ ok: false, error: 'telegram_chat_id is required' });
+
+    const wsRes = await pool.query(
+      `SELECT id, name, telegram_chat_id FROM intel_workspaces WHERE telegram_chat_id = $1 LIMIT 1`,
+      [chatId]
+    );
+    const workspace = wsRes.rows[0] || null;
+    if (!workspace) return res.json({ ok: true, workspace: null, jobs: [] });
+
+    const limit = Math.min(20, Math.max(1, Number(req.query.limit || 5) || 5));
+    const jobsRes = await pool.query(
+      `
+        SELECT id, status, error_message, created_at, started_at, finished_at
+        FROM intel_workspace_run_jobs
+        WHERE workspace_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2
+      `,
+      [Number(workspace.id), Number(limit)]
+    );
+
+    return res.json({ ok: true, workspace, jobs: jobsRes.rows || [] });
+  } catch (err) {
+    console.error('workspace jobs lookup failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: err?.message || 'jobs_lookup_failed' });
   }
 });
 
