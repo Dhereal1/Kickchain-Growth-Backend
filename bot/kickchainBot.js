@@ -13,6 +13,17 @@ function normalizeGroupId(value) {
   return `-${v}`;
 }
 
+function parseInternalGroupIds() {
+  const raw = String(process.env.INTERNAL_GROUP_IDS || '').trim();
+  if (!raw) return new Set();
+  const parts = raw
+    .split(',')
+    .map((s) => normalizeGroupId(s))
+    .map((s) => String(s).trim())
+    .filter(Boolean);
+  return new Set(parts);
+}
+
 function createKickchainBot(options) {
   const botToken = normalizeBotToken(options?.botToken || process.env.BOT_TOKEN);
   const backendUrl = String(options?.backendUrl || process.env.BACKEND_URL || '').trim();
@@ -31,6 +42,12 @@ function createKickchainBot(options) {
   }
 
   const intelAdminKey = String(process.env.INTEL_API_KEY || '').trim();
+  const internalGroupIds = parseInternalGroupIds();
+
+  function isInternalGroup(chatId) {
+    const id = normalizeGroupId(chatId);
+    return internalGroupIds.has(String(id));
+  }
 
   const groupId = normalizeGroupId(rawGroupId);
   let runtimeGroupId = '';
@@ -486,6 +503,24 @@ function createKickchainBot(options) {
       if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
         return ctx.reply('Use /run inside a Telegram group workspace.');
       }
+      if (!internalGroupIds.size) {
+        console.warn('Unauthorized intel /run attempt (INTERNAL_GROUP_IDS not set)', {
+          chat_id: ctx.chat?.id,
+          chat_type: ctx.chat?.type,
+          from_id: ctx.from?.id,
+          from_username: ctx.from?.username,
+        });
+        return ctx.reply('❌ Not allowed here');
+      }
+      if (!isInternalGroup(ctx.chat.id)) {
+        console.warn('Unauthorized intel /run attempt', {
+          chat_id: ctx.chat?.id,
+          chat_type: ctx.chat?.type,
+          from_id: ctx.from?.id,
+          from_username: ctx.from?.username,
+        });
+        return ctx.reply('❌ Not allowed here');
+      }
       if (!intelAdminKey) {
         return ctx.reply('Intel admin key is not configured on the backend.');
       }
@@ -515,6 +550,24 @@ function createKickchainBot(options) {
     try {
       if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
         return ctx.reply('Use /top inside a Telegram group workspace.');
+      }
+      if (!internalGroupIds.size) {
+        console.warn('Unauthorized intel /top attempt (INTERNAL_GROUP_IDS not set)', {
+          chat_id: ctx.chat?.id,
+          chat_type: ctx.chat?.type,
+          from_id: ctx.from?.id,
+          from_username: ctx.from?.username,
+        });
+        return ctx.reply('❌ Not allowed here');
+      }
+      if (!isInternalGroup(ctx.chat.id)) {
+        console.warn('Unauthorized intel /top attempt', {
+          chat_id: ctx.chat?.id,
+          chat_type: ctx.chat?.type,
+          from_id: ctx.from?.id,
+          from_username: ctx.from?.username,
+        });
+        return ctx.reply('❌ Not allowed here');
       }
       if (!intelAdminKey) {
         return ctx.reply('Intel admin key is not configured on the backend.');
