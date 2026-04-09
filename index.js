@@ -13,6 +13,8 @@ const { ingestDatasets, aggregateDaily, cleanupOldPosts } = require('./services/
 const { getIntelConfig } = require('./services/intelConfig');
 const { dispatchIntelWebhooks } = require('./services/intelWebhooks');
 const { createApifyActors } = require('./services/apifyActors');
+const { runTelethonDiscovery, getTelethonConfigFromEnv } = require('./services/telethonService');
+const { ingestTelethonGroups } = require('./services/telethonIngest');
 const {
   discoverFromMessageExtraction,
   scrapeDiscoveredCommunities,
@@ -1027,6 +1029,18 @@ async function runWorkspaceDiscoveryJob({
     const cfg = getDiscoveryConfigFromEnv();
     const wsCfg = await getWorkspaceConfig({ pool, ensureGrowthSchema, workspaceId: workspace.id });
     const thresholds = wsCfg?.thresholds && typeof wsCfg.thresholds === 'object' ? wsCfg.thresholds : {};
+    const signalConfig =
+      (options?.configOverride && typeof options.configOverride === 'object' && !Array.isArray(options.configOverride))
+        ? options.configOverride
+        : {
+            keywords: wsCfg?.keywords || undefined,
+            intent_keywords: thresholds?.intent_keywords,
+            promo_keywords: thresholds?.promo_keywords,
+            activity_keywords: thresholds?.activity_keywords,
+            intentKeywords: thresholds?.intentKeywords,
+            promoKeywords: thresholds?.promoKeywords,
+            activityKeywords: thresholds?.activityKeywords,
+          };
 
     const defaultQueries = Array.isArray(thresholds.discovery_queries) && thresholds.discovery_queries.length
       ? thresholds.discovery_queries.map(String).filter(Boolean).slice(0, 25)
@@ -1040,7 +1054,9 @@ async function runWorkspaceDiscoveryJob({
 
     const queries = Array.isArray(options?.queries) ? options.queries.map(String).filter(Boolean) : defaultQueries;
 
-    const apifyActors = createApifyActors();
+    const telethonCfg = getTelethonConfigFromEnv();
+    const useTelethon = !!telethonCfg.baseUrl && options?.use_telethon !== false;
+    const apifyActors = useTelethon ? null : createApifyActors();
 
     const extraction = options?.message_extraction === false
       ? { ok: true, skipped: true }
@@ -1055,38 +1071,77 @@ async function runWorkspaceDiscoveryJob({
     let search = { ok: true, skipped: true };
     const searchEnabled = options?.search !== false;
     if (searchEnabled && queries.length) {
-      if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
-        throw new Error('APIFY_DISCOVERY_ACTOR_ID is required for search discovery');
+      if (useTelethon) {
+        const run = await runTelethonDiscovery({
+          queries,
+          maxGroupsTotal: 10,
+          maxMessagesPerGroup: 20,
+        });
+        const groups = Array.isArray(run?.groups) ? run.groups : [];
+        const ingested = await ingestTelethonGroups({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          groups,
+          configOverride: signalConfig,
+          datasetId: 'telethon',
+        });
+        const toUpsert = ingested.communities.map((u) => `https://t.me/${String(u).replace(/^@/, '')}`);
+        const up = await upsertDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          communities: toUpsert,
+          source: 'telethon',
+          meta: { actor: 'telethon', groups: groups.length },
+        });
+        search = {
+          ok: true,
+          source: 'telethon',
+          groups: groups.length,
+          posts_ingested: ingested.posts_inserted,
+          ...up,
+          queries,
+        };
+      } else {
+        if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
+          throw new Error('APIFY_DISCOVERY_ACTOR_ID is required for search discovery');
+        }
+        const run = await apifyActors.runSearch({
+          queries,
+          input: options?.input && typeof options.input === 'object' ? options.input : {},
+        });
+        const text = JSON.stringify(run.items || []);
+        const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
+        search = await upsertDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          communities: found,
+          source: 'search',
+          meta: { actor: 'apify_search', datasetId: run.datasetId },
+        });
+        search.datasetId = run.datasetId;
+        search.items = (run.items || []).length;
+        search.queries = queries;
       }
-      const run = await apifyActors.runSearch({ queries, input: options?.input && typeof options.input === 'object' ? options.input : {} });
-      const text = JSON.stringify(run.items || []);
-      const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
-      search = await upsertDiscoveredCommunities({
-        pool,
-        ensureGrowthSchema,
-        workspaceId: workspace.id,
-        communities: found,
-        source: 'search',
-        meta: { actor: 'apify_search', datasetId: run.datasetId },
-      });
-      search.datasetId = run.datasetId;
-      search.items = (run.items || []).length;
-      search.queries = queries;
     }
 
     const scrapeEnabled = options?.scrape !== false;
-    const scrape = scrapeEnabled
-      ? await scrapeDiscoveredCommunities({
-          pool,
-          ensureGrowthSchema,
-          apifyActors,
-          workspaceId: workspace.id,
-          maxScrapes: Math.min(3, Math.max(0, Number(options?.max_scrapes || cfg.maxScrapes) || 0)),
-          cooldownHours: Number(options?.cooldown_hours || cfg.cooldownHours),
-          platform,
-          configOverride: options?.configOverride || null,
-        })
-      : { ok: true, skipped: true };
+    const scrape = useTelethon
+      ? { ok: true, skipped: true, via: 'telethon' }
+      : scrapeEnabled
+        ? await scrapeDiscoveredCommunities({
+            pool,
+            ensureGrowthSchema,
+            apifyActors,
+            workspaceId: workspace.id,
+            maxScrapes: Math.min(3, Math.max(0, Number(options?.max_scrapes || cfg.maxScrapes) || 0)),
+            cooldownHours: Number(options?.cooldown_hours || cfg.cooldownHours),
+            platform,
+            configOverride: options?.configOverride || null,
+          })
+        : { ok: true, skipped: true };
 
     const rankings = await computeAndStoreCommunityRankings({
       pool,
