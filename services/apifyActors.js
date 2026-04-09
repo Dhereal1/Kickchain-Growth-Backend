@@ -168,6 +168,8 @@ function createApifyActors() {
   const datasetFetchLimit = Number(process.env.APIFY_DISCOVERY_DATASET_LIMIT || 200) || 200;
   const preferNestedDiscoveryInput =
     String(process.env.APIFY_DISCOVERY_PREFER_NESTED_INPUT || '').trim().toLowerCase() === 'true';
+  const preferFlatQueriesString =
+    String(process.env.APIFY_DISCOVERY_PREFER_FLAT_QUERIES || '').trim().toLowerCase() === 'true';
   const debugDiscoveryInput =
     String(process.env.APIFY_DISCOVERY_DEBUG_INPUT || '').trim().toLowerCase() === 'true';
 
@@ -185,6 +187,14 @@ function createApifyActors() {
       const joined = coerceQueriesToString(input.queries);
       if (joined) input.queries = joined;
       else delete input.queries;
+    }
+
+    // If requested, ensure a flat newline-delimited `queries` string exists at the root.
+    // Useful for actors like `apify/google-search-scraper`.
+    if (preferFlatQueriesString && qs.length) {
+      if (input.queries == null || String(input.queries).trim() === '') {
+        input.queries = qs.join('\n');
+      }
     }
 
     // Nested schema compatibility: `input: { queries: "..." }`
@@ -218,7 +228,6 @@ function createApifyActors() {
       inputOverride && typeof inputOverride === 'object' ? inputOverride : {};
 
     const input = {
-      maxResultsPerPage: 5,
       ...baseInput,
       ...overrideObj,
     };
