@@ -166,6 +166,8 @@ function createApifyActors() {
 
   const maxWaitMs = Number(process.env.APIFY_ACTOR_MAX_WAIT_MS || 25000) || 25000;
   const datasetFetchLimit = Number(process.env.APIFY_DISCOVERY_DATASET_LIMIT || 200) || 200;
+  const preferNestedDiscoveryInput =
+    String(process.env.APIFY_DISCOVERY_PREFER_NESTED_INPUT || '').trim().toLowerCase() === 'true';
 
   function coerceQueriesToString(value) {
     if (typeof value === 'string') return value;
@@ -220,6 +222,27 @@ function createApifyActors() {
     };
 
     sanitizeQueriesFields({ input, qs });
+
+    // If requested, force the whole input to be nested under `input: { ... }` with `input.queries`.
+    // This matches actors whose schema is `{ input: { queries: string, ... } }`.
+    if (preferNestedDiscoveryInput && qs.length) {
+      const nested =
+        input.input && typeof input.input === 'object' && !Array.isArray(input.input) ? { ...input.input } : {};
+      if (nested.queries == null || String(nested.queries).trim() === '') {
+        nested.queries = qs.join('\n');
+      }
+      for (const [k, v] of Object.entries(input)) {
+        if (k === 'input') continue;
+        if (nested[k] === undefined) nested[k] = v;
+      }
+      const packed = { input: nested };
+      const started = await startWithOptionalRetry(packed);
+      const finished = await waitForRun({ runId: started.runId, token, timeoutMs: maxWaitMs });
+      const datasetId = finished.datasetId || started.datasetId;
+      if (!datasetId) throw new Error('Apify search run did not return datasetId');
+      const items = await fetchDatasetItems({ datasetId, token, limit: datasetFetchLimit });
+      return { runId: started.runId, datasetId, items };
+    }
 
     // Best-effort mapping:
     // - Prefer env-provided shape (some actors use `input.queries` or nested `input.queries`).
