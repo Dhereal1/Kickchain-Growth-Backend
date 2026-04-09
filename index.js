@@ -600,6 +600,14 @@ async function ensureGrowthSchema() {
   await pool.query(
     'CREATE INDEX IF NOT EXISTS intel_workspace_run_jobs_status_idx ON intel_workspace_run_jobs (status, created_at)'
   );
+
+  // Minimal throttle lock for public cron runners (prevents abuse / accidental hammering).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS intel_runner_locks (
+      key TEXT PRIMARY KEY,
+      locked_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
   await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS workspace_id INT");
   await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS user_id BIGINT");
   await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS username TEXT");
@@ -952,11 +960,15 @@ async function telegramSendMessage({ chatId, text }) {
     text,
     disable_web_page_preview: true,
   };
+  const timeoutMs = Math.max(2000, Number(process.env.TELEGRAM_HTTP_TIMEOUT_MS || 8000) || 8000);
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
   const r = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
-  });
+    signal: controller.signal,
+  }).finally(() => clearTimeout(t));
   const j = await r.json().catch(() => null);
   if (!r.ok || !j?.ok) {
     const msg = j?.description || `telegram sendMessage failed (${r.status})`;
@@ -988,12 +1000,7 @@ async function runWorkspaceDiscoveryJob({
   options,
 }) {
   const startedAt = new Date();
-  await pool.query(
-    `UPDATE intel_workspace_run_jobs
-     SET status = 'running', started_at = NOW()
-     WHERE id = $1`,
-    [Number(jobId)]
-  );
+  // Status is set to `running` by the runner when claiming the job.
 
   try {
     const cfg = getDiscoveryConfigFromEnv();
@@ -1053,7 +1060,7 @@ async function runWorkspaceDiscoveryJob({
           ensureGrowthSchema,
           apifyActors,
           workspaceId: workspace.id,
-          maxScrapes: Number(options?.max_scrapes || cfg.maxScrapes),
+          maxScrapes: Math.min(3, Math.max(0, Number(options?.max_scrapes || cfg.maxScrapes) || 0)),
           cooldownHours: Number(options?.cooldown_hours || cfg.cooldownHours),
           platform,
           configOverride: options?.configOverride || null,
@@ -1347,7 +1354,18 @@ registerWithApiAlias('post', '/intel/workspace/enqueue-run', async (req, res) =>
     });
 
     const platform = String(body.platform || 'telegram').toLowerCase();
-    const options = body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {};
+    const optionsRaw =
+      body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {};
+    // Guardrails (serverless + cost control)
+    const options = {
+      ...optionsRaw,
+      max_scrapes: Math.min(3, Math.max(0, Number(optionsRaw.max_scrapes ?? 1) || 1)),
+      window_hours: Math.min(168, Math.max(1, Number(optionsRaw.window_hours ?? 72) || 72)),
+      max_posts: Math.min(5000, Math.max(10, Number(optionsRaw.max_posts ?? 1000) || 1000)),
+      search: optionsRaw.search !== false,
+      scrape: optionsRaw.scrape !== false,
+      message_extraction: optionsRaw.message_extraction !== false,
+    };
 
     const r = await pool.query(
       `
@@ -1388,6 +1406,23 @@ registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
   try {
     await ensureGrowthSchema();
 
+    // Throttle to at most once per N seconds (DB-backed, safe across serverless instances).
+    const throttleSeconds = Math.max(5, Number(process.env.INTEL_RUNNER_THROTTLE_SECONDS || 30) || 30);
+    const lockRes = await pool.query(
+      `
+        INSERT INTO intel_runner_locks (key, locked_at)
+        VALUES ('workspace_runner', NOW())
+        ON CONFLICT (key) DO UPDATE
+          SET locked_at = EXCLUDED.locked_at
+        WHERE intel_runner_locks.locked_at < NOW() - ($1::int * INTERVAL '1 second')
+        RETURNING locked_at
+      `,
+      [throttleSeconds]
+    );
+    if (!lockRes.rowCount) {
+      return res.json({ ok: true, processed: 0, throttled: true });
+    }
+
     // Mark stuck jobs as failed (e.g., function timeout mid-run).
     await pool.query(
       `
@@ -1399,30 +1434,45 @@ registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
       `
     );
 
-    await pool.query('BEGIN');
-    const jobRes = await pool.query(
-      `
-        SELECT id, workspace_id, telegram_chat_id, options
-        FROM intel_workspace_run_jobs
-        WHERE status = 'queued'
-        ORDER BY created_at ASC
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      `
-    );
+    // IMPORTANT: claim jobs inside a real transaction (single client), otherwise BEGIN/COMMIT can hop connections.
+    const client = await pool.connect();
+    let job = null;
+    try {
+      await client.query('BEGIN');
 
-    const job = jobRes.rows[0] || null;
-    if (!job) {
-      await pool.query('COMMIT');
-      return res.json({ ok: true, processed: 0 });
+      const jobRes = await client.query(
+        `
+          SELECT id, workspace_id, telegram_chat_id, options
+          FROM intel_workspace_run_jobs
+          WHERE status = 'queued'
+          ORDER BY created_at ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        `
+      );
+
+      job = jobRes.rows[0] || null;
+      if (!job) {
+        await client.query('COMMIT');
+        return res.json({ ok: true, processed: 0 });
+      }
+
+      await client.query(
+        `UPDATE intel_workspace_run_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
+        [Number(job.id)]
+      );
+
+      await client.query('COMMIT');
+    } catch (txErr) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      throw txErr;
+    } finally {
+      client.release();
     }
-
-    // Claim job
-    await pool.query(
-      `UPDATE intel_workspace_run_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
-      [Number(job.id)]
-    );
-    await pool.query('COMMIT');
 
     const wsRes = await pool.query(
       `SELECT id, name, telegram_chat_id FROM intel_workspaces WHERE id = $1 LIMIT 1`,
@@ -1443,11 +1493,6 @@ registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
     await runWorkspaceDiscoveryJob({ jobId: job.id, workspace, platform, options });
     return res.json({ ok: true, processed: 1, status: 'success', job_id: job.id });
   } catch (err) {
-    try {
-      await pool.query('ROLLBACK');
-    } catch {
-      // ignore
-    }
     console.error('workspace runner failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: err?.message || 'runner_failed' });
   }
