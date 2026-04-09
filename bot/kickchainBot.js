@@ -308,7 +308,7 @@ function createKickchainBot(options) {
     }
   });
 
-  bot.on('message', (ctx) => {
+  bot.on('message', (ctx, next) => {
     if (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') {
       runtimeGroupId = String(ctx.chat.id);
       invalidGroupIds.delete(runtimeGroupId);
@@ -330,6 +330,8 @@ function createKickchainBot(options) {
     if (debugChatId) {
       console.log('CHAT_ID:', ctx.chat?.id);
     }
+
+    return next();
   });
 
   bot.command('stats', async (ctx) => {
