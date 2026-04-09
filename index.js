@@ -1383,8 +1383,14 @@ registerWithApiAlias('post', '/intel/workspace/enqueue-run', async (req, res) =>
 registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
   const secret = String(process.env.CRON_SECRET || '').trim();
   if (secret) {
+    // Vercel Cron requests include this header. If present, allow without sharing a secret in the URL.
+    const isVercelCron = String(req.headers['x-vercel-cron'] || '').trim() === '1';
+    if (isVercelCron) {
+      // ok
+    } else {
     const provided = String(req.query?.secret || req.headers['x-cron-secret'] || '').trim();
     if (provided !== secret) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
   }
 
   try {
