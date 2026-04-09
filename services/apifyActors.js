@@ -277,6 +277,9 @@ function createApifyActors() {
       try {
         const started = await startActorRun({ actorId: discoveryActorId, token, input: actorInput });
         if (!started.runId) throw new Error('Apify search run did not return runId');
+        if (debugDiscoveryInput) {
+          console.log('APIFY START RESULT:', JSON.stringify(started).slice(0, 800));
+        }
         return started;
       } catch (err) {
         const msg = String(err?.details || err?.message || '');
