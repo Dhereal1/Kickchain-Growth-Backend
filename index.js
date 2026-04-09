@@ -568,6 +568,30 @@ async function ensureGrowthSchema() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS growth_actions (
+      id SERIAL PRIMARY KEY,
+      workspace_id INT NOT NULL REFERENCES intel_workspaces(id) ON DELETE CASCADE,
+      user_id BIGINT NOT NULL,
+      username TEXT,
+      community_name TEXT NOT NULL,
+      action_type TEXT NOT NULL DEFAULT 'join',
+      action_day DATE NOT NULL DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS workspace_id INT");
+  await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS user_id BIGINT");
+  await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS username TEXT");
+  await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS community_name TEXT");
+  await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS action_type TEXT NOT NULL DEFAULT 'join'");
+  await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS action_day DATE NOT NULL DEFAULT CURRENT_DATE");
+  await pool.query("ALTER TABLE growth_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()");
+  await runOnce('2026-04-09_growth_actions_uniques', [
+    'CREATE UNIQUE INDEX IF NOT EXISTS growth_actions_unique_daily ON growth_actions (workspace_id, user_id, community_name, action_day)',
+    'CREATE INDEX IF NOT EXISTS growth_actions_workspace_day_idx ON growth_actions (workspace_id, action_day DESC)',
+  ]);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS community_ai_analyses (
       id BIGSERIAL PRIMARY KEY,
       user_id INT,
@@ -887,7 +911,7 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
 });
 
 function formatTeamOutput(items) {
-  const lines = ['🔥 Top Communities:', ''];
+  const lines = ['🔥 Top Communities Today', ''];
   const list = Array.isArray(items) ? items : [];
   for (let i = 0; i < Math.min(10, list.length); i += 1) {
     const it = list[i];
@@ -1122,6 +1146,110 @@ registerWithApiAlias('get', '/intel/workspace/top', async (req, res) => {
   } catch (err) {
     console.error('workspace top failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: err?.message || 'workspace_top_failed' });
+  }
+});
+
+function normalizeTelegramCommunity(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+  const s = raw.startsWith('@') ? raw : `@${raw}`;
+  const name = s.toLowerCase();
+  if (!/^@[a-z0-9_]{5,32}$/.test(name)) return null;
+  return `@${name.slice(1)}`;
+}
+
+registerWithApiAlias('post', '/intel/workspace/actions/join', async (req, res) => {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+
+    const chatId = body.telegram_chat_id != null ? String(body.telegram_chat_id).trim() : '';
+    const userId = body.user_id != null ? Number(body.user_id) : null;
+    const username = body.username != null ? String(body.username).trim() : null;
+    const community = normalizeTelegramCommunity(body.community_name || body.community);
+    const actionType = String(body.action_type || 'join').trim().toLowerCase() || 'join';
+
+    if (!chatId) return res.status(400).json({ ok: false, error: 'telegram_chat_id is required' });
+    if (!userId || !Number.isFinite(userId)) return res.status(400).json({ ok: false, error: 'user_id is required' });
+    if (!community) return res.status(400).json({ ok: false, error: 'invalid community format' });
+
+    const workspace = await getOrCreateWorkspace({ pool, ensureGrowthSchema, telegramChatId: chatId, name: null });
+
+    const r = await pool.query(
+      `
+        INSERT INTO growth_actions (workspace_id, user_id, username, community_name, action_type, action_day)
+        VALUES ($1,$2,$3,$4,$5, CURRENT_DATE)
+        ON CONFLICT (workspace_id, user_id, community_name, action_day) DO NOTHING
+        RETURNING id
+      `,
+      [workspace.id, userId, username, community, actionType]
+    );
+
+    return res.json({ ok: true, workspace_id: workspace.id, logged: !!r.rowCount, community_name: community });
+  } catch (err) {
+    console.error('workspace action join failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'Failed to log action' });
+  }
+});
+
+registerWithApiAlias('get', '/intel/workspace/actions/leaderboard', async (req, res) => {
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+  if (!token || token !== String(process.env.INTEL_API_KEY || '').trim()) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  try {
+    await ensureGrowthSchema();
+    const chatId = req.query.telegram_chat_id != null ? String(req.query.telegram_chat_id).trim() : '';
+    if (!chatId) return res.status(400).json({ ok: false, error: 'telegram_chat_id is required' });
+
+    const workspace = await getOrCreateWorkspace({ pool, ensureGrowthSchema, telegramChatId: chatId, name: null });
+    const daysRaw = req.query.days != null ? Number(req.query.days) : 7;
+    const days = Math.max(1, Math.min(30, Number.isFinite(daysRaw) ? daysRaw : 7));
+
+    const r = await pool.query(
+      `
+        SELECT
+          COALESCE(NULLIF(username, ''), CONCAT('user_', user_id::text)) AS username,
+          user_id,
+          COUNT(*)::int AS joins
+        FROM growth_actions
+        WHERE workspace_id = $1
+          AND action_day >= (CURRENT_DATE - ($2::int - 1))
+        GROUP BY username, user_id
+        ORDER BY joins DESC, username ASC
+        LIMIT 25
+      `,
+      [workspace.id, days]
+    );
+
+    const items = r.rows || [];
+    const format = String(req.query.format || '').trim().toLowerCase();
+    if (format === 'team') {
+      const lines = [];
+      lines.push('🏆 Weekly Leaderboard');
+      lines.push('');
+      if (!items.length) {
+        lines.push('No actions logged yet.');
+      } else {
+        items.slice(0, 10).forEach((x, idx) => {
+          lines.push(`${idx + 1}. @${String(x.username).replace(/^@/, '')} — ${x.joins} joins`);
+        });
+      }
+      return res.json({ ok: true, workspace, days, items, team_output: lines.join('\n') });
+    }
+
+    return res.json({ ok: true, workspace, days, items });
+  } catch (err) {
+    console.error('workspace leaderboard failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'Failed to load leaderboard' });
   }
 });
 
@@ -1445,6 +1573,121 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
   } catch (err) {
     console.error('intel-sync cron failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: 'Cron sync failed' });
+  }
+});
+
+registerWithApiAlias('get', '/cron/workspace-daily-run', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  const enabled = String(process.env.ENABLE_WORKSPACE_DAILY_RUN || '').trim().toLowerCase() === 'true';
+  if (!enabled) return res.json({ ok: true, skipped: true, reason: 'disabled' });
+
+  const rawGroups = String(process.env.INTERNAL_GROUP_IDS || '').trim();
+  const groupIds = rawGroups
+    .split(',')
+    .map((s) => String(s).trim())
+    .filter(Boolean)
+    .slice(0, 25);
+
+  if (!groupIds.length) return res.json({ ok: true, skipped: true, reason: 'no_groups' });
+
+  try {
+    await ensureGrowthSchema();
+    const cfg = getDiscoveryConfigFromEnv();
+    const apifyActors = createApifyActors();
+    const doSearch = String(process.env.WORKSPACE_DAILY_RUN_SEARCH || '').trim().toLowerCase() === 'true';
+
+    const results = [];
+    for (const chatId of groupIds) {
+      // eslint-disable-next-line no-await-in-loop
+      const workspace = await getOrCreateWorkspace({ pool, ensureGrowthSchema, telegramChatId: chatId, name: null });
+
+      // eslint-disable-next-line no-await-in-loop
+      const wsCfg = await getWorkspaceConfig({ pool, ensureGrowthSchema, workspaceId: workspace.id });
+      const thresholds = wsCfg?.thresholds && typeof wsCfg.thresholds === 'object' ? wsCfg.thresholds : {};
+      const defaultQueries = Array.isArray(thresholds.discovery_queries) && thresholds.discovery_queries.length
+        ? thresholds.discovery_queries.map(String).filter(Boolean).slice(0, 25)
+        : [
+            'telegram crypto group',
+            'telegram betting group',
+            'web3 gaming telegram group',
+            'telegram gambling chat',
+            'telegram crypto signals group',
+          ];
+
+      // eslint-disable-next-line no-await-in-loop
+      const extraction = await discoverFromMessageExtraction({
+        pool,
+        ensureGrowthSchema,
+        workspaceId: workspace.id,
+        windowHours: Number(cfg.windowHours),
+        maxPosts: Number(cfg.maxPosts),
+      });
+
+      let search = { ok: true, skipped: true };
+      if (doSearch && defaultQueries.length) {
+        if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
+          search = { ok: false, skipped: true, error: 'APIFY_DISCOVERY_ACTOR_ID missing' };
+        } else {
+          // eslint-disable-next-line no-await-in-loop
+          const run = await apifyActors.runSearch({ queries: defaultQueries, input: {} });
+          const text = JSON.stringify(run.items || []);
+          const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
+          // eslint-disable-next-line no-await-in-loop
+          search = await upsertDiscoveredCommunities({
+            pool,
+            ensureGrowthSchema,
+            workspaceId: workspace.id,
+            communities: found,
+            source: 'search',
+            meta: { actor: 'apify_search', datasetId: run.datasetId },
+          });
+        }
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      const scrape = await scrapeDiscoveredCommunities({
+        pool,
+        ensureGrowthSchema,
+        apifyActors,
+        workspaceId: workspace.id,
+        maxScrapes: Number(cfg.maxScrapes),
+        cooldownHours: Number(cfg.cooldownHours),
+        platform: cfg.platform,
+        configOverride: null,
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      const rankings = await computeAndStoreCommunityRankings({
+        pool,
+        ensureGrowthSchema,
+        workspaceId: workspace.id,
+        platform: cfg.platform,
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      const top = await getWorkspaceTop({ workspaceId: workspace.id, limit: 10 });
+      const message = formatTeamOutput(top.items);
+
+      // eslint-disable-next-line no-await-in-loop
+      const sent = await sendToUsers([chatId], message);
+      results.push({ chat_id: chatId, workspace_id: workspace.id, extraction, search, scrape, rankings, sent });
+    }
+
+    return res.json({ ok: true, workspaces: results });
+  } catch (err) {
+    console.error('workspace-daily-run cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'workspace_daily_run_failed' });
   }
 });
 

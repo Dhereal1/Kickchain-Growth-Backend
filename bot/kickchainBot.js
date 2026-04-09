@@ -342,19 +342,27 @@ function createKickchainBot(options) {
 
   bot.command('leaderboard', async (ctx) => {
     try {
-      const response = await axios.get(`${backendUrl}/leaderboard`);
-      const leaderboard = response.data.leaderboard || [];
-      let message = '🏆 Top Referrers\n\n';
+      if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
+        return ctx.reply('Use /leaderboard inside the team group workspace.');
+      }
+      if (!internalGroupIds.size || !isInternalGroup(ctx.chat.id)) {
+        console.warn('Unauthorized intel /leaderboard attempt', {
+          chat_id: ctx.chat?.id,
+          chat_type: ctx.chat?.type,
+          from_id: ctx.from?.id,
+          from_username: ctx.from?.username,
+        });
+        return ctx.reply('❌ Not allowed here');
+      }
+      if (!intelAdminKey) return ctx.reply('Intel admin key is not configured on the backend.');
 
-      leaderboard.forEach((user, index) => {
-        const username = user.username || 'unknown';
-        const totalReferrals = user.total_referrals ?? 0;
-        const tier = user.tier ? ` [${user.tier}]` : '';
-        const isYou = user.username && ctx.from?.username && user.username === ctx.from.username;
-        message += `${index + 1}. ${username}${tier} — ${totalReferrals} invites${isYou ? ' 👉 YOU' : ''}\n`;
+      const r = await axios.get(`${backendUrl}/intel/workspace/actions/leaderboard`, {
+        headers: { Authorization: `Bearer ${intelAdminKey}` },
+        params: { telegram_chat_id: String(ctx.chat.id), days: 7, format: 'team' },
       });
-
-      await ctx.reply(message.trim());
+      const team = r.data?.team_output || null;
+      if (team) return ctx.reply(team);
+      return ctx.reply('No actions logged yet. Use /join @community to log.');
     } catch (err) {
       console.error('Leaderboard command failed:', err?.message || 'Unknown error');
       ctx.reply('Error fetching leaderboard ❌');
@@ -419,10 +427,49 @@ function createKickchainBot(options) {
   bot.command('join', async (ctx) => {
     const message = ctx.message?.text || '';
     const parts = message.split(' ').filter(Boolean);
-    if (parts.length < 2) return ctx.reply('Usage: /join <match_id>');
+    if (parts.length < 2) return ctx.reply('Usage: /join <match_id>  OR  /join @community');
     const match_id = parts[1];
 
     try {
+      // Growth workflow: /join @community (group-only)
+      if (String(match_id || '').startsWith('@')) {
+        if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
+          return ctx.reply('Use /join @community inside the team group workspace.');
+        }
+        if (!internalGroupIds.size || !isInternalGroup(ctx.chat.id)) {
+          console.warn('Unauthorized intel /join attempt', {
+            chat_id: ctx.chat?.id,
+            chat_type: ctx.chat?.type,
+            from_id: ctx.from?.id,
+            from_username: ctx.from?.username,
+          });
+          return ctx.reply('❌ Not allowed here');
+        }
+        if (!intelAdminKey) return ctx.reply('Intel admin key is not configured on the backend.');
+
+        const community = String(match_id || '').trim().toLowerCase();
+        if (!/^@[a-z0-9_]{5,32}$/.test(community)) {
+          return ctx.reply('Invalid community. Use: /join @community (public username).');
+        }
+
+        const user_id = ctx.from?.id;
+        const username = ctx.from?.username || ctx.from?.first_name || 'unknown';
+
+        await axios.post(
+          `${backendUrl}/intel/workspace/actions/join`,
+          {
+            telegram_chat_id: String(ctx.chat.id),
+            user_id,
+            username,
+            community_name: community,
+            action_type: 'join',
+          },
+          { headers: { Authorization: `Bearer ${intelAdminKey}` } }
+        );
+
+        return ctx.reply(`✅ Logged: joined ${community}`);
+      }
+
       const telegram_id = ctx.from.id;
       await axios.post(`${backendUrl}/matches/join`, {
         match_id,
