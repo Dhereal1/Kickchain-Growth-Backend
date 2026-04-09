@@ -168,6 +168,8 @@ function createApifyActors() {
   const datasetFetchLimit = Number(process.env.APIFY_DISCOVERY_DATASET_LIMIT || 200) || 200;
   const preferNestedDiscoveryInput =
     String(process.env.APIFY_DISCOVERY_PREFER_NESTED_INPUT || '').trim().toLowerCase() === 'true';
+  const debugDiscoveryInput =
+    String(process.env.APIFY_DISCOVERY_DEBUG_INPUT || '').trim().toLowerCase() === 'true';
 
   function coerceQueriesToString(value) {
     if (typeof value === 'string') return value;
@@ -225,17 +227,25 @@ function createApifyActors() {
 
     // If requested, force the whole input to be nested under `input: { ... }` with `input.queries`.
     // This matches actors whose schema is `{ input: { queries: string, ... } }`.
-    if (preferNestedDiscoveryInput && qs.length) {
+    if (preferNestedDiscoveryInput) {
       const nested =
         input.input && typeof input.input === 'object' && !Array.isArray(input.input) ? { ...input.input } : {};
-      if (nested.queries == null || String(nested.queries).trim() === '') {
-        nested.queries = qs.join('\n');
-      }
+      const qStr =
+        (nested.queries != null && String(nested.queries).trim())
+          ? String(nested.queries)
+          : (typeof input.queries === 'string' && input.queries.trim())
+            ? input.queries
+            : qs.join('\n');
+
+      if (nested.queries == null || String(nested.queries).trim() === '') nested.queries = qStr;
       for (const [k, v] of Object.entries(input)) {
         if (k === 'input') continue;
         if (nested[k] === undefined) nested[k] = v;
       }
       const packed = { input: nested };
+      if (debugDiscoveryInput) {
+        console.log('APIFY DISCOVERY INPUT (packed):', JSON.stringify(packed).slice(0, 800));
+      }
       const started = await startWithOptionalRetry(packed);
       const finished = await waitForRun({ runId: started.runId, token, timeoutMs: maxWaitMs });
       const datasetId = finished.datasetId || started.datasetId;
@@ -257,6 +267,10 @@ function createApifyActors() {
       } else if (qs.length) {
         input.searchStringsArray = qs;
       }
+    }
+
+    if (debugDiscoveryInput) {
+      console.log('APIFY DISCOVERY INPUT (final):', JSON.stringify(input).slice(0, 800));
     }
 
     async function startWithOptionalRetry(actorInput) {
