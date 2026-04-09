@@ -131,6 +131,28 @@ function createKickchainBot(options) {
   };
 
   const bot = new Telegraf(botToken);
+  bot.catch((err, ctx) => {
+    console.error('Bot error:', err?.message || String(err), {
+      chat_id: ctx?.chat?.id,
+      chat_type: ctx?.chat?.type,
+      from_id: ctx?.from?.id,
+      update_type: ctx?.updateType,
+    });
+  });
+
+  bot.on('text', (ctx, next) => {
+    const text = String(ctx.message?.text || '');
+    if (text.startsWith('/run') || text.startsWith('/top') || text.startsWith('/leaderboard') || text.startsWith('/join')) {
+      console.info('Command received', {
+        text: text.slice(0, 60),
+        chat_id: ctx.chat?.id,
+        chat_type: ctx.chat?.type,
+        from_id: ctx.from?.id,
+        from_username: ctx.from?.username,
+      });
+    }
+    return next();
+  });
   const PLAY_MATCH_CB = 'kc_play_match';
   const REFERRAL_PUSH_CB = 'kc_referral_push';
   let cachedBotUsername = '';
@@ -575,6 +597,7 @@ function createKickchainBot(options) {
       const chatId = String(ctx.chat.id);
       const title = ctx.chat.title || null;
 
+      console.info('Intel /run starting', { chat_id: chatId, title });
       await ctx.reply('⏳ Running workspace intel… this can take ~30–60 seconds.');
 
       const r = await axios.post(
@@ -584,6 +607,11 @@ function createKickchainBot(options) {
       );
 
       const team = r.data?.team_output || null;
+      console.info('Intel /run completed', {
+        chat_id: chatId,
+        ok: !!r.data?.ok,
+        has_team_output: !!team,
+      });
       if (team) return ctx.reply(team);
       return ctx.reply('✅ Run completed. Use /top to view results.');
     } catch (err) {
@@ -621,12 +649,14 @@ function createKickchainBot(options) {
       }
 
       const chatId = String(ctx.chat.id);
+      console.info('Intel /top requested', { chat_id: chatId });
       const r = await axios.get(`${backendUrl}/intel/workspace/top`, {
         headers: { Authorization: `Bearer ${intelAdminKey}` },
         params: { telegram_chat_id: chatId, format: 'team' },
       });
 
       const team = r.data?.team_output || null;
+      console.info('Intel /top response', { chat_id: chatId, has_team_output: !!team });
       if (team) return ctx.reply(team);
       return ctx.reply('No workspace results yet. Run /run first.');
     } catch (err) {
