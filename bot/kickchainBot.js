@@ -26,7 +26,13 @@ function parseInternalGroupIds() {
 
 function createKickchainBot(options) {
   const botToken = normalizeBotToken(options?.botToken || process.env.BOT_TOKEN);
-  const backendUrl = String(options?.backendUrl || process.env.BACKEND_URL || '').trim();
+  const backendUrl = String(
+    options?.backendUrl ||
+      process.env.BACKEND_URL ||
+      process.env.PUBLIC_BASE_URL ||
+      (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '') ||
+      ''
+  ).trim();
   const rawGroupId = String(options?.groupId || process.env.GROUP_ID || '').trim();
   const debugChatId =
     String(options?.debugChatId ?? process.env.DEBUG_CHAT_ID ?? '')
@@ -38,7 +44,7 @@ function createKickchainBot(options) {
       .toLowerCase() === 'true';
 
   if (!botToken || !backendUrl) {
-    return { bot: null, error: 'Missing BOT_TOKEN or BACKEND_URL' };
+    return { bot: null, error: 'Missing BOT_TOKEN or backend base URL (set BACKEND_URL or PUBLIC_BASE_URL)' };
   }
 
   const intelAdminKey = String(process.env.INTEL_API_KEY || '').trim();

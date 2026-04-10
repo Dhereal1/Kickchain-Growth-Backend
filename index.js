@@ -74,11 +74,18 @@ function generateReferralCode(telegram_id) {
 }
 
 let botSingleton = null;
+let botSingletonError = null;
 function getBot() {
   if (botSingleton !== null) return botSingleton;
-  const { bot } = createKickchainBot();
+  const { bot, error } = createKickchainBot();
+  botSingletonError = error || null;
   botSingleton = bot || null;
   return botSingleton;
+}
+function getBotError() {
+  // Ensure we attempt init at least once for accurate error reporting.
+  if (botSingleton === null) getBot();
+  return botSingletonError;
 }
 
 function isValidTelegramWebhook(req) {
@@ -1758,7 +1765,8 @@ registerWithApiAlias('get', '/intel/workspace/actions/leaderboard', async (req, 
 
 // Telegram webhook (Vercel/serverless friendly)
 registerWithApiAlias('get', '/telegram/webhook', async (req, res) => {
-  res.json({ ok: true, bot: !!process.env.BOT_TOKEN });
+  const botReady = !!getBot();
+  res.json({ ok: true, bot: botReady, error: botReady ? null : getBotError() });
 });
 
 registerWithApiAlias('post', '/telegram/webhook', async (req, res) => {
@@ -1769,7 +1777,7 @@ registerWithApiAlias('post', '/telegram/webhook', async (req, res) => {
 
     const bot = getBot();
     if (!bot) {
-      console.warn('Telegram webhook received but bot is disabled (missing BOT_TOKEN)');
+      console.warn('Telegram webhook received but bot is disabled', { error: getBotError() });
       return;
     }
 
