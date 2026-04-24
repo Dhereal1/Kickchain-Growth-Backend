@@ -1,5 +1,7 @@
 node_modules/
 .env
+.ngrok/
+.codex
 _import/
 __pycache__/
 *.pyc
