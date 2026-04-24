@@ -1,16 +1,14 @@
+if (!process.env.VERCEL) {
+  require('dotenv').config({ path: '.env', quiet: true });
+}
+
+const express = require('express');
 const { CheerioCrawler, RequestList, Configuration, log } = require('crawlee');
 
 function clampNumber(value, { min, max, fallback }) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, n));
-}
-
-function getCrawleeServiceConfigFromEnv() {
-  const baseUrl = String(process.env.CRAWLEE_SERVICE_URL || '').trim().replace(/\/+$/, '');
-  const apiKey = String(process.env.CRAWLEE_SERVICE_API_KEY || '').trim();
-  const timeoutMs = Number(process.env.CRAWLEE_SERVICE_TIMEOUT_MS || 12000) || 12000;
-  return { baseUrl, apiKey, timeoutMs };
 }
 
 function normalizeQuery(q) {
@@ -20,7 +18,6 @@ function normalizeQuery(q) {
 
 function buildDuckDuckGoHtmlUrl(query) {
   const q = encodeURIComponent(query);
-  // HTML results page (lighter than JS app).
   return `https://duckduckgo.com/html/?q=${q}`;
 }
 
@@ -39,7 +36,7 @@ function extractTelegramLinksFromHtml(html) {
   return Array.from(out);
 }
 
-async function searchTelegramLinksWithCrawleeLocal({
+async function searchTelegramLinksWithCrawlee({
   queries,
   maxLinks = 200,
   perQueryPages = 1,
@@ -57,8 +54,6 @@ async function searchTelegramLinksWithCrawleeLocal({
   for (const q of qs) {
     if (engine === 'duckduckgo') {
       for (let i = 0; i < pages; i += 1) {
-        // DDG HTML does not have a consistent pagination API; multiple pages can be approximated by repeating.
-        // Keep it simple and deterministic: one page per query by default.
         if (i === 0) urls.push(buildDuckDuckGoHtmlUrl(q));
       }
     } else {
@@ -66,9 +61,7 @@ async function searchTelegramLinksWithCrawleeLocal({
     }
   }
 
-  // Reduce noisy logs. Callers should instrument at route-level.
   log.setLevel(log.LEVELS.ERROR);
-
   const config = Configuration.getGlobalConfig();
   config.set('persistStorage', false);
 
@@ -89,9 +82,11 @@ async function searchTelegramLinksWithCrawleeLocal({
       }
     },
     failedRequestHandler({ request, error }) {
-      // Avoid throwing; just continue. Do not log full URLs with query in prod logs.
       // eslint-disable-next-line no-console
-      console.warn('crawlee_search_failed', { url: request?.loadedUrl ? '[URL]' : null, error: error?.message || 'error' });
+      console.warn('crawlee_search_failed', {
+        url: request?.loadedUrl ? '[URL]' : null,
+        error: error?.message || 'error',
+      });
     },
   });
 
@@ -105,63 +100,60 @@ async function searchTelegramLinksWithCrawleeLocal({
   };
 }
 
-async function fetchJson(url, { method = 'GET', body = null, timeoutMs = 12000, headers = {} } = {}) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
+function requireApiKey(req, res, next) {
+  const required = String(process.env.CRAWLEE_SERVICE_API_KEY || '').trim();
+  if (!required) return next();
+
+  const apiKey = String(req.headers['x-api-key'] || '').trim();
+  if (!apiKey || apiKey !== required) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  return next();
+}
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+app.get('/health', async (_req, res) => {
+  return res.json({ ok: true, service: 'kickchain-crawlee-service', time: new Date().toISOString() });
+});
+
+app.post('/search', requireApiKey, async (req, res) => {
   try {
-    const r = await fetch(url, {
-      method,
-      headers: body ? { 'content-type': 'application/json', ...headers } : headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const queries = Array.isArray(body.queries) ? body.queries : [];
+    const engine = String(body.engine || process.env.CRAWLEE_SEARCH_ENGINE || 'duckduckgo').trim() || 'duckduckgo';
+
+    const timeoutMs = clampNumber(
+      body.timeout_ms ?? process.env.CRAWLEE_SEARCH_TIMEOUT_MS,
+      { min: 2000, max: 60000, fallback: 12000 }
+    );
+    const maxLinks = clampNumber(
+      body.max_links ?? process.env.CRAWLEE_SEARCH_MAX_LINKS,
+      { min: 1, max: 500, fallback: 200 }
+    );
+    const pagesPerQuery = clampNumber(
+      body.pages_per_query ?? process.env.CRAWLEE_SEARCH_PAGES_PER_QUERY,
+      { min: 1, max: 3, fallback: 1 }
+    );
+
+    const out = await searchTelegramLinksWithCrawlee({
+      queries,
+      maxLinks,
+      perQueryPages: pagesPerQuery,
+      timeoutMs,
+      engine,
     });
-    const txt = await r.text().catch(() => '');
-    if (!r.ok) {
-      const e = new Error(`Crawlee service error: ${r.status}`);
-      e.details = txt.slice(0, 2000);
-      throw e;
-    }
-    return txt ? JSON.parse(txt) : null;
-  } finally {
-    clearTimeout(t);
+
+    return res.json(out);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('crawlee search failed', { error: err?.message || String(err) });
+    return res.status(500).json({ ok: false, error: err?.message || 'search_failed' });
   }
-}
+});
 
-async function searchTelegramLinksWithCrawleeRemote({
-  queries,
-  maxLinks = 200,
-  perQueryPages = 1,
-  timeoutMs = 12_000,
-  engine = 'duckduckgo',
-}) {
-  const cfg = getCrawleeServiceConfigFromEnv();
-  if (!cfg.baseUrl) throw new Error('CRAWLEE_SERVICE_URL is not set');
-  const headers = {};
-  if (cfg.apiKey) headers['x-api-key'] = cfg.apiKey;
+const port = Number(process.env.PORT || 8002) || 8002;
+app.listen(port, '0.0.0.0', () => {
+  // eslint-disable-next-line no-console
+  console.log(`Crawlee service running on port ${port}`);
+});
 
-  const payload = {
-    queries: Array.isArray(queries) ? queries : [],
-    engine,
-    max_links: maxLinks,
-    pages_per_query: perQueryPages,
-    timeout_ms: timeoutMs,
-  };
-
-  return await fetchJson(`${cfg.baseUrl}/search`, {
-    method: 'POST',
-    body: payload,
-    timeoutMs: cfg.timeoutMs,
-    headers,
-  });
-}
-
-async function searchTelegramLinksWithCrawlee(opts) {
-  const cfg = getCrawleeServiceConfigFromEnv();
-  if (cfg.baseUrl) return await searchTelegramLinksWithCrawleeRemote(opts);
-  return await searchTelegramLinksWithCrawleeLocal(opts);
-}
-
-module.exports = {
-  searchTelegramLinksWithCrawlee,
-  extractTelegramLinksFromHtml,
-};

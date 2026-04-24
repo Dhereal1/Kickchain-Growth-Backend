@@ -1,0 +1,21 @@
+{
+  "name": "kickchain-crawlee-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Crawlee microservice for Telegram link discovery (Kickchain Intel).",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "crawlee": "^3.14.1",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1"
+  }
+}
+
