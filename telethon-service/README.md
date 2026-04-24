@@ -60,6 +60,8 @@ Response:
 
 ## Railway deploy
 
-- Create a new Railway project → deploy from this `telethon-service/` folder (Dockerfile included).
-- Add env vars from `.env.example`.
-- Keep service always-on (needed for session reuse).
+## VPS deploy (Docker)
+
+- Build and run via the root `deploy/vps/docker-compose.yml` (recommended), or build this folder’s `Dockerfile` directly.
+- Add env vars from `.env.example` (or `deploy/vps/telethon.env.example`).
+- Keep the service always-on (needed for session reuse).

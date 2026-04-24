@@ -3,6 +3,7 @@ node_modules/
 _import/
 __pycache__/
 *.pyc
+deploy/vps/*.env
 
 # Bot subproject
 bot/node_modules/
