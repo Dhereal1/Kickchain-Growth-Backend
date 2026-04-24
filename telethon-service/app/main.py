@@ -21,6 +21,11 @@ class RunRequest(BaseModel):
     max_messages_per_group: int | None = None
 
 
+class FetchRequest(BaseModel):
+    usernames: list[str] = Field(default_factory=list)
+    max_messages_per_group: int | None = None
+
+
 class MessageOut(BaseModel):
     id: int
     date: str | None
@@ -185,3 +190,60 @@ async def run(req: RunRequest, x_api_key: str | None = Header(default=None)) -> 
 
     return {"ok": True, "groups": [g.model_dump() for g in groups_out]}
 
+
+@app.post("/fetch")
+async def fetch(req: FetchRequest, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    _auth(x_api_key)
+    if _client is None:
+        raise HTTPException(status_code=503, detail="client_not_ready")
+
+    raw = [u.strip() for u in (req.usernames or []) if u and u.strip()]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for u in raw:
+        n = _normalize_username(u)
+        if not n:
+            continue
+        if n not in seen:
+            normalized.append(n)
+            seen.add(n)
+        if len(normalized) >= 50:
+            break
+
+    if not normalized:
+        raise HTTPException(status_code=400, detail="usernames required")
+
+    max_msgs = req.max_messages_per_group or config.MAX_MESSAGES_PER_GROUP
+    delay_s = max(0.0, (config.REQUEST_DELAY_MS or 0) / 1000.0)
+
+    groups_out: list[GroupOut] = []
+    for username in normalized:
+        try:
+            entity = await _client.get_entity(username)  # type: ignore[union-attr]
+        except Exception:
+            continue
+
+        kind = _entity_type(entity)
+        try:
+            msgs = await _fetch_last_messages(entity, limit=max_msgs)
+        except FloodWaitError as e:
+            retry = int(getattr(e, "seconds", 0) or 0)
+            raise HTTPException(status_code=429, detail={"error": "flood_wait", "retry_after": retry})
+
+        groups_out.append(
+            GroupOut(
+                username=username,
+                title=getattr(entity, "title", None),
+                type=kind,
+                messages=msgs,
+            )
+        )
+        if delay_s:
+            await asyncio.sleep(delay_s)
+
+    return {
+        "ok": True,
+        "requested": normalized,
+        "found": len(groups_out),
+        "groups": [g.model_dump() for g in groups_out],
+    }

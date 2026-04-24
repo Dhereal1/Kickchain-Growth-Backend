@@ -28,6 +28,7 @@ Persistent Telegram data collector using Telethon + FastAPI.
 
 - `GET /health`
 - `POST /run`
+- `POST /fetch`
 
 Request:
 
@@ -48,9 +49,17 @@ Auth (optional):
 Response:
 - `groups[]` with `username`, `title`, `type`, and `messages[]`.
 
+`POST /fetch` request:
+
+```json
+{
+  "usernames": ["@somegroup", "https://t.me/anothergroup"],
+  "max_messages_per_group": 50
+}
+```
+
 ## Railway deploy
 
 - Create a new Railway project → deploy from this `telethon-service/` folder (Dockerfile included).
 - Add env vars from `.env.example`.
 - Keep service always-on (needed for session reuse).
-

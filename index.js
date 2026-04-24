@@ -943,7 +943,7 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
   } catch (err) {
     console.error('intel discovery run failed:', err?.message || String(err));
     if (err?.details) {
-      console.error('intel discovery apify details:', String(err.details).slice(0, 2000));
+      console.error('intel discovery details:', String(err.details).slice(0, 2000));
     }
     return res.status(500).json({
       ok: false,
@@ -1407,7 +1407,7 @@ registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
   } catch (err) {
     console.error('workspace run failed:', err?.message || String(err));
     if (err?.details) {
-      console.error('workspace run apify details:', String(err.details).slice(0, 2000));
+      console.error('workspace run details:', String(err.details).slice(0, 2000));
     }
     return res.status(500).json({
       ok: false,
@@ -2026,27 +2026,29 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
 
     // Legacy single-tenant fallback when no intel users exist yet.
     if (!intelUsers.length) {
-      const datasets =
+      const communities =
+        (req.query.communities ? String(req.query.communities).split(',') : null) ||
+        // Backward compatibility
         (req.query.datasets ? String(req.query.datasets).split(',') : null) ||
-        cfg.datasetsDefault;
+        cfg.communitiesDefault;
 
       const platform =
         String(req.query.platform || '').trim().toLowerCase() ||
         cfg.platforms[0] ||
         'telegram';
 
-      const cleanedDatasets = (datasets || [])
+      const cleanedCommunities = (communities || [])
         .map((d) => String(d).trim())
         .filter(Boolean);
 
-      if (!cleanedDatasets.length) {
-        return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
+      if (!cleanedCommunities.length) {
+        return res.status(400).json({ ok: false, error: 'Missing communities (set INTEL_COMMUNITIES/TELETHON_COMMUNITIES)' });
       }
 
       const ingest = await ingestDatasets({
         pool,
         ensureGrowthSchema,
-        datasets: cleanedDatasets,
+        communities: cleanedCommunities,
         platform,
         userId: null,
       });
@@ -2065,7 +2067,11 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
       );
       const c = uc.rows[0] || {};
 
-      const datasets = Array.isArray(c.datasets) && c.datasets.length ? c.datasets : cfg.datasetsDefault;
+      const communities = Array.isArray(c.communities) && c.communities.length
+        ? c.communities
+        : Array.isArray(c.datasets) && c.datasets.length
+          ? c.datasets
+          : cfg.communitiesDefault;
       const platform = Array.isArray(c.platforms) && c.platforms.length ? String(c.platforms[0]).toLowerCase() : (cfg.platforms[0] || 'telegram');
       const configOverride = {
         keywords: c.keywords,
@@ -2074,9 +2080,9 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
         activityKeywords: c.activity_keywords,
       };
 
-      const cleanedDatasets = (datasets || []).map((d) => String(d).trim()).filter(Boolean);
-      if (!cleanedDatasets.length) {
-        results.push({ user_id: u.id, ok: false, error: 'missing_datasets' });
+      const cleanedCommunities = (communities || []).map((d) => String(d).trim()).filter(Boolean);
+      if (!cleanedCommunities.length) {
+        results.push({ user_id: u.id, ok: false, error: 'missing_communities' });
         // eslint-disable-next-line no-continue
         continue;
       }
@@ -2084,7 +2090,7 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
       const ingest = await ingestDatasets({
         pool,
         ensureGrowthSchema,
-        datasets: cleanedDatasets,
+        communities: cleanedCommunities,
         platform,
         userId: u.id,
         configOverride: c,
@@ -2278,13 +2284,13 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
 
     // Legacy single-tenant fallback when no intel users exist yet.
     if (!intelUsers.length) {
-      const datasets = cfg.datasetsDefault;
-      if (!datasets.length) {
-        return res.status(400).json({ ok: false, error: 'Missing datasets (set APIFY_DATASET_IDS)' });
+      const communities = cfg.communitiesDefault;
+      if (!communities.length) {
+        return res.status(400).json({ ok: false, error: 'Missing communities (set INTEL_COMMUNITIES/TELETHON_COMMUNITIES)' });
       }
       const platform = cfg.platforms[0] || 'telegram';
 
-      const ingest = await ingestDatasets({ pool, ensureGrowthSchema, datasets, platform, userId: null });
+      const ingest = await ingestDatasets({ pool, ensureGrowthSchema, communities, platform, userId: null });
       const aggregate = await aggregateDaily({ pool, ensureGrowthSchema, userId: null });
       const cleanup = await cleanupOldPosts({ pool, ensureGrowthSchema, userId: null });
 
@@ -2319,12 +2325,16 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
       );
       const c = uc.rows[0] || {};
 
-      const datasets = Array.isArray(c.datasets) && c.datasets.length ? c.datasets : cfg.datasetsDefault;
+      const communities = Array.isArray(c.communities) && c.communities.length
+        ? c.communities
+        : Array.isArray(c.datasets) && c.datasets.length
+          ? c.datasets
+          : cfg.communitiesDefault;
       const platform = Array.isArray(c.platforms) && c.platforms.length ? String(c.platforms[0]).toLowerCase() : (cfg.platforms[0] || 'telegram');
 
-      const cleanedDatasets = (datasets || []).map((d) => String(d).trim()).filter(Boolean);
-      if (!cleanedDatasets.length) {
-        results.push({ user_id: u.id, ok: false, error: 'missing_datasets' });
+      const cleanedCommunities = (communities || []).map((d) => String(d).trim()).filter(Boolean);
+      if (!cleanedCommunities.length) {
+        results.push({ user_id: u.id, ok: false, error: 'missing_communities' });
         // eslint-disable-next-line no-continue
         continue;
       }
@@ -2332,7 +2342,7 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
       const ingest = await ingestDatasets({
         pool,
         ensureGrowthSchema,
-        datasets: cleanedDatasets,
+        communities: cleanedCommunities,
         platform,
         userId: u.id,
         configOverride: c,

@@ -29,15 +29,18 @@ async function ingestTelethonGroups({
   const uId = wsId != null ? null : (userId === null || userId === undefined ? null : Number(userId));
   const list = Array.isArray(groups) ? groups : [];
   let postsInserted = 0;
+  let postsSeen = 0;
   const communities = new Set();
 
   for (const g of list) {
+    if (String(g?.type || '').toLowerCase() === 'channel') continue;
     const community = normalizeUsername(g?.username);
     if (!community) continue;
     communities.add(community);
 
     const msgs = Array.isArray(g?.messages) ? g.messages : [];
     for (const m of msgs) {
+      postsSeen += 1;
       const text = m?.text ?? null;
       const views = Number(m?.views || 0) || 0;
       const postedAt = m?.date ? new Date(m.date) : null;
@@ -99,7 +102,8 @@ async function ingestTelethonGroups({
     }
   }
 
-  return { communities: Array.from(communities), posts_inserted: postsInserted };
+  const postsDeduped = Math.max(0, postsSeen - postsInserted);
+  return { communities: Array.from(communities), posts_seen: postsSeen, posts_inserted: postsInserted, posts_deduped: postsDeduped };
 }
 
 module.exports = {

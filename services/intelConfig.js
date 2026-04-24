@@ -58,11 +58,16 @@ function getIntelConfig() {
   const trendingSpikeRatio =
     Number(json.trending_spike_ratio ?? process.env.INTEL_TRENDING_SPIKE_RATIO ?? 1.5) || 1.5;
 
-  const maxItemsPerDataset =
-    Number(json.max_items_per_dataset ?? process.env.APIFY_MAX_ITEMS_PER_DATASET ?? 1000) || 1000;
+  const maxMessagesPerCommunity =
+    Number(
+      json.max_messages_per_community ??
+        process.env.INTEL_MAX_MESSAGES_PER_COMMUNITY ??
+        process.env.TELETHON_MAX_MESSAGES_PER_GROUP ??
+        50
+    ) || 50;
 
-  const maxDatasetsPerRun =
-    Number(json.max_datasets_per_run ?? process.env.INTEL_MAX_DATASETS_PER_RUN ?? 5) || 5;
+  const maxCommunitiesPerRun =
+    Number(json.max_communities_per_run ?? process.env.INTEL_MAX_COMMUNITIES_PER_RUN ?? 20) || 20;
 
   const pipelineTimeoutMs =
     Number(json.pipeline_timeout_ms ?? process.env.INTEL_PIPELINE_TIMEOUT_MS ?? 8000) || 8000;
@@ -70,8 +75,13 @@ function getIntelConfig() {
   const postTtlDays =
     Number(json.post_ttl_days ?? process.env.INTEL_POST_TTL_DAYS ?? 30) || 30;
 
-  const datasetsDefault =
+  const communitiesDefault =
+    (json.communities && Array.isArray(json.communities) ? json.communities : null) ||
+    // Backward compatibility: older config used `datasets` to mean sources; now it means communities/usernames.
     (json.datasets && Array.isArray(json.datasets) ? json.datasets : null) ||
+    (process.env.INTEL_COMMUNITIES ? parseCsv(process.env.INTEL_COMMUNITIES) : null) ||
+    (process.env.TELETHON_COMMUNITIES ? parseCsv(process.env.TELETHON_COMMUNITIES) : null) ||
+    // Older envs (deprecated): treat as communities if they look like usernames.
     (process.env.APIFY_DATASET_IDS ? parseCsv(process.env.APIFY_DATASET_IDS) : null) ||
     (process.env.APIFY_DATASET_ID ? [String(process.env.APIFY_DATASET_ID).trim()].filter(Boolean) : []);
 
@@ -83,11 +93,11 @@ function getIntelConfig() {
     platforms: platforms.map((p) => String(p).toLowerCase()),
     intentThreshold,
     trendingSpikeRatio,
-    maxItemsPerDataset,
-    maxDatasetsPerRun,
+    maxMessagesPerCommunity,
+    maxCommunitiesPerRun,
     pipelineTimeoutMs,
     postTtlDays,
-    datasetsDefault,
+    communitiesDefault,
   };
 }
 

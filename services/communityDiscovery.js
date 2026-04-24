@@ -1,5 +1,4 @@
 const { getIntelConfig } = require('./intelConfig');
-const { ingestDatasets, aggregateDaily } = require('./intelPipeline');
 
 function normalizeTelegramUsername(input) {
   const raw = String(input || '').trim();
@@ -134,7 +133,6 @@ function coerceBool(value, fallback = false) {
 async function scrapeDiscoveredCommunities({
   pool,
   ensureGrowthSchema,
-  apifyActors,
   userId = null,
   workspaceId = null,
   maxScrapes = 5,
@@ -143,151 +141,14 @@ async function scrapeDiscoveredCommunities({
   configOverride = null,
 }) {
   await ensureGrowthSchema();
-
-  const wsId = workspaceId === null || workspaceId === undefined ? null : Number(workspaceId);
-  const uId = wsId ? null : (userId === null || userId === undefined ? null : Number(userId));
-
-  const actorCandidates = apifyActors.getTelegramScraperActors
-    ? apifyActors.getTelegramScraperActors()
-    : [];
-
-  const candidates = await pool.query(
-    `
-      SELECT id, community_name, last_scraped_at
-      FROM discovered_communities
-      WHERE ($1::int IS NULL OR workspace_id = $1)
-        AND ($2::int IS NULL OR user_id = $2)
-        AND (last_scraped_at IS NULL OR last_scraped_at < NOW() - ($3::int * INTERVAL '1 hour'))
-      ORDER BY discovered_at DESC
-      LIMIT $4
-    `,
-    [wsId, uId, cooldownHours, maxScrapes]
-  );
-
-  const datasetIds = [];
-  const scraped = [];
-  const skipped = [];
-
-  for (const row of candidates.rows || []) {
-    const name = String(row.community_name || '').trim();
-    if (!name) continue;
-
-    if (!actorCandidates.length) {
-      skipped.push({ community: name, reason: 'no_scraper_actors_configured' });
-      // eslint-disable-next-line no-continue
-      continue;
-    }
-
-    try {
-      const attempts = [];
-      let success = null;
-
-      for (const candidate of actorCandidates.slice(0, 3)) {
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          const { datasetId } = await apifyActors.runTelegramScraper({
-            community: name,
-            actorId: candidate.actorId,
-          });
-
-          if (!datasetId) {
-            attempts.push({
-              actor: candidate.key,
-              actor_id: candidate.actorId,
-              status: 'failed',
-              reason: 'no_dataset_id',
-            });
-            // eslint-disable-next-line no-continue
-            continue;
-          }
-
-          // Verify dataset has at least 1 item.
-          // eslint-disable-next-line no-await-in-loop
-          const peek = apifyActors.fetchDatasetItems
-            ? await apifyActors.fetchDatasetItems({ datasetId, limit: 1, offset: 0 })
-            : [];
-          const items = Array.isArray(peek) ? peek.length : 0;
-          if (!items) {
-            attempts.push({
-              actor: candidate.key,
-              actor_id: candidate.actorId,
-              status: 'failed',
-              reason: 'empty_dataset',
-            });
-            // eslint-disable-next-line no-continue
-            continue;
-          }
-
-          success = { actor: candidate.key, actor_id: candidate.actorId, datasetId, items };
-          attempts.push({
-            actor: candidate.key,
-            actor_id: candidate.actorId,
-            status: 'success',
-            reason: null,
-          });
-          break;
-        } catch (err) {
-          const details = err?.details ? String(err.details).slice(0, 500) : null;
-          attempts.push({
-            actor: candidate.key,
-            actor_id: candidate.actorId,
-            status: 'failed',
-            reason: err?.message || String(err),
-            details,
-          });
-        }
-      }
-
-      if (!success) {
-        skipped.push({ community: name, reason: 'all_actors_failed', attempts });
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      datasetIds.push(success.datasetId);
-      scraped.push({
-        community: name,
-        actor: success.actor,
-        actor_id: success.actor_id,
-        datasetId: success.datasetId,
-        items: success.items,
-      });
-
-      // eslint-disable-next-line no-await-in-loop
-      await pool.query(
-        `UPDATE discovered_communities
-         SET last_scraped_at = NOW(), last_dataset_id = $1
-         WHERE id = $2`,
-        [String(success.datasetId), row.id]
-      );
-    } catch (err) {
-      skipped.push({ community: name, reason: err?.message || String(err) });
-    }
-  }
-
-  if (!datasetIds.length) {
-    return { scraped_count: scraped.length, skipped_count: skipped.length, scraped, skipped, ingest: null, aggregate: null };
-  }
-
-  const ingest = await ingestDatasets({
-    pool,
-    ensureGrowthSchema,
-    datasets: datasetIds,
-    platform,
-    userId: uId,
-    workspaceId: wsId,
-    configOverride,
-  });
-
-  const aggregate = wsId ? null : await aggregateDaily({ pool, ensureGrowthSchema, userId: uId });
-
+  const cfg = getIntelConfig();
   return {
-    scraped_count: scraped.length,
-    skipped_count: skipped.length,
-    scraped,
-    skipped,
-    ingest,
-    aggregate,
+    ok: true,
+    skipped: true,
+    reason: 'apify_removed',
+    hint:
+      'Apify scraping has been removed. Use TELETHON_SERVICE_URL for message ingestion and Crawlee for discovery (links only).',
+    config: { maxScrapes, cooldownHours, platform, hasConfigOverride: !!cfg && !!configOverride },
   };
 }
 

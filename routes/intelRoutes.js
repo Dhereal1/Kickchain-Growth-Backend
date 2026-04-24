@@ -182,7 +182,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       const last = r.rows[0] || null;
       const lastRunAt = last?.run_at ? new Date(last.run_at).toISOString() : null;
       const lastIngestCount = Number(last?.inserted_posts || 0);
-      const datasetsConnected = (cfg.datasetsDefault || []).length;
+      const communitiesConnected = (cfg.communitiesDefault || []).length;
 
       const healthy =
         !!last &&
@@ -192,7 +192,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       return res.json({
         last_run: lastRunAt,
         status: healthy ? 'healthy' : 'unhealthy',
-        datasets_connected: datasetsConnected,
+        communities_connected: communitiesConnected,
         last_ingest_count: lastIngestCount,
       });
     } catch (err) {
@@ -237,7 +237,9 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       return res.json({
         ok: true,
         user_id: userId,
+        // Backward compatibility: "datasets" now represents Telegram communities/usernames.
         datasets: row?.datasets || null,
+        communities: row?.datasets || null,
         keywords: row?.keywords || null,
         intent_keywords: row?.intent_keywords || null,
         promo_keywords: row?.promo_keywords || null,
@@ -262,7 +264,11 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
       const userId = Number(req.intelAuth.user.id);
       const body = req.body && typeof req.body === 'object' ? req.body : {};
 
-      const datasets = Array.isArray(body.datasets) ? body.datasets.map(String) : null;
+      const datasets = Array.isArray(body.communities)
+        ? body.communities.map(String)
+        : Array.isArray(body.datasets)
+          ? body.datasets.map(String)
+          : null;
       const keywords = Array.isArray(body.keywords) ? body.keywords.map(String) : null;
       const intentKeywords = Array.isArray(body.intent_keywords) ? body.intent_keywords.map(String) : null;
       const promoKeywords = Array.isArray(body.promo_keywords) ? body.promo_keywords.map(String) : null;
@@ -342,11 +348,15 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           }
         : null;
 
-      const datasets =
+      const communities =
+        (Array.isArray(body.communities) ? body.communities : null) ||
+        // Backward compatibility: older clients used `datasets` and `datasetId`.
         (Array.isArray(body.datasets) ? body.datasets : null) ||
+        (req.query.community ? [String(req.query.community)] : null) ||
         (req.query.datasetId ? [String(req.query.datasetId)] : null) ||
+        (userConfig?.communities && Array.isArray(userConfig.communities) ? userConfig.communities : null) ||
         (userConfig?.datasets && Array.isArray(userConfig.datasets) ? userConfig.datasets : null) ||
-        cfg.datasetsDefault;
+        cfg.communitiesDefault;
 
       const platform =
         String(body.platform || req.query.platform || '').trim().toLowerCase() ||
@@ -356,22 +366,22 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         cfg.platforms[0] ||
         'telegram';
 
-      const cleanedDatasets = (datasets || [])
+      const cleanedCommunities = (communities || [])
         .map((d) => String(d).trim())
         .filter(Boolean);
 
-      if (!cleanedDatasets.length) {
+      if (!cleanedCommunities.length) {
         return res.status(400).json({
           ok: false,
           error:
-            'Missing datasets. Send JSON { datasets: [...] } or set APIFY_DATASET_IDS/APIFY_DATASET_ID.',
+            'Missing communities. Send JSON { communities: [...] } or set INTEL_COMMUNITIES/TELETHON_COMMUNITIES.',
         });
       }
 
       const ingest = await ingestDatasets({
         pool,
         ensureGrowthSchema,
-        datasets: cleanedDatasets,
+        communities: cleanedCommunities,
         platform,
         userId,
         configOverride,

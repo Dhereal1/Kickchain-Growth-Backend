@@ -1,6 +1,8 @@
 node_modules/
 .env
 _import/
+__pycache__/
+*.pyc
 
 # Bot subproject
 bot/node_modules/

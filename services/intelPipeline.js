@@ -1,7 +1,6 @@
-const crypto = require('crypto');
-const { fetchApifyDatasetItemsWithRetry, normalizeCommunity } = require('./apifyService');
-const { extractSignals } = require('./signalEngine');
 const { getIntelConfig } = require('./intelConfig');
+const { fetchTelethonGroups } = require('./telethonService');
+const { ingestTelethonGroups } = require('./telethonIngest');
 
 function jsonStringifySafe(value) {
   try {
@@ -12,48 +11,33 @@ function jsonStringifySafe(value) {
   }
 }
 
-function stablePostId({ platform, datasetId, item, normalized }) {
-  const explicit = String(normalized?.post_id || '').trim();
-  if (explicit) return explicit;
+function normalizeTelegramUsername(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
 
-  const base = JSON.stringify({
-    platform,
-    datasetId,
-    name: normalized?.name || null,
-    text: normalized?.text || '',
-    date: normalized?.posted_at || item?.date || item?.timestamp || null,
-  });
-  return crypto.createHash('sha256').update(base).digest('hex');
-}
+  const lower = raw.toLowerCase();
+  const urlMatch = lower.match(/(?:https?:\/\/)?t\.me\/([a-z0-9_]{3,64})/i);
+  const username = urlMatch ? urlMatch[1] : lower.replace(/^@/, '');
+  if (!username) return null;
 
-function contentHash({ text, communityName }) {
-  const t = String(text || '').trim();
-  const c = String(communityName || '').trim();
-  const base = `${t}\n${c}`.toLowerCase();
-  if (!base.trim()) return null;
-  return crypto.createHash('sha256').update(base).digest('hex');
-}
+  if (username === 'joinchat') return null;
+  if (username === 'c') return null;
+  if (username.startsWith('+')) return null;
 
-function toTimestamp(value) {
-  if (!value) return null;
-  const d = new Date(value);
-  // Invalid dates become "Invalid Date"
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
+  if (!/^[a-z0-9_]{5,32}$/.test(username)) return null;
+  return `@${username}`;
 }
 
 async function ingestDatasets({
   pool,
   ensureGrowthSchema,
-  datasets,
+  datasets = null,
+  communities = null,
   platform,
   userId = null,
   workspaceId = null,
   configOverride = null,
 }) {
-  const token = String(process.env.APIFY_API_TOKEN || '').trim();
-  if (!token) throw new Error('APIFY_API_TOKEN is required');
-
   const cfg = getIntelConfig();
   const platformHint = platform ? String(platform).toLowerCase() : undefined;
 
@@ -63,191 +47,58 @@ async function ingestDatasets({
   const effectiveUserId = wsId ? null : userId;
 
   const startedAt = Date.now();
-  const maxDatasets = Math.max(1, Number(cfg.maxDatasetsPerRun) || 5);
+  const maxCommunities = Math.max(1, Number(cfg.maxCommunitiesPerRun) || 20);
   const timeoutMs = Math.max(1000, Number(cfg.pipelineTimeoutMs) || 8000);
-  const runDatasets = datasets.slice(0, maxDatasets);
+
+  const rawList = Array.isArray(communities) ? communities : Array.isArray(datasets) ? datasets : [];
+  const runCommunities = rawList
+    .map(normalizeTelegramUsername)
+    .filter(Boolean)
+    .slice(0, maxCommunities);
+
+  if (!runCommunities.length) {
+    const e = new Error(
+      'Missing communities. Set INTEL_COMMUNITIES/TELETHON_COMMUNITIES or send JSON { communities: [...] }.'
+    );
+    e.code = 'COMMUNITIES_MISSING';
+    throw e;
+  }
 
   const run = await pool.query(
     `INSERT INTO intel_runs (user_id, datasets, platform) VALUES ($1, $2::jsonb, $3) RETURNING id`,
-    [effectiveUserId, jsonStringifySafe(runDatasets), platformHint || null]
+    [effectiveUserId, jsonStringifySafe(runCommunities), platformHint || null]
   );
   const runId = run.rows[0].id;
   await pool.query(`UPDATE intel_runs SET dataset_ids = $1::jsonb WHERE id = $2`, [
-    jsonStringifySafe(runDatasets),
+    jsonStringifySafe(runCommunities),
     runId,
   ]);
 
-  let fetchedItems = 0;
-  let insertedPosts = 0;
-  let dedupedPosts = 0;
-  let communitiesUpdated = 0;
+  const maxMsgs = Math.max(1, Number(cfg.maxMessagesPerCommunity) || 50);
+
+  let postsSeen = 0;
+  let postsInserted = 0;
+  let postsDeduped = 0;
 
   try {
-    for (const datasetId of runDatasets) {
-      if (Date.now() - startedAt > timeoutMs) {
-        throw new Error(`Pipeline timeout after ${timeoutMs}ms`);
-      }
+    if (Date.now() - startedAt > timeoutMs) throw new Error(`Pipeline timeout after ${timeoutMs}ms`);
 
-      // eslint-disable-next-line no-await-in-loop
-      const items = await fetchApifyDatasetItemsWithRetry({
-        datasetId,
-        token,
-        limit: cfg.maxItemsPerDataset,
-        offset: 0,
-        retries: 3,
-      });
+    const fetched = await fetchTelethonGroups({ usernames: runCommunities, maxMessagesPerGroup: maxMsgs });
+    const groups = Array.isArray(fetched?.groups) ? fetched.groups : [];
+    postsSeen = groups.reduce((sum, g) => sum + (Array.isArray(g?.messages) ? g.messages.length : 0), 0);
 
-      fetchedItems += items.length;
+    const ingested = await ingestTelethonGroups({
+      pool,
+      ensureGrowthSchema,
+      workspaceId: wsId,
+      userId: effectiveUserId,
+      groups,
+      configOverride,
+      datasetId: 'telethon_fetch',
+    });
 
-      for (const item of items) {
-        if (Date.now() - startedAt > timeoutMs) {
-          throw new Error(`Pipeline timeout after ${timeoutMs}ms`);
-        }
-
-        const normalized = normalizeCommunity(item, platformHint);
-        if (!normalized?.name || !normalized?.platform || normalized.platform === 'unknown') continue;
-
-        // Telegram: focus on groups/chats (conversation sources) and ignore channel-style broadcasts.
-        // Prefer explicit type hints from the dataset when present, otherwise fall back to a stable heuristic:
-        // Telegram "views" are typically channel-only; group messages usually have 0/undefined views.
-        if (normalized.platform === 'telegram') {
-          const rawType = String(item?.type || item?.chatType || item?.chat_type || '').toLowerCase();
-          const viewsHint = Number(normalized.views ?? item?.views ?? item?.viewCount ?? 0) || 0;
-          const isChannel = rawType === 'channel' || viewsHint > 0;
-          if (isChannel) continue;
-        }
-
-        const postId = stablePostId({
-          platform: normalized.platform,
-          datasetId,
-          item,
-          normalized,
-        });
-
-        const text = String(normalized.text || item?.text || '');
-        const views = Number(normalized.views ?? item?.views ?? item?.viewCount ?? 0) || 0;
-
-        const signals = extractSignals({ text, views, raw: item, config: configOverride });
-        const chash = contentHash({ text, communityName: normalized.name });
-
-        // Posts table (dedup by platform+post_id)
-        const postRes = await pool.query(
-          `
-            INSERT INTO community_posts (
-              user_id, workspace_id, platform, community_name, post_id, content_hash, text, views, posted_at, dataset_id,
-              intent_score, promo_score, content_activity_score, engagement_score, frequency_score, raw
-            )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
-            ON CONFLICT DO NOTHING
-          `,
-          [
-            effectiveUserId,
-            wsId,
-            normalized.platform,
-            normalized.name,
-            postId,
-            chash,
-            text || null,
-            views,
-            toTimestamp(normalized.posted_at) || toTimestamp(item?.date || item?.timestamp) || null,
-            String(datasetId),
-            signals.intent_score,
-            signals.promo_score,
-            signals.content_activity_score,
-            signals.engagement_score,
-            signals.frequency_score,
-            jsonStringifySafe(item),
-          ]
-        );
-
-        if (postRes.rowCount) insertedPosts += 1;
-        else dedupedPosts += 1;
-
-        // Communities master list: keep this user-scoped only for now.
-        // Workspace discovery runs write to community_posts and rankings, but should not
-        // mutate global/user community registries.
-        if (wsId) continue;
-
-        const isLegacy = effectiveUserId === null || effectiveUserId === undefined;
-        const communitySql = isLegacy
-          ? `
-            INSERT INTO communities (
-              user_id, name, platform, member_count, activity_score, keyword_matches,
-              intent_score, promo_score, content_activity_score, engagement_score, signal_score, score,
-              last_seen_at, raw, updated_at
-            )
-            VALUES (NULL,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12::jsonb,NOW())
-            ON CONFLICT (name, platform) WHERE user_id IS NULL
-            DO UPDATE SET
-              member_count = EXCLUDED.member_count,
-              activity_score = EXCLUDED.activity_score,
-              keyword_matches = EXCLUDED.keyword_matches,
-              intent_score = GREATEST(communities.intent_score, EXCLUDED.intent_score),
-              promo_score = GREATEST(communities.promo_score, EXCLUDED.promo_score),
-              content_activity_score = GREATEST(communities.content_activity_score, EXCLUDED.content_activity_score),
-              engagement_score = GREATEST(communities.engagement_score, EXCLUDED.engagement_score),
-              signal_score = GREATEST(communities.signal_score, EXCLUDED.signal_score),
-              last_seen_at = NOW(),
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-          `
-          : `
-            INSERT INTO communities (
-              user_id, name, platform, member_count, activity_score, keyword_matches,
-              intent_score, promo_score, content_activity_score, engagement_score, signal_score, score,
-              last_seen_at, raw, updated_at
-            )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13::jsonb,NOW())
-            ON CONFLICT (user_id, name, platform) WHERE user_id IS NOT NULL
-            DO UPDATE SET
-              member_count = EXCLUDED.member_count,
-              activity_score = EXCLUDED.activity_score,
-              keyword_matches = EXCLUDED.keyword_matches,
-              intent_score = GREATEST(communities.intent_score, EXCLUDED.intent_score),
-              promo_score = GREATEST(communities.promo_score, EXCLUDED.promo_score),
-              content_activity_score = GREATEST(communities.content_activity_score, EXCLUDED.content_activity_score),
-              engagement_score = GREATEST(communities.engagement_score, EXCLUDED.engagement_score),
-              signal_score = GREATEST(communities.signal_score, EXCLUDED.signal_score),
-              last_seen_at = NOW(),
-              raw = EXCLUDED.raw,
-              updated_at = NOW()
-          `;
-
-        const communityParams = isLegacy
-          ? [
-              normalized.name,
-              normalized.platform,
-              Number(normalized.member_count ?? views) || 0,
-              Number(normalized.activity_score ?? views) || 0,
-              signals.keyword_matches,
-              signals.intent_score,
-              signals.promo_score,
-              signals.content_activity_score,
-              signals.engagement_score,
-              signals.signal_score,
-              0,
-              jsonStringifySafe(item),
-            ]
-          : [
-              effectiveUserId,
-              normalized.name,
-              normalized.platform,
-              Number(normalized.member_count ?? views) || 0,
-              Number(normalized.activity_score ?? views) || 0,
-              signals.keyword_matches,
-              signals.intent_score,
-              signals.promo_score,
-              signals.content_activity_score,
-              signals.engagement_score,
-              signals.signal_score,
-              0,
-              jsonStringifySafe(item),
-            ];
-
-        const communityRes = await pool.query(communitySql, communityParams);
-        if (communityRes.rowCount) communitiesUpdated += 1;
-      }
-    }
+    postsInserted = Number(ingested?.posts_inserted || 0);
+    postsDeduped = Number(ingested?.posts_deduped || Math.max(0, postsSeen - postsInserted));
 
     const durationMs = Date.now() - startedAt;
     await pool.query(
@@ -259,7 +110,7 @@ async function ingestDatasets({
            duration_ms=$5,
            status='success'
        WHERE id=$6`,
-      [fetchedItems, insertedPosts, dedupedPosts, communitiesUpdated, durationMs, runId]
+      [postsSeen, postsInserted, postsDeduped, 0, durationMs, runId]
     );
   } catch (err) {
     const durationMs = Date.now() - startedAt;
@@ -275,27 +126,21 @@ async function ingestDatasets({
            error_message=$6,
            error=$7
        WHERE id=$8`,
-      [
-        fetchedItems,
-        insertedPosts,
-        dedupedPosts,
-        communitiesUpdated,
-        durationMs,
-        msg,
-        String(err?.details || err?.stack || msg),
-        runId,
-      ]
+      [postsSeen, postsInserted, postsDeduped, 0, durationMs, msg, String(err?.details || err?.stack || msg), runId]
     );
     throw err;
   }
 
   return {
     runId,
-    datasets_processed: runDatasets.length,
-    posts_ingested: insertedPosts,
-    posts_deduped: dedupedPosts,
-    communities_updated: communitiesUpdated,
-    fetched_items: fetchedItems,
+    // Backward compatible keys (older clients call these "datasets").
+    datasets_processed: runCommunities.length,
+    communities_processed: runCommunities.length,
+    posts_seen: postsSeen,
+    posts_ingested: postsInserted,
+    posts_deduped: postsDeduped,
+    communities_updated: 0,
+    fetched_items: postsSeen,
   };
 }
 
@@ -359,7 +204,7 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day, userId = null }) 
 
   // Aggregate posts ingested for that day.
   // Root-cause fix for "communitiesAggregated: 0":
-  // many Apify items don't carry a reliable posted_at; fall back to ingested_at and use a 24h window by default.
+  // many ingested items don't carry a reliable posted_at; fall back to ingested_at and use a 24h window by default.
   const filterSql = dayDate
     ? `(COALESCE(posted_at, ingested_at) AT TIME ZONE 'UTC')::date = $1`
     : `COALESCE(posted_at, ingested_at) >= NOW() - INTERVAL '1 day'`;
@@ -500,29 +345,77 @@ async function aggregateDaily({ pool, ensureGrowthSchema, day, userId = null }) 
     const r = await pool.query(metricsSql, metricsParams);
     upserted += r.rowCount ? 1 : 0;
 
-    // Keep the master row updated with latest score.
-    await pool.query(
-      `UPDATE communities
-       SET intent_score=$1,
-           promo_score=$2,
-           content_activity_score=$3,
-           engagement_score=$4,
-           signal_score=$5,
-           score=$6,
-           updated_at=NOW()
-       WHERE (($7::int IS NULL AND user_id IS NULL) OR user_id=$7) AND name=$8 AND platform=$9`,
-      [
-        row.intent_score,
-        row.promo_score,
-        row.content_activity_score,
-        row.engagement_score,
-        signalScore,
-        score,
-        userId,
-        row.name,
-        row.platform,
-      ]
-    );
+    // Keep the master row updated with latest score (and insert if missing).
+    if (isLegacy) {
+      // eslint-disable-next-line no-await-in-loop
+      await pool.query(
+        `
+          INSERT INTO communities (
+            user_id, name, platform, member_count, activity_score, keyword_matches,
+            intent_score, promo_score, content_activity_score, engagement_score, signal_score, score,
+            last_seen_at, raw, updated_at
+          )
+          VALUES (NULL,$1,$2,0,$3,0,$4,$5,$6,$7,$8,$9,NOW(),NULL,NOW())
+          ON CONFLICT (name, platform) WHERE user_id IS NULL
+          DO UPDATE SET
+            activity_score = EXCLUDED.activity_score,
+            intent_score = EXCLUDED.intent_score,
+            promo_score = EXCLUDED.promo_score,
+            content_activity_score = EXCLUDED.content_activity_score,
+            engagement_score = EXCLUDED.engagement_score,
+            signal_score = EXCLUDED.signal_score,
+            score = EXCLUDED.score,
+            last_seen_at = NOW(),
+            updated_at = NOW()
+        `,
+        [
+          row.name,
+          row.platform,
+          row.activity_score,
+          row.intent_score,
+          row.promo_score,
+          row.content_activity_score,
+          row.engagement_score,
+          signalScore,
+          score,
+        ]
+      );
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      await pool.query(
+        `
+          INSERT INTO communities (
+            user_id, name, platform, member_count, activity_score, keyword_matches,
+            intent_score, promo_score, content_activity_score, engagement_score, signal_score, score,
+            last_seen_at, raw, updated_at
+          )
+          VALUES ($1,$2,$3,0,$4,0,$5,$6,$7,$8,$9,$10,NOW(),NULL,NOW())
+          ON CONFLICT (user_id, name, platform) WHERE user_id IS NOT NULL
+          DO UPDATE SET
+            activity_score = EXCLUDED.activity_score,
+            intent_score = EXCLUDED.intent_score,
+            promo_score = EXCLUDED.promo_score,
+            content_activity_score = EXCLUDED.content_activity_score,
+            engagement_score = EXCLUDED.engagement_score,
+            signal_score = EXCLUDED.signal_score,
+            score = EXCLUDED.score,
+            last_seen_at = NOW(),
+            updated_at = NOW()
+        `,
+        [
+          userId,
+          row.name,
+          row.platform,
+          row.activity_score,
+          row.intent_score,
+          row.promo_score,
+          row.content_activity_score,
+          row.engagement_score,
+          signalScore,
+          score,
+        ]
+      );
+    }
   }
 
   return { day: targetDay, communitiesAggregated: upserted };

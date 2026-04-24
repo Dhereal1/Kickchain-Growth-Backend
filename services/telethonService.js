@@ -66,8 +66,42 @@ async function runTelethonDiscovery({ queries, maxGroupsTotal = 10, maxMessagesP
   return null;
 }
 
+async function fetchTelethonGroups({ usernames, maxMessagesPerGroup = null }) {
+  const cfg = getTelethonConfigFromEnv();
+  if (!cfg.baseUrl) throw new Error('TELETHON_SERVICE_URL is not set');
+  const headers = {};
+  if (cfg.apiKey) headers['x-api-key'] = cfg.apiKey;
+
+  const payload = {
+    usernames: Array.isArray(usernames) ? usernames : [],
+    max_messages_per_group: maxMessagesPerGroup === null || maxMessagesPerGroup === undefined ? undefined : maxMessagesPerGroup,
+  };
+
+  // Simple retry for transient 5xx
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await telethonFetchJson(`${cfg.baseUrl}/fetch`, {
+        method: 'POST',
+        body: payload,
+        timeoutMs: cfg.timeoutMs,
+        headers,
+      });
+    } catch (err) {
+      const msg = String(err?.message || '');
+      if (attempt < 2 && msg.includes('Telethon service error: 5')) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(500);
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+      throw err;
+    }
+  }
+  return null;
+}
+
 module.exports = {
   runTelethonDiscovery,
+  fetchTelethonGroups,
   getTelethonConfigFromEnv,
 };
-
