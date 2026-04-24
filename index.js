@@ -12,12 +12,11 @@ const { registerIntelRoutes } = require('./routes/intelRoutes');
 const { ingestDatasets, aggregateDaily, cleanupOldPosts } = require('./services/intelPipeline');
 const { getIntelConfig } = require('./services/intelConfig');
 const { dispatchIntelWebhooks } = require('./services/intelWebhooks');
-const { createApifyActors } = require('./services/apifyActors');
 const { runTelethonDiscovery, getTelethonConfigFromEnv } = require('./services/telethonService');
 const { ingestTelethonGroups } = require('./services/telethonIngest');
+const { searchTelegramLinksWithCrawlee } = require('./services/crawleeSearch');
 const {
   discoverFromMessageExtraction,
-  scrapeDiscoveredCommunities,
   computeAndStoreCommunityRankings,
   getDiscoveryConfigFromEnv,
   upsertDiscoveredCommunities,
@@ -636,7 +635,9 @@ async function ensureGrowthSchema() {
       workspace_id INT,
       platform TEXT NOT NULL,
       community_name TEXT NOT NULL,
+      provider TEXT,
       model TEXT,
+      model_version TEXT,
       messages_hash TEXT,
       quality_score FLOAT,
       intent_detected BOOLEAN,
@@ -644,13 +645,16 @@ async function ensureGrowthSchema() {
       recommended_action TEXT,
       summary TEXT,
       analysis JSONB NOT NULL DEFAULT '{}'::jsonb,
+      requested_at TIMESTAMP,
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS user_id INT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS workspace_id INT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS provider TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS model TEXT");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS model_version TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS messages_hash TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS quality_score FLOAT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS intent_detected BOOLEAN");
@@ -658,6 +662,7 @@ async function ensureGrowthSchema() {
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS recommended_action TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS summary TEXT");
   await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS analysis JSONB NOT NULL DEFAULT '{}'::jsonb");
+  await pool.query("ALTER TABLE community_ai_analyses ADD COLUMN IF NOT EXISTS requested_at TIMESTAMP");
   await runOnce('2026-04-08_workspace_ai_analysis_uniques', [
     'DROP INDEX IF EXISTS community_ai_analyses_user_uq',
     'DROP INDEX IF EXISTS community_ai_analyses_workspace_uq',
@@ -803,7 +808,8 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
     const userId = isAdmin ? (body.user_id ? Number(body.user_id) : null) : Number(authUser.id);
     const platform = String(body.platform || cfg.platform || 'telegram').toLowerCase();
 
-    const apifyActors = createApifyActors();
+    const telethonCfg = getTelethonConfigFromEnv();
+    const useTelethon = !!telethonCfg.baseUrl && body.use_telethon !== false;
 
     const messageExtraction = body.message_extraction !== false;
 
@@ -864,66 +870,65 @@ registerWithApiAlias('post', '/intel/discovery/run', async (req, res) => {
       (body.scrape === undefined && searchEnabled && queries.length);
     let search = { ok: true, skipped: true };
     if (searchEnabled && queries.length) {
-      if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
-        return res.status(400).json({
-          ok: false,
-          error: 'APIFY_DISCOVERY_ACTOR_ID is required for search discovery',
+      if (useTelethon) {
+        const run = await runTelethonDiscovery({
+          queries,
+          maxGroupsTotal: 10,
+          maxMessagesPerGroup: 20,
         });
+        const groups = Array.isArray(run?.groups) ? run.groups : [];
+        const ingested = await ingestTelethonGroups({
+          pool,
+          ensureGrowthSchema,
+          userId,
+          groups,
+          configOverride: body.configOverride || null,
+          datasetId: 'telethon',
+        });
+        const toUpsert = ingested.communities.map((u) => `https://t.me/${String(u).replace(/^@/, '')}`);
+        search = await upsertDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          userId,
+          communities: toUpsert,
+          source: 'telethon',
+          meta: { actor: 'telethon', groups: groups.length },
+        });
+        search.queries = queries;
+        search.groups = groups.length;
+        search.posts_ingested = ingested.posts_inserted;
+      } else {
+        const crawlee = await searchTelegramLinksWithCrawlee({
+          queries,
+          maxLinks: Number(body.max_links || 200),
+          perQueryPages: Number(body.pages_per_query || 1),
+          timeoutMs: Number(process.env.CRAWLEE_SEARCH_TIMEOUT_MS || 12000),
+          engine: String(process.env.CRAWLEE_SEARCH_ENGINE || 'duckduckgo').trim() || 'duckduckgo',
+        });
+        const found = crawlee.links || [];
+        search = await upsertDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          userId,
+          communities: found,
+          source: 'crawlee_search',
+          meta: { actor: 'crawlee_search', engine: crawlee.engine, queries: crawlee.queries.length },
+        });
+        search.items = found.length;
+        search.queries = queries;
       }
-
-      const searchInputOverride = hasDirectInput
-        ? body.input
-        : {
-            ...(Number.isFinite(Number(body.maxResultsPerPage))
-              ? { maxResultsPerPage: Number(body.maxResultsPerPage) }
-              : {}),
-          };
-
-      // If caller provides a direct Apify input object, do not auto-map `queries` into other fields.
-      const run = hasDirectInput
-        ? await apifyActors.runSearch({ queries: [], input: searchInputOverride })
-        : await apifyActors.runSearch({ queries, input: searchInputOverride });
-      const text = JSON.stringify(run.items || []);
-      const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
-      search = await upsertDiscoveredCommunities({
-        pool,
-        ensureGrowthSchema,
-        userId,
-        communities: found,
-        source: 'search',
-        meta: { actor: 'apify_search', datasetId: run.datasetId },
-      });
-      search.datasetId = run.datasetId;
-      search.items = (run.items || []).length;
-      search.queries = queries;
     }
 
     let scrapeResult = { ok: true, skipped: true };
     if (scrape) {
-      const anyScraperActor =
-        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_PRIMARY || '').trim() ||
-        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_SECONDARY || '').trim() ||
-        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID_TERTIARY || '').trim() ||
-        String(process.env.APIFY_TELEGRAM_SCRAPER_ACTOR_ID || '').trim();
-
-      if (!anyScraperActor) {
-        scrapeResult = {
-          ok: false,
-          skipped: true,
-          error:
-            'APIFY_TELEGRAM_SCRAPER_ACTOR_ID_PRIMARY (or APIFY_TELEGRAM_SCRAPER_ACTOR_ID) is required to scrape discovered communities',
-        };
+      if (useTelethon) {
+        scrapeResult = { ok: true, skipped: true, via: 'telethon' };
       } else {
-        scrapeResult = await scrapeDiscoveredCommunities({
-          pool,
-          ensureGrowthSchema,
-          apifyActors,
-          userId,
-          maxScrapes: Number(body.max_scrapes || cfg.maxScrapes),
-          cooldownHours: Number(body.cooldown_hours || cfg.cooldownHours),
-          platform,
-          configOverride: body.configOverride || null,
-        });
+        scrapeResult = {
+          ok: true,
+          skipped: true,
+          error: 'Scrape step requires TELETHON_SERVICE_URL (Crawlee does not scrape Telegram messages reliably)',
+        };
       }
     }
 
@@ -1063,7 +1068,6 @@ async function runWorkspaceDiscoveryJob({
 
     const telethonCfg = getTelethonConfigFromEnv();
     const useTelethon = !!telethonCfg.baseUrl && options?.use_telethon !== false;
-    const apifyActors = useTelethon ? null : createApifyActors();
 
     const extraction = options?.message_extraction === false
       ? { ok: true, skipped: true }
@@ -1111,25 +1115,23 @@ async function runWorkspaceDiscoveryJob({
           queries,
         };
       } else {
-        if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
-          throw new Error('APIFY_DISCOVERY_ACTOR_ID is required for search discovery');
-        }
-        const run = await apifyActors.runSearch({
+        const crawlee = await searchTelegramLinksWithCrawlee({
           queries,
-          input: options?.input && typeof options.input === 'object' ? options.input : {},
+          maxLinks: 200,
+          perQueryPages: 1,
+          timeoutMs: Number(process.env.CRAWLEE_SEARCH_TIMEOUT_MS || 12000),
+          engine: String(process.env.CRAWLEE_SEARCH_ENGINE || 'duckduckgo').trim() || 'duckduckgo',
         });
-        const text = JSON.stringify(run.items || []);
-        const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
+        const found = crawlee.links || [];
         search = await upsertDiscoveredCommunities({
           pool,
           ensureGrowthSchema,
           workspaceId: workspace.id,
           communities: found,
-          source: 'search',
-          meta: { actor: 'apify_search', datasetId: run.datasetId },
+          source: 'crawlee_search',
+          meta: { actor: 'crawlee_search', engine: crawlee.engine, queries: crawlee.queries.length },
         });
-        search.datasetId = run.datasetId;
-        search.items = (run.items || []).length;
+        search.items = found.length;
         search.queries = queries;
       }
     }
@@ -1137,18 +1139,7 @@ async function runWorkspaceDiscoveryJob({
     const scrapeEnabled = options?.scrape !== false;
     const scrape = useTelethon
       ? { ok: true, skipped: true, via: 'telethon' }
-      : scrapeEnabled
-        ? await scrapeDiscoveredCommunities({
-            pool,
-            ensureGrowthSchema,
-            apifyActors,
-            workspaceId: workspace.id,
-            maxScrapes: Math.min(3, Math.max(0, Number(options?.max_scrapes || cfg.maxScrapes) || 0)),
-            cooldownHours: Number(options?.cooldown_hours || cfg.cooldownHours),
-            platform,
-            configOverride: options?.configOverride || null,
-          })
-        : { ok: true, skipped: true };
+      : { ok: true, skipped: true, error: 'Scrape step requires TELETHON_SERVICE_URL' };
 
     const rankings = await computeAndStoreCommunityRankings({
       pool,
@@ -1324,7 +1315,8 @@ registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
           : defaultQueries;
     const platform = String(body.platform || cfg.platform || 'telegram').toLowerCase();
 
-    const apifyActors = createApifyActors();
+    const telethonCfg = getTelethonConfigFromEnv();
+    const useTelethon = !!telethonCfg.baseUrl && body.use_telethon !== false;
 
     const extraction = body.message_extraction === false
       ? { ok: true, skipped: true }
@@ -1339,50 +1331,59 @@ registerWithApiAlias('post', '/intel/workspace/run', async (req, res) => {
     let search = { ok: true, skipped: true };
     const searchEnabled = body.search !== false;
     if (searchEnabled && queries.length) {
-      if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
-        return res.status(400).json({ ok: false, error: 'APIFY_DISCOVERY_ACTOR_ID is required for search discovery' });
+      if (useTelethon) {
+        const run = await runTelethonDiscovery({
+          queries,
+          maxGroupsTotal: 10,
+          maxMessagesPerGroup: 20,
+        });
+        const groups = Array.isArray(run?.groups) ? run.groups : [];
+        const ingested = await ingestTelethonGroups({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          groups,
+          configOverride: body.configOverride || null,
+          datasetId: 'telethon',
+        });
+        const toUpsert = ingested.communities.map((u) => `https://t.me/${String(u).replace(/^@/, '')}`);
+        search = await upsertDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          communities: toUpsert,
+          source: 'telethon',
+          meta: { actor: 'telethon', groups: groups.length },
+        });
+        search.queries = queries;
+        search.groups = groups.length;
+        search.posts_ingested = ingested.posts_inserted;
+      } else {
+        const crawlee = await searchTelegramLinksWithCrawlee({
+          queries,
+          maxLinks: Number(body.max_links || 200),
+          perQueryPages: Number(body.pages_per_query || 1),
+          timeoutMs: Number(process.env.CRAWLEE_SEARCH_TIMEOUT_MS || 12000),
+          engine: String(process.env.CRAWLEE_SEARCH_ENGINE || 'duckduckgo').trim() || 'duckduckgo',
+        });
+        const found = crawlee.links || [];
+        search = await upsertDiscoveredCommunities({
+          pool,
+          ensureGrowthSchema,
+          workspaceId: workspace.id,
+          communities: found,
+          source: 'crawlee_search',
+          meta: { actor: 'crawlee_search', engine: crawlee.engine, queries: crawlee.queries.length },
+        });
+        search.items = found.length;
+        search.queries = queries;
       }
-
-      const searchInputOverride = hasDirectInput
-        ? body.input
-        : {
-            ...(Number.isFinite(Number(body.maxResultsPerPage))
-              ? { maxResultsPerPage: Number(body.maxResultsPerPage) }
-              : {}),
-          };
-
-      // If caller provides a direct Apify input object, do not auto-map `queries` into other fields.
-      const run = hasDirectInput
-        ? await apifyActors.runSearch({ queries: [], input: searchInputOverride })
-        : await apifyActors.runSearch({ queries, input: searchInputOverride });
-      const text = JSON.stringify(run.items || []);
-      const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
-      search = await upsertDiscoveredCommunities({
-        pool,
-        ensureGrowthSchema,
-        workspaceId: workspace.id,
-        communities: found,
-        source: 'search',
-        meta: { actor: 'apify_search', datasetId: run.datasetId },
-      });
-      search.datasetId = run.datasetId;
-      search.items = (run.items || []).length;
-      search.queries = queries;
     }
 
     const scrapeEnabled = body.scrape !== false;
-    const scrape = scrapeEnabled
-      ? await scrapeDiscoveredCommunities({
-          pool,
-          ensureGrowthSchema,
-          apifyActors,
-          workspaceId: workspace.id,
-          maxScrapes: Number(body.max_scrapes || cfg.maxScrapes),
-          cooldownHours: Number(body.cooldown_hours || cfg.cooldownHours),
-          platform,
-          configOverride: body.configOverride || null,
-        })
-      : { ok: true, skipped: true };
+    const scrape = useTelethon
+      ? { ok: true, skipped: true, via: 'telethon' }
+      : { ok: true, skipped: true, error: 'Scrape step requires TELETHON_SERVICE_URL' };
 
     const rankings = await computeAndStoreCommunityRankings({
       pool,
@@ -2128,7 +2129,8 @@ registerWithApiAlias('get', '/cron/workspace-daily-run', async (req, res) => {
   try {
     await ensureGrowthSchema();
     const cfg = getDiscoveryConfigFromEnv();
-    const apifyActors = createApifyActors();
+    const telethonCfg = getTelethonConfigFromEnv();
+    const useTelethon = !!telethonCfg.baseUrl;
     const doSearch = String(process.env.WORKSPACE_DAILY_RUN_SEARCH || '').trim().toLowerCase() === 'true';
 
     const results = [];
@@ -2160,36 +2162,62 @@ registerWithApiAlias('get', '/cron/workspace-daily-run', async (req, res) => {
 
       let search = { ok: true, skipped: true };
       if (doSearch && defaultQueries.length) {
-        if (!String(process.env.APIFY_DISCOVERY_ACTOR_ID || '').trim()) {
-          search = { ok: false, skipped: true, error: 'APIFY_DISCOVERY_ACTOR_ID missing' };
+        if (useTelethon) {
+          // eslint-disable-next-line no-await-in-loop
+          const run = await runTelethonDiscovery({
+            queries: defaultQueries,
+            maxGroupsTotal: 10,
+            maxMessagesPerGroup: 20,
+          });
+          const groups = Array.isArray(run?.groups) ? run.groups : [];
+          // eslint-disable-next-line no-await-in-loop
+          const ingested = await ingestTelethonGroups({
+            pool,
+            ensureGrowthSchema,
+            workspaceId: workspace.id,
+            groups,
+            configOverride: null,
+            datasetId: 'telethon',
+          });
+          const toUpsert = ingested.communities.map((u) => `https://t.me/${String(u).replace(/^@/, '')}`);
+          // eslint-disable-next-line no-await-in-loop
+          search = await upsertDiscoveredCommunities({
+            pool,
+            ensureGrowthSchema,
+            workspaceId: workspace.id,
+            communities: toUpsert,
+            source: 'telethon',
+            meta: { actor: 'telethon', groups: groups.length },
+          });
+          search.groups = groups.length;
+          search.posts_ingested = ingested.posts_inserted;
         } else {
           // eslint-disable-next-line no-await-in-loop
-          const run = await apifyActors.runSearch({ queries: defaultQueries, input: {} });
-          const text = JSON.stringify(run.items || []);
-          const found = (text.match(/(?:https?:\/\/)?t\.me\/[a-z0-9_]{5,32}/gi) || []).slice(0, 200);
+          const crawlee = await searchTelegramLinksWithCrawlee({
+            queries: defaultQueries,
+            maxLinks: 200,
+            perQueryPages: 1,
+            timeoutMs: Number(process.env.CRAWLEE_SEARCH_TIMEOUT_MS || 12000),
+            engine: String(process.env.CRAWLEE_SEARCH_ENGINE || 'duckduckgo').trim() || 'duckduckgo',
+          });
+          const found = crawlee.links || [];
           // eslint-disable-next-line no-await-in-loop
           search = await upsertDiscoveredCommunities({
             pool,
             ensureGrowthSchema,
             workspaceId: workspace.id,
             communities: found,
-            source: 'search',
-            meta: { actor: 'apify_search', datasetId: run.datasetId },
+            source: 'crawlee_search',
+            meta: { actor: 'crawlee_search', engine: crawlee.engine, queries: crawlee.queries.length },
           });
+          search.items = found.length;
         }
       }
 
       // eslint-disable-next-line no-await-in-loop
-      const scrape = await scrapeDiscoveredCommunities({
-        pool,
-        ensureGrowthSchema,
-        apifyActors,
-        workspaceId: workspace.id,
-        maxScrapes: Number(cfg.maxScrapes),
-        cooldownHours: Number(cfg.cooldownHours),
-        platform: cfg.platform,
-        configOverride: null,
-      });
+      const scrape = useTelethon
+        ? { ok: true, skipped: true, via: 'telethon' }
+        : { ok: true, skipped: true, error: 'Scrape step requires TELETHON_SERVICE_URL' };
 
       // eslint-disable-next-line no-await-in-loop
       const rankings = await computeAndStoreCommunityRankings({

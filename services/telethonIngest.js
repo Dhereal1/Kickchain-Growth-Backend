@@ -17,14 +17,16 @@ function normalizeUsername(username) {
 async function ingestTelethonGroups({
   pool,
   ensureGrowthSchema,
-  workspaceId,
+  workspaceId = null,
+  userId = null,
   groups,
   configOverride = null,
   datasetId = null,
 }) {
   await ensureGrowthSchema();
 
-  const wsId = Number(workspaceId);
+  const wsId = workspaceId === null || workspaceId === undefined ? null : Number(workspaceId);
+  const uId = wsId != null ? null : (userId === null || userId === undefined ? null : Number(userId));
   const list = Array.isArray(groups) ? groups : [];
   let postsInserted = 0;
   const communities = new Set();
@@ -41,9 +43,10 @@ async function ingestTelethonGroups({
       const postedAt = m?.date ? new Date(m.date) : null;
 
       // Use a stable per-workspace post id to avoid collisions across groups.
-      const postKey = `${community}:${String(m?.id ?? '')}`;
+      const tenantPrefix = wsId != null ? `ws:${wsId}` : uId != null ? `u:${uId}` : 'legacy';
+      const postKey = `${tenantPrefix}:${community}:${String(m?.id ?? '')}`;
       const postId = sha256Hex(postKey);
-      const contentHash = sha256Hex(`${community}:${String(text || '')}`);
+      const contentHash = sha256Hex(`${tenantPrefix}:${community}:${String(text || '')}`);
 
       const signals = extractSignals({ text, views, raw: m, config: configOverride });
 
@@ -51,6 +54,7 @@ async function ingestTelethonGroups({
       const r = await pool.query(
         `
           INSERT INTO community_posts (
+            user_id,
             workspace_id,
             platform,
             community_name,
@@ -67,12 +71,13 @@ async function ingestTelethonGroups({
             frequency_score,
             raw
           ) VALUES (
-            $1, 'telegram', $2, $3, $4, $5, $6, $7, $8,
-            $9, $10, $11, $12, $13, $14::jsonb
+            $1, $2, 'telegram', $3, $4, $5, $6, $7, $8, $9,
+            $10, $11, $12, $13, $14, $15::jsonb
           )
           ON CONFLICT DO NOTHING
         `,
         [
+          uId,
           wsId,
           community,
           postId,
@@ -100,4 +105,3 @@ async function ingestTelethonGroups({
 module.exports = {
   ingestTelethonGroups,
 };
-

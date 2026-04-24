@@ -11,6 +11,7 @@ const {
 const {
   analyzeCommunity,
   computeMessagesHash,
+  computeLegacyMessagesHash,
   getCachedCommunityAnalysis,
   upsertCommunityAnalysis,
 } = require('../services/aiAnalysis');
@@ -790,7 +791,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         // Pull up to 10 recent messages (lightweight, post-processing only).
         const m = await pool.query(
           `
-            SELECT text
+            SELECT text, posted_at
             FROM community_posts
             WHERE platform = 'telegram'
               AND community_name = $1
@@ -800,7 +801,9 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           `,
           [comm, userId]
         );
-        const messages = (m.rows || []).map((x) => x.text).filter(Boolean);
+        const messages = (m.rows || [])
+          .map((x) => ({ text: x.text, posted_at: x.posted_at }))
+          .filter((x) => x && x.text);
         if (!messages.length) {
           analyzed.push({ ...row, ai_summary: null, ai: { skipped: true, reason: 'no_messages' } });
           continue;
@@ -808,6 +811,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
 
         const model = String(process.env.OPENAI_MODEL || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
         const messagesHash = computeMessagesHash(messages);
+        const legacyMessagesHash = computeLegacyMessagesHash(messages);
         const cached = await getCachedCommunityAnalysis({
           pool,
           ensureGrowthSchema,
@@ -815,6 +819,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           platform: 'telegram',
           communityName: comm,
           messagesHash,
+          legacyMessagesHash,
         });
 
         if (cached?.analysis) {
@@ -845,6 +850,8 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             communityName: comm,
             messagesHash,
             model,
+            provider: ai?._meta?.provider || 'openai',
+            modelVersion: ai?._meta?.model_version || null,
             analysis: ai,
           });
           const finalDecision = toUpperDecision(
@@ -913,6 +920,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
 
       const model = String(process.env.OPENAI_MODEL || body.model || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
       const messagesHash = computeMessagesHash(messages);
+      const legacyMessagesHash = computeLegacyMessagesHash(messages);
 
       const cached = await getCachedCommunityAnalysis({
         pool,
@@ -921,6 +929,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         platform: 'telegram',
         communityName: community,
         messagesHash,
+        legacyMessagesHash,
       });
 
       if (cached?.analysis) {
@@ -936,6 +945,8 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         communityName: community,
         messagesHash,
         model,
+        provider: ai?._meta?.provider || 'openai',
+        modelVersion: ai?._meta?.model_version || null,
         analysis: ai,
       });
 
