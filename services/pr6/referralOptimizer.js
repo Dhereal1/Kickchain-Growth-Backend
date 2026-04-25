@@ -332,7 +332,11 @@ async function runPr6ReferralOptimizer({ pool, ensureGrowthSchema, dryRun } = {}
   await ensureGrowthSchema();
 
   const dayRes = await pool.query(`SELECT (NOW() AT TIME ZONE 'UTC')::date AS day`);
-  const day = String(dayRes.rows[0]?.day || '').slice(0, 10);
+  const dayRaw = dayRes.rows[0]?.day;
+  const day =
+    dayRaw instanceof Date
+      ? dayRaw.toISOString().slice(0, 10)
+      : String(dayRaw || '').slice(0, 10);
   if (!day) throw new Error('failed_to_resolve_day');
 
   const maxNudges = clampInt(process.env.PR6_MAX_NUDGES_PER_RUN, 0, 500, 50);
