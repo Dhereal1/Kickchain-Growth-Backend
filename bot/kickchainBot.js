@@ -17,9 +17,9 @@ function toMiniappUrl(miniappPublicUrl) {
   const base = normalizeUrl(miniappPublicUrl);
   if (!base) return '';
   const lower = base.toLowerCase();
-  if (lower.endsWith('/miniapp/')) return base;
-  if (lower.endsWith('/miniapp')) return `${base}/`;
-  return `${base}/miniapp/`;
+  if (lower.endsWith('/miniapp/')) return base.replace(/\/+$/, '');
+  if (lower.endsWith('/miniapp')) return base;
+  return `${base}/miniapp`;
 }
 
 function readEnvValueFromFile(envPath, key) {

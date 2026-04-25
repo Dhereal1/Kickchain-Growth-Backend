@@ -160,7 +160,11 @@ MINIAPP_PUBLIC_URL="$(rg -N "^MINIAPP_PUBLIC_URL=" "$ROOT_DIR/.env" 2>/dev/null 
 if [[ -n "${MINIAPP_PUBLIC_URL:-}" ]]; then
   MINIAPP_PUBLIC_URL="${MINIAPP_PUBLIC_URL%/}"
   echo ""
-  echo "Mini App URL: ${MINIAPP_PUBLIC_URL}/miniapp"
+  if [[ "$MINIAPP_PUBLIC_URL" == */miniapp ]]; then
+    echo "Mini App URL: ${MINIAPP_PUBLIC_URL}"
+  else
+    echo "Mini App URL: ${MINIAPP_PUBLIC_URL}/miniapp"
+  fi
 fi
 
 echo ""
