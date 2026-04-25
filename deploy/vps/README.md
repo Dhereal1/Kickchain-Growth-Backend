@@ -61,3 +61,15 @@ Defaults:
 
 - Runs every ~10 hours (configurable via `WORKSPACE_AUTO_RUN_CRON`)
 - Enqueues jobs and processes them in the background (runner tick controlled by `ENABLE_WORKSPACE_RUNNER_SCHEDULER`)
+
+## Feature flags + canary rollouts
+
+This backend uses env-var feature flags (see `.env.example`, and set them in `deploy/vps/backend.env`).
+
+Recommended rollout process:
+
+- Flip **one** flag at a time.
+- Do a canary deploy first (enable the flag on a single instance / environment), watch logs and error rate, then roll out broadly.
+- Keep a running checklist / go-no-go notes in `tasks`.
+
+PR6 cron (when enabled): `GET /cron/pr6-referral-optimizer` (supports `?dry_run=1` and `&format=team`), protected by `CRON_SECRET` like other cron endpoints. Guardrails: per-user 7d nudge cap + 30d bonus cap via PR6 env vars.

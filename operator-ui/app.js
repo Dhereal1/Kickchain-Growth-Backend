@@ -437,6 +437,36 @@ async function loadDiscovered() {
   return { data, node: root };
 }
 
+async function loadHype() {
+  const data = await apiFetch('/api/growth/hype/events?limit=50', { method: 'GET', timeoutMs: 30000 });
+  const items = Array.isArray(data?.items) ? data.items : [];
+
+  const root = document.createElement('div');
+  root.className = 'row';
+  root.appendChild(renderKvs([{ key: 'Events', value: fmtNum(items.length) }]));
+
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'help';
+    empty.textContent = 'No hype events yet (or feature disabled).';
+    root.appendChild(empty);
+    return { data, node: root };
+  }
+
+  const cards = items.map((e) =>
+    communityCard(
+      {
+        name: `match #${e.match_id} · ${e.status}`,
+        platform: 'telegram',
+        reason: `winner: ${e.winner_id} | stake: ${e.stake_amount} | attempts: ${e.attempts}\n${e.hype_text}\n${e.last_error ? `error: ${e.last_error}` : ''}`,
+      },
+      { label: String(e.status || 'event') }
+    )
+  );
+  root.appendChild(renderList(cards));
+  return { data, node: root };
+}
+
 function init() {
   const baseUrl = $('baseUrl');
   const token = $('token');
@@ -529,6 +559,7 @@ function init() {
     today: async () => loadToday(),
     runs: async () => loadRuns(),
     discovered: async () => loadDiscovered(),
+    hype: async () => loadHype(),
     raw: async () => ({ data: null, node: document.createElement('div') }),
   };
 
@@ -579,4 +610,3 @@ function init() {
 }
 
 document.addEventListener('DOMContentLoaded', init);
-

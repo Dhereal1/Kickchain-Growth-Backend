@@ -1,0 +1,139 @@
+# Kickchain Growth Backend — Next Moves (as of 2026-04-25)
+
+## Verdict
+- Use the current implementation as-is (no redo).
+
+## Rollout Plan
+### 1) Enable flags one at a time
+- Identify the next flag to ship (start with additive modules):
+  - `ENABLE_GROWTH_CRM`
+  - `ENABLE_MATCH_HYPE_EVENTS`
+  - `ENABLE_TOURNAMENT_ORCHESTRATION`
+  - `ENABLE_AMBASSADORS`
+  - `ENABLE_COPILOT`
+- For each flag:
+  - [ ] Enable on canary only
+  - [ ] Observe for 24 hours
+  - [ ] If stable, expand to full rollout
+  - [ ] If unstable, roll back by flipping the flag off
+
+### 2) Canary rollout
+- [ ] Pick a canary target (one instance / one region / one environment).
+- [ ] Deploy canary with exactly one flag change.
+- [ ] Monitor:
+  - Error rate (5xx) + logs
+  - Duplicate-event rate (hype queue)
+  - Tournament completion success %
+  - Referral conversion deltas
+  - Latency (p95/p99) for critical routes
+  - DB write latency (watch new tables / PR6)
+  - DB errors / connection saturation
+  - Queue/worker backlog (if applicable)
+- [ ] Document “go/no-go” for the canary in this file.
+
+#### Canary measurement snippets (SQL)
+```sql
+-- Duplicate-event rate (hype queue) over last 7d; should be 0 with unique match_id
+SELECT
+  1 - (COUNT(DISTINCT match_id)::float / NULLIF(COUNT(*)::float, 0)) AS duplicate_rate
+FROM match_hype_events
+WHERE created_at >= NOW() - INTERVAL '7 days';
+
+-- Tournament completion success % over last 7d
+SELECT
+  (SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END)::float
+   / NULLIF(SUM(CASE WHEN status IN ('active','completed') THEN 1 ELSE 0 END)::float, 0)) AS completion_rate
+FROM tournaments
+WHERE created_at >= NOW() - INTERVAL '7 days';
+
+-- Referral conversions per day (last 14d)
+SELECT (created_at AT TIME ZONE 'UTC')::date AS day, COUNT(*)::int AS referred_signups
+FROM users
+WHERE referred_by IS NOT NULL
+  AND created_at >= NOW() - INTERVAL '14 days'
+GROUP BY 1
+ORDER BY 1 DESC;
+
+-- PR6 writes per day (last 14d)
+SELECT day, COUNT(*)::int AS scored_users
+FROM pr6_user_scores_daily
+WHERE day >= (NOW() AT TIME ZONE 'UTC')::date - 13
+GROUP BY 1
+ORDER BY 1 DESC;
+
+-- PR6 cap hit rate (bonus cap) over last 7d: users hitting caps / nudged users
+SELECT
+  (COUNT(*) FILTER (WHERE bonus_capped)::float / NULLIF(COUNT(*)::float, 0)) AS cap_hit_rate
+FROM pr6_nudges
+WHERE created_at >= NOW() - INTERVAL '7 days'
+  AND status = 'sent';
+
+-- PR6 7d nudge cap pressure (set 3 to your `PR6_MAX_NUDGES_PER_USER_7D`)
+WITH per_user AS (
+  SELECT telegram_id, COUNT(*)::int AS nudges_7d
+  FROM pr6_nudges
+  WHERE created_at >= NOW() - INTERVAL '7 days'
+    AND status = 'sent'
+  GROUP BY telegram_id
+)
+SELECT
+  (COUNT(*) FILTER (WHERE nudges_7d >= 3)::float / NULLIF(COUNT(*)::float, 0)) AS at_or_over_cap_rate,
+  AVG(nudges_7d)::float AS avg_nudges_7d
+FROM per_user;
+
+-- PR6 concentration (avoid whales): top-10 share of nudges and bonus allocation over last 7d
+WITH u AS (
+  SELECT
+    telegram_id,
+    COUNT(*)::int AS nudges_7d,
+    SUM(COALESCE(bonus_xp,0) * COALESCE(bonus_conversions,0))::int AS bonus_alloc_xp_7d
+  FROM pr6_nudges
+  WHERE created_at >= NOW() - INTERVAL '7 days'
+    AND status = 'sent'
+  GROUP BY telegram_id
+),
+tot AS (
+  SELECT
+    SUM(nudges_7d)::float AS nudges_total,
+    SUM(bonus_alloc_xp_7d)::float AS bonus_total
+  FROM u
+),
+top AS (
+  SELECT *
+  FROM u
+  ORDER BY nudges_7d DESC, bonus_alloc_xp_7d DESC
+  LIMIT 10
+)
+SELECT
+  (SELECT SUM(nudges_7d)::float FROM top) / NULLIF((SELECT nudges_total FROM tot), 0) AS top10_nudge_share,
+  (SELECT SUM(bonus_alloc_xp_7d)::float FROM top) / NULLIF((SELECT bonus_total FROM tot), 0) AS top10_bonus_share;
+```
+
+### 3) Observe for one week
+- [ ] After full rollout, observe for 7 days (e.g., 2026-04-25 → 2026-05-02).
+- [ ] Capture any regressions, edge cases, or required follow-ups.
+- [ ] Only proceed when the week looks clean.
+
+## Next: PR6 (Referral Optimization Engine)
+- [ ] Define PR6 scope + success metrics (conversion, retention, referral rate).
+- [ ] Decide data sources + required events/logs.
+- [ ] Confirm tracking + attribution rules (multi-touch, last-touch, fraud/abuse handling).
+- [ ] Decide persistence layer changes (tables/columns, backfills, migrations).
+- [ ] Draft API shape (endpoints, schemas, idempotency).
+- [ ] Add experiment/flagging strategy for PR6 (ship behind a dedicated flag).
+- [ ] Create PR6 implementation checklist and break into small PRs.
+
+### PR6 Canary Sequence (recommended)
+**Stage 1 (24–48h, dry-run only)**
+- Set `ENABLE_PR6_REFERRAL_ENGINE=true`
+- Keep `PR6_CANARY_PERCENT=100` (full scoring distribution)
+- Trigger: `GET /cron/pr6-referral-optimizer?dry_run=1` (or `?dry_run=1&format=team`)
+- Watch: score distributions, projected nudge volume, projected bonus allocations, unexpected cap hits
+
+**Stage 2 (small live canary cohort)**
+- Set `PR6_CANARY_PERCENT=5` (or `10`) and keep `PR6_CANARY_SALT=pr6` stable
+- Trigger: `GET /cron/pr6-referral-optimizer` (no `dry_run`)
+- Watch: nudge acceptance, referral lift, bonus issuance rate, cap hit rate
+
+**Stage 3 (7-day observation)**
+- Promote to `PR6_CANARY_PERCENT=100` only if stable, then observe for 7 days.

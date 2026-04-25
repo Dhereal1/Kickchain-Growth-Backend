@@ -16,3 +16,4 @@
     { "path": "/api/cron/intel-full-pipeline", "schedule": "10 9 * * *" }
   ]
 }
+

@@ -2,10 +2,18 @@ const KEY_API_KEY = "kc_intel_api_key_v1";
 const KEY_BASE_URL = "kc_intel_base_url_v1";
 
 export function defaultBaseUrl() {
-  return (
-    (process.env.NEXT_PUBLIC_INTEL_API_BASE_URL || "").trim() ||
-    "https://kickchain-growth-backend.vercel.app"
-  );
+  const fromEnv = (process.env.NEXT_PUBLIC_INTEL_API_BASE_URL || "").trim();
+  if (fromEnv) return fromEnv;
+
+  // Avoid accidentally pointing at an old Vercel deployment. If running on a VPS where
+  // intel-ui is served from :3001 and backend from :3004, infer the backend host.
+  if (typeof window !== "undefined" && window.location) {
+    const proto = window.location.protocol || "http:";
+    const host = window.location.hostname || "localhost";
+    return `${proto}//${host}:3004`;
+  }
+
+  return "http://localhost:3004";
 }
 
 export function getApiKey(): string {
@@ -44,4 +52,3 @@ export function setBaseUrl(v: string) {
     // ignore
   }
 }
-

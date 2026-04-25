@@ -1,6 +1,4 @@
-if (!process.env.VERCEL) {
-  require('dotenv').config({ quiet: true });
-}
+require('dotenv').config({ quiet: true });
 const express = require('express');
 const path = require('path');
 const pool = require('./db/pool');
@@ -10,6 +8,11 @@ const { processLeaderboardUpdate } = require('./events/leaderboardHype');
 const { createKickchainBot } = require('./bot/kickchainBot');
 const { sendToUsers } = require('./bot/notifyUsers');
 const { registerIntelRoutes } = require('./routes/intelRoutes');
+const { registerGrowthRoutes } = require('./routes/growthRoutes');
+const { registerTournamentRoutes } = require('./routes/tournamentRoutes');
+const { registerAmbassadorRoutes } = require('./routes/ambassadorRoutes');
+const { registerCopilotRoutes } = require('./routes/copilotRoutes');
+const { registerHypeRoutes } = require('./routes/hypeRoutes');
 const { ingestDatasets, aggregateDaily, cleanupOldPosts } = require('./services/intelPipeline');
 const { getIntelConfig } = require('./services/intelConfig');
 const { dispatchIntelWebhooks } = require('./services/intelWebhooks');
@@ -18,6 +21,19 @@ const { ingestTelethonGroups } = require('./services/telethonIngest');
 const { searchTelegramLinksWithCrawlee } = require('./services/crawleeSearch');
 const { verifyTelegramWebAppInitData } = require('./services/telegramWebAppAuth');
 const { createCorsMiddleware } = require('./middleware/cors');
+const { isGrowthCrmEnabled } = require('./services/featureFlags');
+const { isMatchHypeEventsEnabled } = require('./services/featureFlags');
+const { isPr6ReferralEngineEnabled } = require('./services/featureFlags');
+const { queueMatchHypeEvent } = require('./services/events/matchEvents');
+const { processHypeQueueOnce } = require('./workers/hypeWorker');
+const { applyMatchResultToTournament } = require('./services/tournaments/orchestrator');
+const { getTournamentState, joinTournament } = require('./services/tournaments/orchestrator');
+const { isTournamentOrchestrationEnabled } = require('./services/featureFlags');
+const { isAmbassadorsEnabled } = require('./services/featureFlags');
+const { getActiveBoostMultiplier } = require('./services/ambassadors/boosts');
+const { computeAmbassadorEligibility } = require('./services/ambassadors/eligibility');
+const { runPr6ReferralOptimizer, _internals: pr6Internals } = require('./services/pr6/referralOptimizer');
+const { applyReferralBonusOnSignup } = require('./services/pr6/referralBonus');
 const {
   discoverFromMessageExtraction,
   computeAndStoreCommunityRankings,
@@ -55,6 +71,11 @@ app.use(
 );
 
 registerIntelRoutes(app, { pool, ensureGrowthSchema });
+registerGrowthRoutes(app, { pool, ensureGrowthSchema });
+registerTournamentRoutes(app, { pool, ensureGrowthSchema });
+registerAmbassadorRoutes(app, { pool, ensureGrowthSchema });
+registerCopilotRoutes(app, { pool, ensureGrowthSchema });
+registerHypeRoutes(app, { pool, ensureGrowthSchema });
 
 function generateReferralCode(telegram_id) {
   return `KC${telegram_id}${Math.floor(Math.random() * 1000)}`;
@@ -268,11 +289,81 @@ async function ensureUserFromTelegramWebApp({ telegramId, username, referralCode
 
   // Reward referrer on successful referral (best-effort).
   if (referrer?.telegram_id) {
-    await awardXp({ telegramId: Number(referrer.telegram_id), amount: 120, reason: 'referral_signup' });
-    await awardBadgesIfEligible({ telegramId: Number(referrer.telegram_id) });
+    const refTid = Number(referrer.telegram_id);
+    let amount = 120;
+    if (isAmbassadorsEnabled()) {
+      try {
+        const mult = await getActiveBoostMultiplier({
+          pool,
+          ensureGrowthSchema,
+          telegramId: refTid,
+          boostType: 'referral_xp',
+        });
+        amount = Math.round(amount * mult);
+      } catch (err) {
+        console.warn('ambassador referral boost lookup failed:', err?.message || String(err));
+      }
+    }
+
+    if (isPr6ReferralEngineEnabled()) {
+      try {
+        const b = await applyReferralBonusOnSignup({ pool, telegramId: refTid });
+        if (b?.applied) amount += Number(b.bonus_xp || 0) || 0;
+      } catch (err) {
+        console.warn('pr6 referral bonus apply failed:', err?.message || String(err));
+      }
+    }
+
+    await awardXp({ telegramId: refTid, amount, reason: 'referral_signup' });
+    await awardBadgesIfEligible({ telegramId: refTid });
   }
 
   return { user: result.rows[0], created: true };
+}
+
+async function maybeAttributePartnerCampaign({ referralCodeUsed, newTelegramId }) {
+  if (!isGrowthCrmEnabled()) return { ok: true, skipped: true, reason: 'disabled' };
+  const code = String(referralCodeUsed || '').trim();
+  if (!code) return { ok: true, skipped: true, reason: 'no_code' };
+
+  const defaultUserIdRaw = Number(process.env.DEFAULT_GROWTH_USER_ID || 0);
+  const defaultUserId = Number.isFinite(defaultUserIdRaw) && defaultUserIdRaw > 0 ? defaultUserIdRaw : null;
+  if (!defaultUserId) return { ok: true, skipped: true, reason: 'DEFAULT_GROWTH_USER_ID_not_set' };
+
+  // Only attribute codes that are not user referral codes. Caller should ensure this, but keep safe.
+  const userRef = await pool.query('SELECT referral_code FROM users WHERE referral_code = $1 LIMIT 1', [code]);
+  if (userRef.rowCount) return { ok: true, skipped: true, reason: 'is_user_referral_code' };
+
+  const campaignRes = await pool.query(
+    `SELECT id, influencer_id, user_id
+     FROM partner_campaigns
+     WHERE user_id = $1 AND code = $2
+     LIMIT 1`,
+    [defaultUserId, code]
+  );
+  const campaign = campaignRes.rows[0] || null;
+  if (!campaign) return { ok: true, skipped: true, reason: 'campaign_not_found' };
+
+  await pool.query(
+    `
+      INSERT INTO partner_attributions (user_id, campaign_id, referred_telegram_id)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (campaign_id, referred_telegram_id) DO NOTHING
+    `,
+    [campaign.user_id, campaign.id, Number(newTelegramId)]
+  );
+
+  if (campaign.influencer_id) {
+    await pool.query(
+      `UPDATE influencer_pipeline
+       SET conversions = COALESCE(conversions, 0) + 1,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [Number(campaign.influencer_id)]
+    );
+  }
+
+  return { ok: true, attributed: true, user_id: campaign.user_id, campaign_id: campaign.id };
 }
 
 async function computeUserStats({ telegramId }) {
@@ -664,6 +755,9 @@ async function ensureGrowthSchema() {
     await pool.query(
       "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_hype_at TIMESTAMP"
     );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_pr6_nudge_at TIMESTAMP"
+    );
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS groups (
@@ -743,11 +837,137 @@ async function ensureGrowthSchema() {
   await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS is_private BOOLEAN DEFAULT FALSE");
   await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS invite_code TEXT");
   await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS owner_telegram_id BIGINT");
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS format TEXT DEFAULT 'single_elim'");
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS max_participants INT DEFAULT 16");
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS entry_stake_amount NUMERIC DEFAULT 0");
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS prize_pool NUMERIC DEFAULT 0");
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rules JSONB DEFAULT '{}'::jsonb");
   await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS tournaments_invite_code_uq ON tournaments (invite_code)");
 
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS tournaments_title_uq ON tournaments (title)'
   );
+
+  // Match hype events (durable queue; behind ENABLE_MATCH_HYPE_EVENTS).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS match_hype_events (
+      id BIGSERIAL PRIMARY KEY,
+      match_id INT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      winner_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      loser_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      stake_amount NUMERIC NOT NULL DEFAULT 0,
+      hype_text TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      attempts INT NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      sent_at TIMESTAMP
+    );
+  `);
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS match_id INT');
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS winner_id BIGINT');
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS loser_id BIGINT');
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS stake_amount NUMERIC NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS hype_text TEXT');
+  await pool.query("ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'queued'");
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS last_error TEXT');
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query('ALTER TABLE match_hype_events ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS match_hype_events_match_uq ON match_hype_events (match_id)');
+  await pool.query('CREATE INDEX IF NOT EXISTS match_hype_events_status_idx ON match_hype_events (status, id)');
+
+  // Tournament orchestration tables (additive; behind ENABLE_TOURNAMENT_ORCHESTRATION).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournament_participants (
+      tournament_id INT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      seed INT,
+      status TEXT NOT NULL DEFAULT 'joined',
+      joined_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (tournament_id, telegram_id)
+    );
+  `);
+  await pool.query('ALTER TABLE tournament_participants ADD COLUMN IF NOT EXISTS tournament_id INT');
+  await pool.query('ALTER TABLE tournament_participants ADD COLUMN IF NOT EXISTS telegram_id BIGINT');
+  await pool.query('ALTER TABLE tournament_participants ADD COLUMN IF NOT EXISTS seed INT');
+  await pool.query("ALTER TABLE tournament_participants ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'joined'");
+  await pool.query('ALTER TABLE tournament_participants ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS tournament_participants_lookup_idx ON tournament_participants (tournament_id, joined_at)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournament_bracket_matches (
+      id BIGSERIAL PRIMARY KEY,
+      tournament_id INT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+      round INT NOT NULL,
+      slot INT NOT NULL,
+      player_a BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+      player_b BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+      match_id INT REFERENCES matches(id) ON DELETE SET NULL,
+      winner_id BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS tournament_id INT');
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS round INT');
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS slot INT');
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS player_a BIGINT');
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS player_b BIGINT');
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS match_id INT');
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS winner_id BIGINT');
+  await pool.query("ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'");
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query('ALTER TABLE tournament_bracket_matches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS tournament_bracket_matches_uq ON tournament_bracket_matches (tournament_id, round, slot)'
+  );
+  await pool.query('CREATE INDEX IF NOT EXISTS tournament_bracket_matches_match_idx ON tournament_bracket_matches (match_id)');
+
+  // Ambassador layer (additive; behind ENABLE_AMBASSADORS).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ambassadors (
+      telegram_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'active',
+      level INT NOT NULL DEFAULT 1,
+      score NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE ambassadors ADD COLUMN IF NOT EXISTS telegram_id BIGINT');
+  await pool.query("ALTER TABLE ambassadors ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'");
+  await pool.query('ALTER TABLE ambassadors ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 1');
+  await pool.query('ALTER TABLE ambassadors ADD COLUMN IF NOT EXISTS score NUMERIC NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE ambassadors ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query('ALTER TABLE ambassadors ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ambassador_boosts (
+      id BIGSERIAL PRIMARY KEY,
+      telegram_id BIGINT NOT NULL REFERENCES ambassadors(telegram_id) ON DELETE CASCADE,
+      boost_type TEXT NOT NULL,
+      multiplier NUMERIC NOT NULL DEFAULT 1.0,
+      starts_at TIMESTAMP,
+      ends_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE ambassador_boosts ADD COLUMN IF NOT EXISTS telegram_id BIGINT');
+  await pool.query('ALTER TABLE ambassador_boosts ADD COLUMN IF NOT EXISTS boost_type TEXT');
+  await pool.query('ALTER TABLE ambassador_boosts ADD COLUMN IF NOT EXISTS multiplier NUMERIC NOT NULL DEFAULT 1.0');
+  await pool.query('ALTER TABLE ambassador_boosts ADD COLUMN IF NOT EXISTS starts_at TIMESTAMP');
+  await pool.query('ALTER TABLE ambassador_boosts ADD COLUMN IF NOT EXISTS ends_at TIMESTAMP');
+  await pool.query('ALTER TABLE ambassador_boosts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query('ALTER TABLE ambassador_boosts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS ambassador_boosts_uq ON ambassador_boosts (telegram_id, boost_type)'
+  );
+  await pool.query('CREATE INDEX IF NOT EXISTS ambassador_boosts_active_idx ON ambassador_boosts (boost_type, telegram_id)');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS communities (
@@ -1133,6 +1353,142 @@ async function ensureGrowthSchema() {
     'CREATE INDEX IF NOT EXISTS growth_actions_workspace_day_idx ON growth_actions (workspace_id, action_day DESC)',
   ]);
 
+  // Growth CRM (per-intel-user) tables (additive; behind ENABLE_GROWTH_CRM).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS communities_pipeline (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT NOT NULL,
+      platform TEXT NOT NULL DEFAULT 'telegram',
+      community_name TEXT NOT NULL,
+      stage TEXT NOT NULL DEFAULT 'discovered',
+      opportunity_score NUMERIC NOT NULL DEFAULT 0,
+      assigned_to TEXT,
+      tags TEXT[],
+      notes TEXT,
+      last_touch_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS user_id INT');
+  await pool.query("ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'telegram'");
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS community_name TEXT');
+  await pool.query("ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'discovered'");
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS opportunity_score NUMERIC NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS assigned_to TEXT');
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS tags TEXT[]');
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS notes TEXT');
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS last_touch_at TIMESTAMP');
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query('ALTER TABLE communities_pipeline ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS communities_pipeline_uq ON communities_pipeline (user_id, platform, community_name)'
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS communities_pipeline_stage_idx ON communities_pipeline (user_id, stage, opportunity_score DESC)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS influencer_pipeline (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT NOT NULL,
+      platform TEXT NOT NULL DEFAULT 'telegram',
+      handle TEXT NOT NULL,
+      contact_status TEXT NOT NULL DEFAULT 'new',
+      deal_status TEXT NOT NULL DEFAULT 'none',
+      payout_total NUMERIC NOT NULL DEFAULT 0,
+      conversions INT NOT NULL DEFAULT 0,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS user_id INT');
+  await pool.query("ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'telegram'");
+  await pool.query('ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS handle TEXT');
+  await pool.query("ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS contact_status TEXT NOT NULL DEFAULT 'new'");
+  await pool.query("ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS deal_status TEXT NOT NULL DEFAULT 'none'");
+  await pool.query('ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS payout_total NUMERIC NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS conversions INT NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS notes TEXT');
+  await pool.query('ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query('ALTER TABLE influencer_pipeline ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS influencer_pipeline_uq ON influencer_pipeline (user_id, platform, handle)'
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS influencer_pipeline_status_idx ON influencer_pipeline (user_id, contact_status, updated_at DESC)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_campaigns (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT NOT NULL,
+      name TEXT NOT NULL,
+      code TEXT NOT NULL,
+      influencer_id BIGINT REFERENCES influencer_pipeline(id) ON DELETE SET NULL,
+      payout_total NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE partner_campaigns ADD COLUMN IF NOT EXISTS user_id INT');
+  await pool.query('ALTER TABLE partner_campaigns ADD COLUMN IF NOT EXISTS name TEXT');
+  await pool.query('ALTER TABLE partner_campaigns ADD COLUMN IF NOT EXISTS code TEXT');
+  await pool.query('ALTER TABLE partner_campaigns ADD COLUMN IF NOT EXISTS influencer_id BIGINT');
+  await pool.query('ALTER TABLE partner_campaigns ADD COLUMN IF NOT EXISTS payout_total NUMERIC NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE partner_campaigns ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query('ALTER TABLE partner_campaigns ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS partner_campaigns_uq ON partner_campaigns (user_id, code)'
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS partner_campaigns_user_idx ON partner_campaigns (user_id, updated_at DESC)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_attributions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT NOT NULL,
+      campaign_id BIGINT NOT NULL REFERENCES partner_campaigns(id) ON DELETE CASCADE,
+      referred_telegram_id BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE partner_attributions ADD COLUMN IF NOT EXISTS user_id INT');
+  await pool.query('ALTER TABLE partner_attributions ADD COLUMN IF NOT EXISTS campaign_id BIGINT');
+  await pool.query('ALTER TABLE partner_attributions ADD COLUMN IF NOT EXISTS referred_telegram_id BIGINT');
+  await pool.query('ALTER TABLE partner_attributions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS partner_attributions_uq ON partner_attributions (campaign_id, referred_telegram_id)'
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS partner_attributions_campaign_idx ON partner_attributions (campaign_id, created_at DESC)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS outreach_events (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      status TEXT NOT NULL,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query('ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS user_id INT');
+  await pool.query('ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS entity_type TEXT');
+  await pool.query('ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS entity_key TEXT');
+  await pool.query('ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS channel TEXT');
+  await pool.query('ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS status TEXT');
+  await pool.query('ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS notes TEXT');
+  await pool.query('ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()');
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS outreach_events_lookup_idx ON outreach_events (user_id, entity_type, entity_key, created_at DESC)'
+  );
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS community_ai_analyses (
       id BIGSERIAL PRIMARY KEY,
@@ -1211,6 +1567,54 @@ async function ensureGrowthSchema() {
       PRIMARY KEY (day, telegram_id)
     );
   `);
+
+  // PR6: referral optimization engine (additive; behind ENABLE_PR6_REFERRAL_ENGINE).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pr6_user_scores_daily (
+      day DATE NOT NULL,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      referral_score INT NOT NULL DEFAULT 0,
+      churn_risk INT NOT NULL DEFAULT 0,
+      computed_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (day, telegram_id)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pr6_nudges (
+      id BIGSERIAL PRIMARY KEY,
+      day DATE NOT NULL,
+      telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      nudge_type TEXT NOT NULL,
+      bonus_xp INT NOT NULL DEFAULT 0,
+      bonus_conversions INT NOT NULL DEFAULT 0,
+      bonus_capped BOOLEAN NOT NULL DEFAULT FALSE,
+      status TEXT NOT NULL DEFAULT 'queued',
+      error TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      sent_at TIMESTAMP
+    );
+  `);
+  await pool.query("ALTER TABLE pr6_nudges ADD COLUMN IF NOT EXISTS bonus_xp INT NOT NULL DEFAULT 0");
+  await pool.query("ALTER TABLE pr6_nudges ADD COLUMN IF NOT EXISTS bonus_conversions INT NOT NULL DEFAULT 0");
+  await pool.query("ALTER TABLE pr6_nudges ADD COLUMN IF NOT EXISTS bonus_capped BOOLEAN NOT NULL DEFAULT FALSE");
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS pr6_nudges_uq ON pr6_nudges (day, telegram_id, nudge_type)'
+  );
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS pr6_nudges_lookup_idx ON pr6_nudges (telegram_id, created_at DESC)'
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pr6_referral_bonuses (
+      telegram_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+      bonus_xp INT NOT NULL DEFAULT 0,
+      remaining_conversions INT NOT NULL DEFAULT 0,
+      expires_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
   })().catch((err) => {
     ensureGrowthSchemaPromise = null;
     throw err;
@@ -1223,6 +1627,148 @@ function registerWithApiAlias(method, path, handler) {
   app[method](path, handler);
   app[method](`/api${path}`, handler);
 }
+
+// Miniapp: match hype feed (optional)
+app.get('/miniapp/api/hype/feed', async (req, res) => {
+  try {
+    if (!isMatchHypeEventsEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
+    verifyMiniApp(req);
+    await ensureGrowthSchema();
+
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 20) || 20));
+    const r = await pool.query(
+      `
+        SELECT id, match_id, winner_id, loser_id, stake_amount, hype_text, sent_at, created_at
+        FROM match_hype_events
+        WHERE status = 'sent'
+        ORDER BY sent_at DESC NULLS LAST, id DESC
+        LIMIT $1
+      `,
+      [limit]
+    );
+    return res.json({ ok: true, items: r.rows || [] });
+  } catch (err) {
+    const code = err?.code || 'miniapp_hype_feed_failed';
+    const msg = err?.message || String(err);
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+app.get('/miniapp/api/hype/latest', async (req, res) => {
+  try {
+    if (!isMatchHypeEventsEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
+    const verified = verifyMiniApp(req);
+    const telegramId = verified?.user?.id != null ? Number(verified.user.id) : null;
+    if (!telegramId || !Number.isFinite(telegramId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_telegram_user' });
+    }
+    await ensureGrowthSchema();
+
+    const r = await pool.query(
+      `
+        SELECT id, match_id, winner_id, loser_id, stake_amount, hype_text, sent_at, created_at
+        FROM match_hype_events
+        WHERE status = 'sent' AND winner_id = $1
+        ORDER BY sent_at DESC NULLS LAST, id DESC
+        LIMIT 1
+      `,
+      [telegramId]
+    );
+    return res.json({ ok: true, item: r.rows[0] || null });
+  } catch (err) {
+    const code = err?.code || 'miniapp_hype_latest_failed';
+    const msg = err?.message || String(err);
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+// Miniapp: tournaments (orchestration layer; optional)
+app.get('/miniapp/api/tournaments', async (req, res) => {
+  try {
+    if (!isTournamentOrchestrationEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
+    verifyMiniApp(req);
+    await ensureGrowthSchema();
+    const r = await pool.query('SELECT * FROM tournaments ORDER BY start_date ASC NULLS LAST, id DESC LIMIT 50');
+    return res.json({ ok: true, tournaments: r.rows || [] });
+  } catch (err) {
+    const code = err?.code || 'miniapp_tournaments_failed';
+    const msg = err?.message || String(err);
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+app.get('/miniapp/api/tournaments/:id', async (req, res) => {
+  try {
+    if (!isTournamentOrchestrationEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
+    verifyMiniApp(req);
+    const id = Number(req.params.id);
+    const state = await getTournamentState({ pool, ensureGrowthSchema, tournamentId: id });
+    if (!state.tournament) return res.status(404).json({ ok: false, error: 'not_found' });
+    return res.json({ ok: true, ...state });
+  } catch (err) {
+    const code = err?.code || 'miniapp_tournament_failed';
+    const msg = err?.message || String(err);
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+app.post('/miniapp/api/tournaments/:id/join', async (req, res) => {
+  try {
+    if (!isTournamentOrchestrationEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
+    const verified = verifyMiniApp(req);
+    const telegramId = verified?.user?.id != null ? Number(verified.user.id) : null;
+    if (!telegramId || !Number.isFinite(telegramId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_telegram_user' });
+    }
+    const id = Number(req.params.id);
+    const out = await joinTournament({ pool, ensureGrowthSchema, tournamentId: id, telegramId });
+    return res.json(out);
+  } catch (err) {
+    const code = err?.code || 'miniapp_tournament_join_failed';
+    const msg = err?.message || String(err);
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+// Miniapp: ambassadors (optional)
+app.get('/miniapp/api/ambassadors/me', async (req, res) => {
+  try {
+    if (!isAmbassadorsEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
+    const verified = verifyMiniApp(req);
+    const telegramId = verified?.user?.id != null ? Number(verified.user.id) : null;
+    if (!telegramId || !Number.isFinite(telegramId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_telegram_user' });
+    }
+
+    // Ensure user exists to compute eligibility/stats
+    const username = verified?.user?.username || verified?.user?.first_name || 'no_username';
+    await ensureUserFromTelegramWebApp({ telegramId, username, referralCodeUsed: null });
+
+    const stats = await computeUserStats({ telegramId });
+    const eligibility = computeAmbassadorEligibility({ userStats: stats });
+
+    await ensureGrowthSchema();
+    const aRes = await pool.query('SELECT * FROM ambassadors WHERE telegram_id = $1 LIMIT 1', [telegramId]);
+    const ambassador = aRes.rows[0] || null;
+    const bRes = await pool.query(
+      'SELECT * FROM ambassador_boosts WHERE telegram_id = $1 ORDER BY updated_at DESC, id DESC',
+      [telegramId]
+    );
+    const boosts = bRes.rows || [];
+
+    return res.json({ ok: true, ambassador, boosts, eligibility, stats });
+  } catch (err) {
+    const code = err?.code || 'miniapp_ambassador_failed';
+    const msg = err?.message || String(err);
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
 
 // Print a clear connectivity status on startup
 (async () => {
@@ -2354,6 +2900,41 @@ registerWithApiAlias('get', '/cron/weekly-leaderboard', async (req, res) => {
   }
 });
 
+registerWithApiAlias('get', '/cron/pr6-referral-optimizer', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  const dryRun =
+    String(req.query?.dry_run || '').trim().toLowerCase() === '1' ||
+    String(req.query?.dry_run || '').trim().toLowerCase() === 'true';
+
+  if (!isPr6ReferralEngineEnabled() && !dryRun) {
+    return res.json({ ok: true, skipped: true, reason: 'disabled' });
+  }
+
+  try {
+    const out = await runPr6ReferralOptimizer({ pool, ensureGrowthSchema, dryRun });
+    const format = String(req.query?.format || '').trim().toLowerCase();
+    if (format === 'team') {
+      const team = pr6Internals?.formatPr6TeamOutput ? pr6Internals.formatPr6TeamOutput(out) : '';
+      return res.json({ ...out, team_output: team });
+    }
+    return res.json(out);
+  } catch (err) {
+    console.error('pr6-referral-optimizer cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'pr6_failed' });
+  }
+});
+
 registerWithApiAlias('get', '/cron/daily-nudge', async (req, res) => {
   const cronHeader = String(req.headers['x-vercel-cron'] || '');
   const secret = (process.env.CRON_SECRET || '').trim();
@@ -2503,6 +3084,28 @@ registerWithApiAlias('get', '/cron/daily-nudge', async (req, res) => {
   }
 });
 
+registerWithApiAlias('get', '/cron/hype-runner', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  try {
+    const out = await processHypeQueueOnce({ pool, max: 20 });
+    return res.json(out);
+  } catch (err) {
+    console.error('hype-runner cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'hype_runner_failed' });
+  }
+});
+
 registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
   const cronHeader = String(req.headers['x-vercel-cron'] || '');
   const secret = (process.env.CRON_SECRET || '').trim();
@@ -2517,7 +3120,7 @@ registerWithApiAlias('get', '/cron/intel-sync', async (req, res) => {
     return res.status(401).json({
       ok: false,
       error: 'unauthorized',
-      hint: 'Vercel Cron calls include x-vercel-cron: 1. For manual tests, pass ?secret=CRON_SECRET or Authorization: Bearer <CRON_SECRET>.',
+      hint: 'For manual tests, pass ?secret=CRON_SECRET or Authorization: Bearer <CRON_SECRET>. (If you use Vercel Cron, it sets x-vercel-cron: 1.)',
     });
   }
 
@@ -2907,7 +3510,7 @@ registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
     return res.status(401).json({
       ok: false,
       error: 'unauthorized',
-      hint: 'Vercel Cron calls include x-vercel-cron: 1. For manual tests, pass ?secret=CRON_SECRET or Authorization: Bearer <CRON_SECRET>.',
+      hint: 'For manual tests, pass ?secret=CRON_SECRET or Authorization: Bearer <CRON_SECRET>. (If you use Vercel Cron, it sets x-vercel-cron: 1.)',
     });
   }
 
@@ -3177,7 +3780,29 @@ registerWithApiAlias('post', '/user/create', async (req, res) => {
 
     if (referrer) {
       console.log(`Referral success: ${referrer.username} invited ${username}`);
-      await awardXp({ telegramId: Number(referrer.telegram_id), amount: 120, reason: 'referral_signup' });
+      let amount = 120;
+      if (isAmbassadorsEnabled()) {
+        try {
+          const mult = await getActiveBoostMultiplier({
+            pool,
+            ensureGrowthSchema,
+            telegramId: Number(referrer.telegram_id),
+            boostType: 'referral_xp',
+          });
+          amount = Math.round(amount * mult);
+        } catch (err) {
+          console.warn('ambassador referral boost lookup failed:', err?.message || String(err));
+        }
+      }
+      if (isPr6ReferralEngineEnabled()) {
+        try {
+          const b = await applyReferralBonusOnSignup({ pool, telegramId: Number(referrer.telegram_id) });
+          if (b?.applied) amount += Number(b.bonus_xp || 0) || 0;
+        } catch (err) {
+          console.warn('pr6 referral bonus apply failed:', err?.message || String(err));
+        }
+      }
+      await awardXp({ telegramId: Number(referrer.telegram_id), amount, reason: 'referral_signup' });
       await awardBadgesIfEligible({ telegramId: Number(referrer.telegram_id) });
     }
 
@@ -3187,6 +3812,15 @@ registerWithApiAlias('post', '/user/create', async (req, res) => {
       message: 'User created ✅',
       user: createdUser,
     });
+
+    // Optional: partner campaign attribution (separate from user referrals).
+    if (!referrer && referral_code_used) {
+      try {
+        await maybeAttributePartnerCampaign({ referralCodeUsed: referral_code_used, newTelegramId: telegram_id });
+      } catch (err) {
+        console.warn('partner campaign attribution failed:', err?.message || String(err));
+      }
+    }
 
     // Fire-and-forget: detect leaderboard changes after new user insertion.
   if (process.env.ENABLE_LEADERBOARD_HYPE !== 'false') {
@@ -3470,6 +4104,13 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
       [winnerId, match_id]
     );
 
+    // Tournament orchestration hook (optional): if this match belongs to a bracket, advance it.
+    try {
+      await applyMatchResultToTournament({ pool, ensureGrowthSchema, matchId: match_id, winnerId });
+    } catch (err) {
+      console.warn('applyMatchResultToTournament failed:', err?.message || String(err));
+    }
+
     // Update user stats (safe even if older rows had NULLs)
     await pool.query(
       `UPDATE users
@@ -3591,6 +4232,23 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
         : '';
     const calloutStake = stake > 0 ? stake : 10;
     const hypeText = `🔥 @${safeWinner} just ${wonLine}${streakLine}.\nWho can beat @${safeWinner}? Try: /challenge ${calloutStake}${rivalryLine}`;
+
+    // Durable hype event queue (optional; feature-flagged). Broadcast worker sends to INTERNAL_GROUP_IDS.
+    if (isMatchHypeEventsEnabled() && hypeAllowed) {
+      try {
+        await queueMatchHypeEvent({
+          pool,
+          ensureGrowthSchema,
+          match,
+          winnerId,
+          loserId,
+          stakeAmount: stake,
+          hypeText,
+        });
+      } catch (err) {
+        console.warn('queueMatchHypeEvent failed:', err?.message || String(err));
+      }
+    }
 
     // Keep tiers in sync with referral counts.
     for (const uid of [match.challenger_id, match.opponent_id]) {
@@ -3808,7 +4466,7 @@ if (require.main === module) {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
 
-  // Local-only scheduler (Vercel serverless can't keep a process alive reliably).
+  // Local-only scheduler (serverless platforms can't keep a process alive reliably).
   if (process.env.ENABLE_WEEKLY_LEADERBOARD === 'true' && !process.env.VERCEL) {
     // eslint-disable-next-line global-require
     const cron = require('node-cron');
@@ -3829,6 +4487,15 @@ if (require.main === module) {
       cron.schedule('*/1 * * * *', () => {
         processWorkspaceRunQueueOnce().catch((err) => {
           console.error('local workspace runner tick failed:', err?.message || String(err));
+        });
+      });
+    }
+
+    // Local-only hype worker (broadcasts to INTERNAL_GROUP_IDS).
+    if (process.env.ENABLE_MATCH_HYPE_EVENTS === 'true') {
+      cron.schedule('*/1 * * * *', () => {
+        processHypeQueueOnce({ pool, max: 20 }).catch((err) => {
+          console.error('local hype runner tick failed:', err?.message || String(err));
         });
       });
     }

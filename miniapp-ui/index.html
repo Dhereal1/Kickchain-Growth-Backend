@@ -127,6 +127,9 @@
       .tab[data-tab="progress"]::before { content: "⚡ "; }
       .tab[data-tab="me"]::before { content: "🪙 "; }
       .tab[data-tab="referrals"]::before { content: "🤝 "; }
+      .tab[data-tab="feed"]::before { content: "📣 "; }
+      .tab[data-tab="tournaments"]::before { content: "🏆 "; }
+      .tab[data-tab="ambassador"]::before { content: "🧩 "; }
       .tab:hover { transform: translateY(-1px); box-shadow: var(--shadow2); border-color: rgba(0, 255, 136, 0.18); }
       .tab:active { transform: translateY(0px) scale(0.99); }
       .tab.active { border-color: rgba(0, 255, 136, 0.45); background: rgba(0, 255, 136, 0.10); box-shadow: var(--glow); }
@@ -283,6 +286,9 @@
         <button class="tab" data-tab="progress">Progress</button>
         <button class="tab" data-tab="me">My Stats</button>
         <button class="tab" data-tab="referrals">Referrals</button>
+        <button class="tab" data-tab="feed">Feed</button>
+        <button class="tab" data-tab="tournaments">Tournaments</button>
+        <button class="tab" data-tab="ambassador">Ambassador</button>
       </div>
 
       <div class="row" id="panel">

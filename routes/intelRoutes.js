@@ -8,6 +8,8 @@ const {
   discoverFromMessageExtraction,
   computeAndStoreCommunityRankings,
 } = require('../services/communityDiscovery');
+const { isGrowthCrmEnabled } = require('../services/featureFlags');
+const { upsertDiscoveredCommunitiesIntoPipeline } = require('../services/growth-crm/syncFromIntel');
 const {
   analyzeCommunity,
   hasAIKey,
@@ -992,7 +994,21 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         platform: 'telegram',
       });
 
-      return res.json({ ok: true, extraction, rankings });
+      let growthSync = null;
+      if (isGrowthCrmEnabled() && userId) {
+        try {
+          growthSync = await upsertDiscoveredCommunitiesIntoPipeline({
+            pool,
+            ensureGrowthSchema,
+            userId,
+            limit: 200,
+          });
+        } catch (err) {
+          growthSync = { ok: false, error: err?.message || String(err) };
+        }
+      }
+
+      return res.json({ ok: true, extraction, rankings, growth_sync: growthSync });
     } catch (err) {
       console.error('discovered-communities refresh failed:', err?.message || String(err));
       return res.status(500).json({ ok: false, error: 'Failed to refresh discovery' });

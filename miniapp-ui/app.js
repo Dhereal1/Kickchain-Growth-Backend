@@ -417,6 +417,208 @@ async function showReferrals() {
   setPanel(root);
 }
 
+async function showFeed() {
+  setFooter('Feed');
+  const data = await apiFetch('/miniapp/api/hype/feed?limit=20');
+  const items = Array.isArray(data?.items) ? data.items : [];
+
+  const root = document.createElement('div');
+  root.className = 'row';
+
+  const list = document.createElement('div');
+  list.className = 'list';
+
+  if (!items.length) {
+    list.appendChild(itemRow({ left: 'No hype yet', right: '—', meta: 'Win matches to trigger hype events.' }));
+  } else {
+    items.forEach((e) => {
+      list.appendChild(
+        itemRow({
+          left: `Match #${safeText(e.match_id)} · stake ${safeText(e.stake_amount || 0)}`,
+          right: safeText(e.sent_at || e.created_at || '—'),
+          meta: safeText(e.hype_text || ''),
+        })
+      );
+    });
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'row';
+  const btns = document.createElement('div');
+  btns.className = 'btns';
+
+  const btnLatest = document.createElement('button');
+  btnLatest.className = 'btn';
+  btnLatest.textContent = 'My Latest Win Share';
+  btnLatest.onclick = async () => {
+    btnLatest.disabled = true;
+    try {
+      const latest = await apiFetch('/miniapp/api/hype/latest');
+      const item = latest?.item || null;
+      if (!item?.hype_text) {
+        alert('No recent win share found yet.');
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(String(item.hype_text));
+        setFooter('Copied win share text');
+        setTimeout(() => setFooter('Feed'), 1200);
+      } catch {
+        prompt('Copy this win share:', String(item.hype_text));
+      }
+    } finally {
+      btnLatest.disabled = false;
+    }
+  };
+  btns.appendChild(btnLatest);
+  actions.appendChild(btns);
+
+  root.appendChild(card('Challenge Feed', list));
+  root.appendChild(card('Share', actions));
+  setPanel(root);
+}
+
+async function showTournaments() {
+  setFooter('Tournaments');
+  const data = await apiFetch('/miniapp/api/tournaments');
+  const items = Array.isArray(data?.tournaments) ? data.tournaments : [];
+
+  const root = document.createElement('div');
+  root.className = 'row';
+
+  const list = document.createElement('div');
+  list.className = 'list';
+
+  if (!items.length) {
+    list.appendChild(itemRow({ left: 'No tournaments', right: '—', meta: 'Come back later.' }));
+  } else {
+    items.forEach((t) => {
+      const title = safeText(t.title || `Tournament #${t.id}`);
+      const status = safeText(t.status || 'upcoming');
+      const when = t.start_date ? safeText(t.start_date) : '—';
+      const it = itemRow({
+        left: title,
+        right: status,
+        meta: `Starts: ${when} · Max: ${safeText(t.max_participants || 16)} · Stake: ${safeText(t.entry_stake_amount || 0)}`,
+      });
+      it.onclick = async () => {
+        try {
+          setFooter('Loading tournament…');
+          const state = await apiFetch(`/miniapp/api/tournaments/${t.id}`);
+          const bracket = Array.isArray(state?.bracket) ? state.bracket : [];
+          const participants = Array.isArray(state?.participants) ? state.participants : [];
+
+          const view = document.createElement('div');
+          view.className = 'row';
+          view.appendChild(card('Tournament', (() => {
+            const kvs = document.createElement('div');
+            kvs.className = 'kvs';
+            kvs.appendChild(kv('Title', title));
+            kvs.appendChild(kv('Status', status));
+            kvs.appendChild(kv('Participants', `${fmtNum(participants.length)} / ${fmtNum(t.max_participants || 16)}`));
+            return kvs;
+          })()));
+
+          const btns = document.createElement('div');
+          btns.className = 'btns';
+          const btnJoin = document.createElement('button');
+          btnJoin.className = 'btn primary';
+          btnJoin.textContent = 'Join';
+          btnJoin.onclick = async () => {
+            btnJoin.disabled = true;
+            try {
+              const out = await apiFetch(`/miniapp/api/tournaments/${t.id}/join`, { method: 'POST', body: {} });
+              if (out?.ok) {
+                alert('Joined ✅');
+              } else {
+                alert(`Join failed: ${out?.error || 'failed'}`);
+              }
+            } finally {
+              btnJoin.disabled = false;
+            }
+          };
+          btns.appendChild(btnJoin);
+
+          const btnBack = document.createElement('button');
+          btnBack.className = 'btn';
+          btnBack.textContent = 'Back';
+          btnBack.onclick = () => showTournaments();
+          btns.appendChild(btnBack);
+
+          view.appendChild(card('Actions', btns));
+
+          const bracketList = document.createElement('div');
+          bracketList.className = 'list';
+          if (!bracket.length) {
+            bracketList.appendChild(itemRow({ left: 'No bracket yet', right: '—', meta: 'Tournament may not be started.' }));
+          } else {
+            bracket.forEach((m) => {
+              bracketList.appendChild(
+                itemRow({
+                  left: `R${safeText(m.round)} · Slot ${safeText(m.slot)}`,
+                  right: safeText(m.status || 'pending'),
+                  meta: `A: ${safeText(m.player_a || '—')} vs B: ${safeText(m.player_b || '—')} · winner: ${safeText(m.winner_id || '—')}`,
+                })
+              );
+            });
+          }
+          view.appendChild(card('Bracket', bracketList));
+
+          setPanel(view);
+          setFooter(title);
+        } catch (err) {
+          setFooter('Tournament load failed');
+          setPanel(renderError('Tournament load failed', err));
+        }
+      };
+      list.appendChild(it);
+    });
+  }
+
+  root.appendChild(card('Lobby', list));
+  setPanel(root);
+}
+
+async function showAmbassador() {
+  setFooter('Ambassador');
+  const data = await apiFetch('/miniapp/api/ambassadors/me');
+
+  const root = document.createElement('div');
+  root.className = 'row';
+
+  const ambassador = data?.ambassador || null;
+  const eligibility = data?.eligibility || null;
+  const boosts = Array.isArray(data?.boosts) ? data.boosts : [];
+
+  const kvs = document.createElement('div');
+  kvs.className = 'kvs';
+  kvs.appendChild(kv('Status', ambassador?.status ? safeText(ambassador.status) : 'not enrolled'));
+  kvs.appendChild(kv('Level', ambassador?.level != null ? safeText(ambassador.level) : '—'));
+  kvs.appendChild(kv('Score', ambassador?.score != null ? safeText(ambassador.score) : '—'));
+  kvs.appendChild(kv('Eligible', eligibility?.eligible ? 'yes' : 'no'));
+  if (eligibility?.reason) kvs.appendChild(kv('Note', safeText(eligibility.reason)));
+  root.appendChild(card('Ambassador', kvs));
+
+  const list = document.createElement('div');
+  list.className = 'list';
+  if (!boosts.length) {
+    list.appendChild(itemRow({ left: 'No boosts', right: '—', meta: 'Admins can enable boosts for ambassadors.' }));
+  } else {
+    boosts.forEach((b) => {
+      list.appendChild(
+        itemRow({
+          left: safeText(b.boost_type || 'boost'),
+          right: `x${safeText(b.multiplier || 1)}`,
+          meta: `from: ${safeText(b.starts_at || 'now')} · to: ${safeText(b.ends_at || 'open')}`,
+        })
+      );
+    });
+  }
+  root.appendChild(card('Boosts', list));
+
+  setPanel(root);
+}
+
 function setActiveTab(tab) {
   const buttons = document.querySelectorAll('[data-tab]');
   buttons.forEach((b) => b.classList.toggle('active', b.getAttribute('data-tab') === tab));
@@ -430,6 +632,9 @@ async function route(tab) {
     if (tab === 'progress') return await showProgress();
     if (tab === 'me') return await showMyStats();
     if (tab === 'referrals') return await showReferrals();
+    if (tab === 'feed') return await showFeed();
+    if (tab === 'tournaments') return await showTournaments();
+    if (tab === 'ambassador') return await showAmbassador();
     return await showLeaderboard();
   } catch (err) {
     setConn({ ok: false, text: 'Error' });

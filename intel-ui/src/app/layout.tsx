@@ -24,6 +24,9 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const showGrowth = String(process.env.NEXT_PUBLIC_ENABLE_GROWTH_CRM_UI || "").trim() === "true";
+  const showCopilot = String(process.env.NEXT_PUBLIC_ENABLE_COPILOT_UI || "").trim() === "true";
+
   return (
     <html
       lang="en"
@@ -47,6 +50,16 @@ export default function RootLayout({
                 <Link className="rounded-md px-3 py-1.5 hover:bg-zinc-900" href="/results">
                   Results
                 </Link>
+                {showGrowth ? (
+                  <Link className="rounded-md px-3 py-1.5 hover:bg-zinc-900" href="/growth/communities">
+                    Growth
+                  </Link>
+                ) : null}
+                {showCopilot ? (
+                  <Link className="rounded-md px-3 py-1.5 hover:bg-zinc-900" href="/copilot">
+                    Copilot
+                  </Link>
+                ) : null}
               </nav>
             </div>
             <ApiKeyBar />
