@@ -8,9 +8,12 @@
     "dev": "node --dns-result-order=ipv4first index.js",
     "test": "node --test",
     "ngrok:setup": "node scripts/ngrok-setup.js",
+    "miniapp:up": "bash scripts/miniapp-local-up.sh",
     "miniapp:proxy": "node scripts/miniapp-proxy.js",
     "tunnel:miniapp": "node scripts/ngrok-miniapp.js",
-    "tunnel:miniapp:cloudflare": "node scripts/cloudflared-miniapp.js"
+    "tunnel:miniapp:cloudflare": "node scripts/cloudflared-miniapp.js",
+    "env:sync": "node scripts/env-sync.js",
+    "env:check": "node scripts/env-check.js"
   },
   "keywords": [],
   "author": "",

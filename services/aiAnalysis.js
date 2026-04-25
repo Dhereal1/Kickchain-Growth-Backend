@@ -10,6 +10,48 @@ class AIAnalysisError extends Error {
   }
 }
 
+function resolveAIConfig(overrides = {}) {
+  const provider = String(overrides.provider || process.env.AI_PROVIDER || 'openai')
+    .trim()
+    .toLowerCase();
+  const defaultBaseUrl =
+    provider === 'groq'
+      ? 'https://api.groq.com/openai/v1'
+      : provider === 'grok'
+        ? 'https://api.x.ai/v1'
+        : 'https://api.openai.com/v1';
+  const baseUrl = String(overrides.baseUrl || process.env.AI_BASE_URL || defaultBaseUrl)
+    .trim()
+    .replace(/\/+$/, '');
+  const defaultModel =
+    provider === 'groq'
+      ? 'openai/gpt-oss-20b'
+      : provider === 'grok'
+        ? 'grok-4.20-reasoning'
+        : 'gpt-4o-mini';
+  const model = String(
+    overrides.model ||
+      process.env.AI_MODEL ||
+      process.env.OPENAI_MODEL ||
+      process.env.GROQ_MODEL ||
+      process.env.XAI_MODEL ||
+      defaultModel
+  ).trim() || defaultModel;
+  const apiKey = String(
+    overrides.apiKey ||
+      process.env.AI_API_KEY ||
+      (provider === 'groq' ? process.env.GROQ_API_KEY : '') ||
+      (provider === 'grok' ? process.env.XAI_API_KEY : '') ||
+      process.env.OPENAI_API_KEY ||
+      ''
+  ).trim();
+  return { provider, baseUrl, model, apiKey };
+}
+
+function hasAIKey() {
+  return !!resolveAIConfig().apiKey;
+}
+
 function safeHashId(input) {
   return sha256(String(input || '')).slice(0, 12);
 }
@@ -406,16 +448,19 @@ async function fetchWithRetries(url, { fetchFn, ...init }, { maxRetries, signal,
 async function analyzeCommunity({
   communityName,
   messages,
-  model = 'gpt-4o-mini',
-  apiKey = process.env.OPENAI_API_KEY,
+  model,
+  apiKey,
+  provider,
+  baseUrl,
   timeoutMs = clampNumber(process.env.AI_ANALYSIS_TIMEOUT_MS, { min: 1000, max: 120000, fallback: 12_000 }),
   sampleSize = clampNumber(process.env.AI_ANALYSIS_SAMPLE_SIZE, { min: 5, max: 50, fallback: 10 }),
   maxRetries = clampNumber(process.env.AI_ANALYSIS_MAX_RETRIES, { min: 0, max: 2, fallback: 2 }),
   fetchFn = fetch,
 }) {
-  const key = String(apiKey || '').trim();
+  const aiConfig = resolveAIConfig({ model, apiKey, provider, baseUrl });
+  const key = aiConfig.apiKey;
   if (!key) {
-    throw new AIAnalysisError('OPENAI_API_KEY missing', { code: 'OPENAI_KEY_MISSING', status: 503 });
+    throw new AIAnalysisError('AI API key missing', { code: 'OPENAI_KEY_MISSING', status: 503 });
   }
 
   const sampleRaw = takeSampleMessages(messages, sampleSize);
@@ -427,7 +472,7 @@ async function analyzeCommunity({
       category: 'low',
       summary: 'No usable messages provided for analysis.',
       recommended_action: 'ignore',
-      _meta: { sampled: 0, provider: 'openai', model },
+      _meta: { sampled: 0, provider: aiConfig.provider, model: aiConfig.model },
     };
   }
 
@@ -461,7 +506,7 @@ async function analyzeCommunity({
 
   try {
     const body = {
-      model,
+      model: aiConfig.model,
       temperature: 0.2,
       input: [
         { role: 'system', content: [{ type: 'input_text', text: system }] },
@@ -481,7 +526,7 @@ async function analyzeCommunity({
     let r;
     try {
       r = await fetchWithRetries(
-        'https://api.openai.com/v1/responses',
+        `${aiConfig.baseUrl}/responses`,
         {
           fetchFn,
           method: 'POST',
@@ -500,7 +545,8 @@ async function analyzeCommunity({
             if (attempt > 0) {
               logEvent('info', 'ai_analysis_retry_attempt', {
                 community: communityHash,
-                model,
+                model: aiConfig.model,
+                provider: aiConfig.provider,
                 attempt,
                 status: status || null,
                 network_error: err ? String(err?.name || 'Error') : null,
@@ -515,14 +561,15 @@ async function analyzeCommunity({
       const code = aborted ? 'OPENAI_TIMEOUT' : 'OPENAI_NETWORK_ERROR';
       logEvent('error', 'ai_analysis_openai_request_failed', {
         community: communityHash,
-        model,
+        model: aiConfig.model,
+        provider: aiConfig.provider,
         aborted,
         error_name: String(err?.name || 'Error'),
       });
-      throw new AIAnalysisError(aborted ? 'OpenAI request timed out' : 'OpenAI request failed', {
+      throw new AIAnalysisError(aborted ? 'AI request timed out' : 'AI request failed', {
         code,
         status: aborted ? 504 : 502,
-        meta: { provider: 'openai', model, community: communityHash },
+        meta: { provider: aiConfig.provider, model: aiConfig.model, community: communityHash },
       });
     }
 
@@ -531,7 +578,8 @@ async function analyzeCommunity({
     const usage = json?.usage && typeof json.usage === 'object' ? json.usage : null;
     logEvent('info', 'ai_analysis_openai_response', {
       community: communityHash,
-      model,
+      model: aiConfig.model,
+      provider: aiConfig.provider,
       status: r.status,
       ok: r.ok,
       latency_ms: latencyMs,
@@ -547,10 +595,10 @@ async function analyzeCommunity({
 
     if (!r.ok) {
       const details = json?.error?.message || json?.message || `HTTP ${r.status}`;
-      throw new AIAnalysisError(`OpenAI API error: ${details}`, {
+      throw new AIAnalysisError(`AI API error: ${details}`, {
         code: 'OPENAI_API_ERROR',
         status: r.status,
-        meta: { provider: 'openai', model, community: communityHash },
+        meta: { provider: aiConfig.provider, model: aiConfig.model, community: communityHash },
       });
     }
 
@@ -558,7 +606,8 @@ async function analyzeCommunity({
     if (!parsed) {
       logEvent('warn', 'ai_analysis_parse_failed', {
         community: communityHash,
-        model,
+        model: aiConfig.model,
+        provider: aiConfig.provider,
         response_id: json?.id || null,
         output_text_len: typeof json?.output_text === 'string' ? json.output_text.length : null,
         output_items: Array.isArray(json?.output) ? json.output.length : null,
@@ -566,7 +615,7 @@ async function analyzeCommunity({
       throw new AIAnalysisError('Failed to parse AI JSON output', {
         code: 'OPENAI_PARSE_FAILED',
         status: 502,
-        meta: { provider: 'openai', model, community: communityHash, response_id: json?.id || null },
+        meta: { provider: aiConfig.provider, model: aiConfig.model, community: communityHash, response_id: json?.id || null },
       });
     }
 
@@ -574,8 +623,8 @@ async function analyzeCommunity({
       ...parsed,
       _meta: {
         sampled: sample.length,
-        provider: 'openai',
-        model,
+        provider: aiConfig.provider,
+        model: aiConfig.model,
         model_version: json?.model || null,
         requested_at: new Date().toISOString(),
         response_id: json?.id || null,
@@ -842,6 +891,8 @@ async function upsertCommunityAnalysis({
 
 module.exports = {
   analyzeCommunity,
+  hasAIKey,
+  resolveAIConfig,
   takeSampleMessages,
   computeMessagesHash,
   computeLegacyMessagesHash,

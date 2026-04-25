@@ -5,11 +5,26 @@ services:
       dockerfile: Dockerfile
     env_file:
       - ./backend.env
+    environment:
+      # Bot runs in-process with the backend (polling mode), so always use localhost for bot API calls.
+      BOT_BACKEND_URL: http://127.0.0.1:3004
     depends_on:
       - telethon
       - crawlee
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3004:3004"
+    restart: unless-stopped
+
+  intel-ui:
+    build:
+      context: ../../intel-ui
+      dockerfile: Dockerfile
+    environment:
+      NEXT_PUBLIC_INTEL_API_BASE_URL: http://72.62.148.156
+    depends_on:
+      - backend
+    ports:
+      - "0.0.0.0:3001:3000"
     restart: unless-stopped
 
   telethon:
@@ -31,4 +46,3 @@ services:
     ports:
       - "127.0.0.1:8002:8002"
     restart: unless-stopped
-

@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kickchain Intel Operator</title>
+    <style>
+      :root {
+        --bg: #0b1020;
+        --panel: #111a33;
+        --panel2: #0f1730;
+        --text: #e8eefc;
+        --muted: #a8b3d6;
+        --border: rgba(255, 255, 255, 0.09);
+        --accent: #7c5cff;
+        --accent2: #2dd4bf;
+        --danger: #fb7185;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        background: radial-gradient(1200px 600px at 20% -10%, rgba(124, 92, 255, 0.35), transparent 60%),
+          radial-gradient(900px 500px at 90% 0%, rgba(45, 212, 191, 0.22), transparent 55%),
+          var(--bg);
+        color: var(--text);
+      }
+      a { color: var(--accent2); text-decoration: none; }
+      .wrap { max-width: 1120px; margin: 0 auto; padding: 20px 14px 48px; }
+      .top {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 10px 0 14px;
+      }
+      .brand h1 { margin: 0; font-size: 20px; letter-spacing: 0.2px; }
+      .brand p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.04);
+        border-radius: 999px;
+        font-size: 12px;
+        color: var(--muted);
+        user-select: none;
+      }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.16); }
+      .dot.ok { background: var(--accent2); box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.14); }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+      @media (min-width: 980px) {
+        .grid { grid-template-columns: 380px 1fr; gap: 14px; }
+      }
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+        overflow: hidden;
+      }
+      .card .hd {
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .card .hd h2 { margin: 0; font-size: 13px; font-weight: 650; letter-spacing: 0.2px; }
+      .card .bd { padding: 12px 14px 14px; }
+      .row { display: grid; gap: 8px; }
+      label { font-size: 12px; color: var(--muted); }
+      input, textarea, select {
+        width: 100%;
+        padding: 10px 11px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: rgba(15, 23, 48, 0.7);
+        color: var(--text);
+        outline: none;
+      }
+      textarea { min-height: 84px; resize: vertical; }
+      input::placeholder, textarea::placeholder { color: rgba(168, 179, 214, 0.65); }
+      .btns { display: flex; flex-wrap: wrap; gap: 8px; }
+      button {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        padding: 9px 10px;
+        border-radius: 10px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+      button.primary {
+        background: linear-gradient(135deg, rgba(124, 92, 255, 0.85), rgba(45, 212, 191, 0.6));
+        border-color: rgba(255, 255, 255, 0.14);
+      }
+      button.danger { background: rgba(251, 113, 133, 0.18); border-color: rgba(251, 113, 133, 0.28); }
+      button:disabled { opacity: 0.55; cursor: not-allowed; }
+      .help { margin-top: 8px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+      .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+      .tabs button { padding: 8px 10px; }
+      .tabs button.active { border-color: rgba(124, 92, 255, 0.55); background: rgba(124, 92, 255, 0.14); }
+      .statusline {
+        margin-top: 10px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background: rgba(15, 23, 48, 0.55);
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      .kvs { display: grid; gap: 8px; }
+      .kv {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 6px;
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .kv .k { color: var(--muted); font-size: 12px; }
+      .kv .v { font-size: 13px; }
+      .list { display: grid; gap: 8px; }
+      .item {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .item .t { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+      .item .t .name { font-weight: 700; font-size: 13px; }
+      .item .t .pill {
+        font-size: 11px;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 3px 8px;
+      }
+      .item .m { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+      .split { display: grid; grid-template-columns: 1fr; gap: 10px; }
+      @media (min-width: 980px) { .split { grid-template-columns: 1fr 1fr; } }
+      .foot { margin-top: 16px; color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div class="brand">
+          <h1>Kickchain Intel Operator</h1>
+          <p>Telethon ingestion + Crawlee discovery → intel scoring → actionable weekly targets.</p>
+        </div>
+        <div class="badge" title="Connection status">
+          <span id="statusDot" class="dot"></span>
+          <span id="statusText">Disconnected</span>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <div class="hd">
+            <h2>Connection</h2>
+            <div class="btns">
+              <button id="btnPing" class="primary">Ping</button>
+              <button id="btnClear" class="danger">Clear</button>
+            </div>
+          </div>
+          <div class="bd">
+            <div class="row">
+              <div>
+                <label for="baseUrl">Base URL</label>
+                <input id="baseUrl" placeholder="Leave blank if served from same backend" />
+              </div>
+              <div>
+                <label for="token">Bearer Token (INTEL_API_KEY or user api_key)</label>
+                <input id="token" type="password" placeholder="kc_live_xxx or kc_user_xxx" />
+                <div class="help">
+                  Stored locally in your browser. This dashboard never auto-DMs; it only reads intel endpoints and triggers ingestion/aggregation.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="hd">
+            <h2>Actions</h2>
+            <div class="btns">
+              <button id="btnSync" class="primary">Sync Communities</button>
+              <button id="btnRefresh">Refresh Discovery</button>
+            </div>
+          </div>
+          <div class="bd">
+            <div class="split">
+              <div class="row">
+                <div>
+                  <label for="communities">Communities (optional, one per line)</label>
+                  <textarea id="communities" placeholder="@somegroup&#10;https://t.me/anothergroup"></textarea>
+                  <div class="help">
+                    If empty, the backend uses `INTEL_COMMUNITIES` / user config communities.
+                  </div>
+                </div>
+              </div>
+              <div class="row">
+                <div>
+                  <label for="configCommunities">Save communities to your intel config</label>
+                  <textarea id="configCommunities" placeholder="@somegroup&#10;@anothergroup"></textarea>
+                </div>
+                <div class="btns">
+                  <button id="btnLoadConfig">Load Config</button>
+                  <button id="btnSaveConfig" class="primary">Save Config</button>
+                </div>
+                <div class="help">
+                  Uses `GET/POST /intel/config` for the authenticated user.
+                </div>
+              </div>
+            </div>
+            <div id="actionStatus" class="statusline mono" style="display:none"></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="height: 12px"></div>
+
+      <div class="card">
+        <div class="hd">
+          <h2>Intel</h2>
+          <div class="tabs">
+            <button data-tab="opportunities" class="active">Opportunities</button>
+            <button data-tab="today">Today</button>
+            <button data-tab="runs">Runs</button>
+            <button data-tab="discovered">Communities</button>
+            <button data-tab="raw">Raw JSON</button>
+          </div>
+        </div>
+        <div class="bd">
+          <div id="panel"></div>
+          <div id="rawPanel" class="statusline mono" style="display:none"></div>
+        </div>
+      </div>
+
+      <div class="foot">
+        Tip: if you need an operator user key, create one via `POST /intel/admin/users` with `Authorization: Bearer INTEL_API_KEY`.
+      </div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
+

@@ -2,7 +2,7 @@
 
 This repo contains 3 services:
 
-- `kickchain-backend` (Node/Express, port `3000`)
+- `kickchain-backend` (Node/Express, port `3004`)
 - `telethon-service` (FastAPI/Telethon, internal port `8000`)
 - `crawlee-service` (Node/Crawlee, internal port `8002`)
 
@@ -45,7 +45,19 @@ If you want to point to *remote* Telethon/Crawlee instead, override those env va
 
 ## 5) Reverse proxy (optional, recommended)
 
-Put Nginx in front of the backend, terminate TLS, and proxy to `127.0.0.1:3000`.
+Put Nginx in front of the backend, terminate TLS, and proxy to `127.0.0.1:3004`.
 
 Example server block template is in `deploy/vps/nginx/kickchain-backend.conf`.
 
+## 6) Automatic scraping (/run replacement)
+
+To run the workspace discovery/scraping automatically (no manual `/run`), set in `deploy/vps/backend.env`:
+
+- `INTERNAL_GROUP_IDS=-100123...,-100456...` (Telegram group chat IDs to post results into)
+- `INTEL_API_KEY=...` (admin key; also used by operator UI)
+- `ENABLE_WORKSPACE_AUTO_RUN=true`
+
+Defaults:
+
+- Runs every ~10 hours (configurable via `WORKSPACE_AUTO_RUN_CRON`)
+- Enqueues jobs and processes them in the background (runner tick controlled by `ENABLE_WORKSPACE_RUNNER_SCHEDULER`)

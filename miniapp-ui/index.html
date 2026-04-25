@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Kickchain</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+      :root {
+        --bg: #0b1020;
+        --panel: rgba(255, 255, 255, 0.06);
+        --panel2: rgba(255, 255, 255, 0.04);
+        --text: rgba(255, 255, 255, 0.92);
+        --muted: rgba(255, 255, 255, 0.62);
+        --border: rgba(255, 255, 255, 0.12);
+        --accent: #7c5cff;
+        --accent2: #2dd4bf;
+        --danger: #fb7185;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        background: radial-gradient(1100px 520px at 16% -18%, rgba(124, 92, 255, 0.35), transparent 60%),
+          radial-gradient(900px 520px at 96% -10%, rgba(45, 212, 191, 0.20), transparent 55%),
+          var(--bg);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 16px 14px 90px;
+      }
+      .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 2px 0 10px;
+      }
+      .brand { display: grid; gap: 2px; }
+      .brand .title { font-weight: 800; letter-spacing: 0.2px; }
+      .brand .sub { font-size: 12px; color: var(--muted); }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 10px;
+        border: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.12);
+        border-radius: 999px;
+        font-size: 12px;
+        color: var(--muted);
+        user-select: none;
+        white-space: nowrap;
+      }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.14); }
+      .dot.ok { background: var(--accent2); box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.12); }
+      .tabs {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 10px 0 12px;
+      }
+      .tab {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text);
+        padding: 9px 11px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+      }
+      .tab.active { border-color: rgba(124, 92, 255, 0.55); background: rgba(124, 92, 255, 0.16); }
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02));
+        overflow: hidden;
+      }
+      .card .hd {
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .card .hd h2 { margin: 0; font-size: 13px; font-weight: 800; }
+      .card .bd { padding: 12px 14px 14px; }
+      .row { display: grid; gap: 10px; }
+      .kvs { display: grid; gap: 10px; }
+      .kv {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.03);
+        display: grid;
+        gap: 6px;
+      }
+      .kv .k { font-size: 12px; color: var(--muted); }
+      .kv .v { font-size: 14px; font-weight: 800; letter-spacing: 0.2px; }
+      .list { display: grid; gap: 10px; }
+      .item {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .item .t { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+      .item .t .name { font-weight: 900; font-size: 13px; }
+      .item .t .pill2 {
+        font-size: 11px;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 3px 8px;
+      }
+      .item .m { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+      .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+      .btn {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        padding: 9px 10px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .btn.primary {
+        background: linear-gradient(135deg, rgba(124, 92, 255, 0.88), rgba(45, 212, 191, 0.62));
+        border-color: rgba(255, 255, 255, 0.14);
+      }
+      .hint { font-size: 12px; color: var(--muted); line-height: 1.45; }
+      .error {
+        border: 1px solid rgba(251, 113, 133, 0.28);
+        background: rgba(251, 113, 133, 0.10);
+        color: rgba(255, 255, 255, 0.9);
+        padding: 10px 12px;
+        border-radius: 14px;
+        font-size: 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .skeleton {
+        height: 12px;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(255,255,255,0.06), rgba(255,255,255,0.13), rgba(255,255,255,0.06));
+        background-size: 200% 100%;
+        animation: shimmer 1.2s infinite;
+      }
+      @keyframes shimmer {
+        0% { background-position: 180% 0; }
+        100% { background-position: -20% 0; }
+      }
+      .footer {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+        background: rgba(11, 16, 32, 0.78);
+        backdrop-filter: blur(10px);
+        border-top: 1px solid rgba(255, 255, 255, 0.10);
+      }
+      .footer .inner {
+        max-width: 900px;
+        margin: 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .footer .small { font-size: 12px; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div class="brand">
+          <div class="title">Kickchain</div>
+          <div class="sub">Leaderboard • Stats • Referrals</div>
+        </div>
+        <div class="pill" id="connPill">
+          <span class="dot" id="connDot"></span>
+          <span id="connText">Connecting…</span>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button class="tab active" data-tab="leaderboard">Leaderboard</button>
+        <button class="tab" data-tab="me">My Stats</button>
+        <button class="tab" data-tab="referrals">Referrals</button>
+      </div>
+
+      <div class="row" id="panel">
+        <div class="card">
+          <div class="hd"><h2>Loading…</h2></div>
+          <div class="bd">
+            <div class="row">
+              <div class="skeleton" style="width: 60%"></div>
+              <div class="skeleton" style="width: 85%"></div>
+              <div class="skeleton" style="width: 40%"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div class="inner">
+        <div class="small" id="footerText">—</div>
+        <div class="btns">
+          <button class="btn" id="btnRefresh">Refresh</button>
+          <button class="btn primary" id="btnClose">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
+

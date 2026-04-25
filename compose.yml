@@ -1,0 +1,68 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: ${PORT:-3004}
+      DATABASE_URL: ${DATABASE_URL}
+      BOT_TOKEN: ${BOT_TOKEN}
+      BOT_USERNAME: ${BOT_USERNAME}
+      ENABLE_TELEGRAM_POLLING: ${ENABLE_TELEGRAM_POLLING:-true}
+      TELEGRAM_CLEAR_WEBHOOK_ON_POLLING: ${TELEGRAM_CLEAR_WEBHOOK_ON_POLLING:-true}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      BACKEND_URL: ${BACKEND_URL:-http://localhost:3004}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3004}
+
+      INTEL_API_KEY: ${INTEL_API_KEY}
+      INTERNAL_GROUP_IDS: ${INTERNAL_GROUP_IDS}
+      ENABLE_WORKSPACE_AUTO_RUN: ${ENABLE_WORKSPACE_AUTO_RUN:-false}
+      WORKSPACE_AUTO_RUN_CRON: ${WORKSPACE_AUTO_RUN_CRON:-0 */10 * * *}
+      WORKSPACE_AUTO_RUN_MIN_HOURS: ${WORKSPACE_AUTO_RUN_MIN_HOURS:-10}
+      ENABLE_WORKSPACE_RUNNER_SCHEDULER: ${ENABLE_WORKSPACE_RUNNER_SCHEDULER:-true}
+      WORKSPACE_DAILY_RUN_SEARCH: ${WORKSPACE_DAILY_RUN_SEARCH:-false}
+
+      TELETHON_SERVICE_URL: ${TELETHON_SERVICE_URL:-http://telethon:8000}
+      TELETHON_SERVICE_API_KEY: ${TELETHON_SERVICE_API_KEY}
+      TELETHON_SERVICE_TIMEOUT_MS: ${TELETHON_SERVICE_TIMEOUT_MS:-25000}
+
+      CRAWLEE_SERVICE_URL: ${CRAWLEE_SERVICE_URL:-http://crawlee:8002}
+      CRAWLEE_SERVICE_API_KEY: ${CRAWLEE_SERVICE_API_KEY}
+      CRAWLEE_SERVICE_TIMEOUT_MS: ${CRAWLEE_SERVICE_TIMEOUT_MS:-12000}
+      CRAWLEE_SEARCH_ENGINE: ${CRAWLEE_SEARCH_ENGINE:-duckduckgo}
+      CRAWLEE_SEARCH_TIMEOUT_MS: ${CRAWLEE_SEARCH_TIMEOUT_MS:-12000}
+    depends_on:
+      - telethon
+      - crawlee
+    ports:
+      - "127.0.0.1:3004:3004"
+    restart: unless-stopped
+
+  telethon:
+    build:
+      context: ./telethon-service
+      dockerfile: Dockerfile
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELETHON_SESSION: ${TELETHON_SESSION}
+      TELETHON_SERVICE_API_KEY: ${TELETHON_SERVICE_API_KEY}
+      MAX_GROUPS_PER_QUERY: ${MAX_GROUPS_PER_QUERY:-5}
+      MAX_GROUPS_TOTAL: ${MAX_GROUPS_TOTAL:-10}
+      MAX_MESSAGES_PER_GROUP: ${MAX_MESSAGES_PER_GROUP:-20}
+      REQUEST_DELAY_MS: ${REQUEST_DELAY_MS:-250}
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  crawlee:
+    build:
+      context: ./crawlee-service
+      dockerfile: Dockerfile
+    environment:
+      PORT: 8002
+      CRAWLEE_SERVICE_API_KEY: ${CRAWLEE_SERVICE_API_KEY}
+    ports:
+      - "127.0.0.1:8002:8002"
+    restart: unless-stopped

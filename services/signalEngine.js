@@ -1,12 +1,28 @@
 const { getIntelConfig } = require('./intelConfig');
 
+function normalizeForMatch(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function includesKeyword({ rawLower, normalizedLower }, keyword) {
+  const kRaw = String(keyword || '').toLowerCase().trim();
+  if (!kRaw) return false;
+  if (rawLower.includes(kRaw)) return true;
+
+  const kNorm = normalizeForMatch(kRaw);
+  if (!kNorm) return false;
+  return normalizedLower.includes(kNorm);
+}
+
 function countMatches(haystack, needles) {
-  const text = String(haystack || '').toLowerCase();
+  const rawLower = String(haystack || '').toLowerCase();
+  const normalizedLower = normalizeForMatch(haystack);
   let count = 0;
   for (const needle of needles) {
-    const n = String(needle || '').toLowerCase();
-    if (!n) continue;
-    if (text.includes(n)) count += 1;
+    if (includesKeyword({ rawLower, normalizedLower }, needle)) count += 1;
   }
   return count;
 }
@@ -43,6 +59,7 @@ function extractSignals({ text, views, raw, config }) {
 
   const safeText = String(text || '');
   const lowered = safeText.toLowerCase();
+  const loweredNorm = normalizeForMatch(safeText);
 
   if (!safeText || safeText.length < 5) {
     return {
@@ -57,11 +74,15 @@ function extractSignals({ text, views, raw, config }) {
   }
 
   const keyword_matches = countMatches(safeText, cfg.keywords);
-  const promo_score = cfg.promoKeywords.filter((k) => lowered.includes(String(k))).length;
-  const content_activity_score = cfg.activityKeywords.filter((k) =>
-    lowered.includes(String(k))
+  const promo_score = cfg.promoKeywords.filter((k) =>
+    includesKeyword({ rawLower: lowered, normalizedLower: loweredNorm }, k)
   ).length;
-  const baseIntent = cfg.intentKeywords.filter((k) => lowered.includes(String(k))).length;
+  const content_activity_score = cfg.activityKeywords.filter((k) =>
+    includesKeyword({ rawLower: lowered, normalizedLower: loweredNorm }, k)
+  ).length;
+  const baseIntent = cfg.intentKeywords.filter((k) =>
+    includesKeyword({ rawLower: lowered, normalizedLower: loweredNorm }, k)
+  ).length;
 
   // Strong "real conversation" intent rule (transactional / request language).
   const hasRealIntent =

@@ -43,7 +43,7 @@ async function handler(req, res) {
       return;
     }
 
-    const targetPort = Number(process.env.MINIAPP_TARGET_PORT || 3000) || 3000;
+    const targetPort = Number(process.env.MINIAPP_TARGET_PORT || 3004) || 3004;
     const target = `http://127.0.0.1:${targetPort}${req.url}`;
     const method = String(req.method || 'GET').toUpperCase();
     const body = method === 'GET' || method === 'HEAD' ? null : await readBody(req);
@@ -93,11 +93,10 @@ function main() {
   });
   server.listen(port, '127.0.0.1', () => {
     // eslint-disable-next-line no-console
-    console.log(`Miniapp proxy listening on http://127.0.0.1:${port} (forwarding to :${Number(process.env.MINIAPP_TARGET_PORT || 3000) || 3000})`);
+    console.log(`Miniapp proxy listening on http://127.0.0.1:${port} (forwarding to :${Number(process.env.MINIAPP_TARGET_PORT || 3004) || 3004})`);
     // eslint-disable-next-line no-console
     console.log('Allowed paths: /miniapp/* and /miniapp/api/*');
   });
 }
 
 main();
-

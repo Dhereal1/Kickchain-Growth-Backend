@@ -18,9 +18,9 @@ This repo is set up to run the Telegram bot via long-polling (no webhook).
 
 - `docker compose up -d --build`
 
-Backend: `http://127.0.0.1:3000` (includes operator UI at `/operator`)
+Backend: `http://127.0.0.1:3004` (includes operator UI at `/operator`)
 
-Mini App UI: `http://127.0.0.1:3000/miniapp` (Telegram WebApp; requires `BOT_TOKEN` to call `/miniapp/api/*`).
+Mini App UI: `http://127.0.0.1:3004/miniapp` (Telegram WebApp; requires `BOT_TOKEN` to call `/miniapp/api/*`).
 
 ## Mini App (local) via ngrok
 

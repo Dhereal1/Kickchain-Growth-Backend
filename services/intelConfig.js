@@ -19,7 +19,28 @@ function getIntelConfig() {
 
   const keywords = (json.keywords && Array.isArray(json.keywords) ? json.keywords : null) ||
     (process.env.INTEL_KEYWORDS ? parseCsv(process.env.INTEL_KEYWORDS) : null) ||
-    ['game', 'play', '1v1', 'bet', 'earn'];
+    [
+      // General product/activity terms (broad match)
+      'game',
+      'play',
+      '1v1',
+      'match',
+      'skill-based',
+      'telegram',
+      // Monetization terms
+      'stake',
+      'stakes',
+      'rake',
+      'rakeback',
+      'referral',
+      'wallet',
+      'withdraw',
+      'usdt',
+      'usdc',
+      // Brand terms (narrow match)
+      'kickchain',
+      'soccer stars',
+    ];
 
   const intentKeywords =
     (json.intent_keywords && Array.isArray(json.intent_keywords) ? json.intent_keywords : null) ||
@@ -40,12 +61,83 @@ function getIntelConfig() {
   const promoKeywords =
     (json.promo_keywords && Array.isArray(json.promo_keywords) ? json.promo_keywords : null) ||
     (process.env.INTEL_PROMO_KEYWORDS ? parseCsv(process.env.INTEL_PROMO_KEYWORDS) : null) ||
-    ['join', 'play', 'win', 'earn', 'invite', 'reward', 'contest', 'launch', 'airdrop'];
+    [
+      // Core promo language
+      'join',
+      'play',
+      'play now',
+      'win',
+      'earn',
+      'invite',
+      'reward',
+      'contest',
+      'launch',
+      'v1 launch',
+      'beta',
+      'airdrop',
+      // Real-stakes / wallets
+      'real stakes',
+      'real money',
+      'stake',
+      'stakes',
+      'stake tiers',
+      'usdt',
+      'usdc',
+      'wallet',
+      'withdraw',
+      'withdrawable',
+      'winnings',
+      // Fees / monetization
+      'rake',
+      'rake fee',
+      'rake fees',
+      'rakeback',
+      'vip',
+      // Referrals
+      'referral',
+      'referrals',
+      'refer',
+      'rake share',
+      // Differentiators
+      'anti-cheat',
+      'anti cheat',
+      'server-authoritative',
+      'server authoritative',
+      'zero rng',
+      'no rng',
+      'pay-to-win',
+      'pay to win',
+    ];
 
   const activityKeywords =
     (json.activity_keywords && Array.isArray(json.activity_keywords) ? json.activity_keywords : null) ||
     (process.env.INTEL_ACTIVITY_KEYWORDS ? parseCsv(process.env.INTEL_ACTIVITY_KEYWORDS) : null) ||
-    ['game', 'play', 'mission', 'race', 'earn', 'token'];
+    [
+      // Gameplay / competition
+      'game',
+      'play',
+      '1v1',
+      'match',
+      'turn-based',
+      'turn based',
+      'skill-based',
+      'skill based',
+      // Mechanics (helps detect similar games)
+      'drag-to-aim',
+      'drag to aim',
+      'physics',
+      'puck',
+      // Stakes/economy surface area (content frequently discussed)
+      'stake',
+      'stakes',
+      'rake',
+      'rakeback',
+      'referral',
+      'wallet',
+      'usdt',
+      'usdc',
+      'withdraw',
+    ];
 
   const platforms =
     (json.platforms && Array.isArray(json.platforms) ? json.platforms : null) ||

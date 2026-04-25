@@ -10,3 +10,9 @@ deploy/vps/*.env
 # Bot subproject
 bot/node_modules/
 bot/.env
+
+# Runtime artifacts
+logs/
+
+# Local tool installs
+tools/ngrok/

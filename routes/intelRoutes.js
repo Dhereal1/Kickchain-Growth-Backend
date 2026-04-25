@@ -10,9 +10,11 @@ const {
 } = require('../services/communityDiscovery');
 const {
   analyzeCommunity,
+  hasAIKey,
   computeMessagesHash,
   computeLegacyMessagesHash,
   getCachedCommunityAnalysis,
+  resolveAIConfig,
   upsertCommunityAnalysis,
 } = require('../services/aiAnalysis');
 const {
@@ -757,7 +759,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         return res.json(baseItems);
       }
 
-      const keyPresent = !!String(process.env.OPENAI_API_KEY || '').trim();
+      const keyPresent = hasAIKey();
       if (!keyPresent) {
         const out = baseItems.map((x) => ({
           ...x,
@@ -769,7 +771,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           ),
           final_reason: x.reason,
           ai_summary: null,
-          ai: { skipped: true, reason: 'OPENAI_API_KEY missing' },
+          ai: { skipped: true, reason: 'AI API key missing' },
         }));
         if (format === 'team') {
           const lines = ['🔥 Top Communities:', ''];
@@ -819,7 +821,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
           continue;
         }
 
-        const model = String(process.env.OPENAI_MODEL || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+        const model = resolveAIConfig().model;
         const messagesHash = computeMessagesHash(messages);
         const legacyMessagesHash = computeLegacyMessagesHash(messages);
         const cached = await getCachedCommunityAnalysis({
@@ -860,7 +862,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
             communityName: comm,
             messagesHash,
             model,
-            provider: ai?._meta?.provider || 'openai',
+            provider: ai?._meta?.provider || resolveAIConfig().provider,
             modelVersion: ai?._meta?.model_version || null,
             analysis: ai,
           });
@@ -928,7 +930,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         ? (body.user_id ? Number(body.user_id) : null)
         : Number(req.intelAuth?.user?.id);
 
-      const model = String(process.env.OPENAI_MODEL || body.model || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+      const model = resolveAIConfig({ model: body.model }).model;
       const messagesHash = computeMessagesHash(messages);
       const legacyMessagesHash = computeLegacyMessagesHash(messages);
 
@@ -955,7 +957,7 @@ function registerIntelRoutes(app, { pool, ensureGrowthSchema }) {
         communityName: community,
         messagesHash,
         model,
-        provider: ai?._meta?.provider || 'openai',
+        provider: ai?._meta?.provider || resolveAIConfig().provider,
         modelVersion: ai?._meta?.model_version || null,
         analysis: ai,
       });

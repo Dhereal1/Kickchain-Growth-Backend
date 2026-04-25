@@ -2,6 +2,7 @@ if (!process.env.VERCEL) {
   require('dotenv').config({ quiet: true });
 }
 const express = require('express');
+const path = require('path');
 const pool = require('./db/pool');
 const leaderboardService = require('./services/leaderboardService');
 const { postWeeklyLeaderboard } = require('./jobs/weeklyLeaderboard');
@@ -15,6 +16,8 @@ const { dispatchIntelWebhooks } = require('./services/intelWebhooks');
 const { runTelethonDiscovery, getTelethonConfigFromEnv } = require('./services/telethonService');
 const { ingestTelethonGroups } = require('./services/telethonIngest');
 const { searchTelegramLinksWithCrawlee } = require('./services/crawleeSearch');
+const { verifyTelegramWebAppInitData } = require('./services/telegramWebAppAuth');
+const { createCorsMiddleware } = require('./middleware/cors');
 const {
   discoverFromMessageExtraction,
   computeAndStoreCommunityRankings,
@@ -31,40 +34,25 @@ const {
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
+app.use(createCorsMiddleware());
 
-function corsMiddleware(req, res, next) {
-  const configured = (process.env.CORS_ORIGIN || '*').trim();
-  const requestOrigin = req.headers.origin;
+// Lightweight operator dashboard (no build step). Uses the same Bearer token as /intel/*.
+app.use(
+  '/operator',
+  express.static(path.join(__dirname, 'operator-ui'), {
+    index: 'index.html',
+    maxAge: '5m',
+  })
+);
 
-  let allowOrigin = configured;
-  if (configured !== '*' && requestOrigin) {
-    const allowed = configured
-      .split(',')
-      .map((v) => v.trim())
-      .filter(Boolean);
-    if (allowed.includes(requestOrigin)) {
-      allowOrigin = requestOrigin;
-    } else {
-      allowOrigin = allowed[0] || 'null';
-    }
-  }
-
-  res.setHeader('Access-Control-Allow-Origin', allowOrigin);
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
-  );
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-  return next();
-}
-
-app.use(corsMiddleware);
+// Telegram Mini App (no build step). Provides a player-facing UI.
+app.use(
+  '/miniapp',
+  express.static(path.join(__dirname, 'miniapp-ui'), {
+    index: 'index.html',
+    maxAge: '5m',
+  })
+);
 
 registerIntelRoutes(app, { pool, ensureGrowthSchema });
 
@@ -87,47 +75,14 @@ function getBotError() {
   return botSingletonError;
 }
 
-function isValidTelegramWebhook(req) {
-  const secret = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
-  if (!secret) return true;
-
-  const header = req.headers['x-telegram-bot-api-secret-token'];
-  if (header && String(header) === secret) return true;
-
-  const qs = req.query?.secret;
-  if (qs && String(qs) === secret) return true;
-
-  return false;
-}
-
-function getPublicBaseUrl(req) {
-  const envUrl = (process.env.PUBLIC_BASE_URL || '').trim();
-  if (envUrl) return envUrl.replace(/\/+$/, '');
-
-  const proto =
-    (req.headers['x-forwarded-proto'] && String(req.headers['x-forwarded-proto']).split(',')[0]) ||
-    'https';
-  const host =
-    (req.headers['x-forwarded-host'] && String(req.headers['x-forwarded-host']).split(',')[0]) ||
-    req.headers.host;
-
-  if (!host) return '';
-  return `${proto}://${host}`.replace(/\/+$/, '');
-}
-
-async function telegramSetWebhook({ webhookUrl }) {
+async function telegramDeleteWebhook({ dropPendingUpdates }) {
   const botToken = String(process.env.BOT_TOKEN || '').trim().replace(/^['"]|['"]$/g, '');
   if (!botToken) return { ok: false, description: 'BOT_TOKEN missing' };
 
-  const secret = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
   const body = {
-    url: webhookUrl,
-    allowed_updates: ['message', 'callback_query'],
-    drop_pending_updates: true,
+    drop_pending_updates: dropPendingUpdates === true,
   };
-  if (secret) body.secret_token = secret;
-
-  const r = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+  const r = await fetch(`https://api.telegram.org/bot${botToken}/deleteWebhook`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -145,76 +100,307 @@ function computeTierFromReferrals(totalReferrals) {
   return 'Bronze';
 }
 
-async function ensureGrowthSchema() {
-  // Keep this idempotent and safe to run multiple times.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      key TEXT PRIMARY KEY,
-      applied_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
+function getMiniAppInitData(req) {
+  const header = req.headers['x-telegram-init-data'];
+  if (header) return String(header);
+  if (req.query?.init_data) return String(req.query.init_data);
+  return '';
+}
 
-  async function runOnce(key, statements) {
-    const r = await pool.query(
-      `INSERT INTO schema_migrations (key) VALUES ($1)
-       ON CONFLICT (key) DO NOTHING
-       RETURNING key`,
-      [key]
-    );
-    if (!r.rowCount) return;
+function getBotUsernameFromEnv() {
+  return String(process.env.BOT_USERNAME || '').trim().replace(/^@/, '');
+}
 
-    const list = Array.isArray(statements) ? statements : [statements];
-    for (const sql of list) {
-      // eslint-disable-next-line no-await-in-loop
-      await pool.query(sql);
-    }
+async function getUserByTelegramId(telegramId) {
+  const r = await pool.query('SELECT * FROM users WHERE telegram_id = $1 LIMIT 1', [telegramId]);
+  return r.rows[0] || null;
+}
+
+async function ensureUserFromTelegramWebApp({ telegramId, username, referralCodeUsed }) {
+  const existing = await getUserByTelegramId(telegramId);
+  if (existing) return { user: existing, created: false };
+
+  const referral_code = generateReferralCode(telegramId);
+  let referrer = null;
+  if (referralCodeUsed) {
+    const refResult = await pool.query('SELECT * FROM users WHERE referral_code = $1', [referralCodeUsed]);
+    if (refResult.rows.length > 0) referrer = refResult.rows[0];
   }
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      telegram_id BIGINT UNIQUE NOT NULL,
-      username TEXT,
-      referral_code TEXT UNIQUE,
-      referred_by TEXT,
-      total_won NUMERIC DEFAULT 0,
-      games_played INT DEFAULT 0,
-      tier TEXT DEFAULT 'Bronze',
-      matches_played INT DEFAULT 0,
-      wins INT DEFAULT 0,
-      fun_mode_completed BOOLEAN DEFAULT FALSE,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  // Safe migrations for existing DBs
-  await pool.query(
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_won NUMERIC DEFAULT 0"
-  );
-  await pool.query(
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS games_played INT DEFAULT 0"
-  );
-  await pool.query(
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'Bronze'"
-  );
-  await pool.query(
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS matches_played INT DEFAULT 0"
-  );
-  await pool.query(
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INT DEFAULT 0"
-  );
-  await pool.query(
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS fun_mode_completed BOOLEAN DEFAULT FALSE"
+  const result = await pool.query(
+    `INSERT INTO users (telegram_id, username, referral_code, referred_by)
+     VALUES ($1, $2, $3, $4)
+     RETURNING *`,
+    [telegramId, username || 'no_username', referral_code, referrer ? referrer.referral_code : null]
   );
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS groups (
-      id SERIAL PRIMARY KEY,
-      chat_id BIGINT UNIQUE,
-      title TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  return { user: result.rows[0], created: true };
+}
+
+async function computeUserStats({ telegramId }) {
+  const user = await getUserByTelegramId(telegramId);
+  if (!user) return null;
+
+  const countResult = await pool.query('SELECT COUNT(*)::int AS total FROM users WHERE referred_by = $1', [
+    user.referral_code,
+  ]);
+  const totalReferrals = countResult.rows[0]?.total ?? 0;
+
+  const rankResult = await pool.query(
+    `
+      SELECT rank
+      FROM (
+        SELECT
+          u.referral_code,
+          CAST(RANK() OVER (ORDER BY COUNT(r.id) DESC) AS int) AS rank
+        FROM users u
+        LEFT JOIN users r
+          ON r.referred_by = u.referral_code
+        GROUP BY u.referral_code
+      ) ranked
+      WHERE referral_code = $1;
+    `,
+    [user.referral_code]
+  );
+  const rank = rankResult.rows[0]?.rank || 0;
+
+  const tier = computeTierFromReferrals(totalReferrals);
+  await pool.query('UPDATE users SET tier = $1 WHERE telegram_id = $2 AND tier IS DISTINCT FROM $1', [tier, telegramId]);
+
+  return {
+    username: user.username,
+    referral_code: user.referral_code,
+    total_referrals: totalReferrals,
+    rank,
+    tier,
+    matches_played: user.matches_played ?? 0,
+    wins: user.wins ?? 0,
+    fun_mode_completed: !!user.fun_mode_completed,
+    total_won: user.total_won ?? 0,
+    games_played: user.games_played ?? 0,
+  };
+}
+
+function verifyMiniApp(req) {
+  const initData = getMiniAppInitData(req);
+  return verifyTelegramWebAppInitData({
+    initData,
+    botToken: process.env.BOT_TOKEN,
+    maxAgeSeconds: Math.max(60, Number(process.env.MINIAPP_INITDATA_MAX_AGE_SECONDS || 24 * 60 * 60) || 24 * 60 * 60),
+  });
+}
+
+app.get('/miniapp/api/leaderboard', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        u.username,
+        u.referral_code,
+        COUNT(r.id)::int AS total_referrals,
+        CASE
+          WHEN COUNT(r.id) >= 50 THEN 'Diamond'
+          WHEN COUNT(r.id) >= 25 THEN 'Platinum'
+          WHEN COUNT(r.id) >= 10 THEN 'Gold'
+          WHEN COUNT(r.id) >= 3 THEN 'Silver'
+          ELSE 'Bronze'
+        END AS tier
+      FROM users u
+      LEFT JOIN users r
+        ON r.referred_by = u.referral_code
+      GROUP BY u.id
+      ORDER BY total_referrals DESC
+      LIMIT 10;
+    `);
+    return res.json({ ok: true, leaderboard: result.rows });
+  } catch (err) {
+    console.error('miniapp leaderboard failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'leaderboard_failed' });
+  }
+});
+
+app.get('/miniapp/api/leaderboard/extended', async (req, res) => {
+  try {
+    const [referrers, winners, players] = await Promise.all([
+      leaderboardService.getTopReferrers(10),
+      leaderboardService.getTopWinners(10),
+      leaderboardService.getTopPlayers(10),
+    ]);
+    return res.json({ ok: true, referrers, winners, players });
+  } catch (err) {
+    console.error('miniapp leaderboard extended failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'leaderboard_extended_failed' });
+  }
+});
+
+app.post('/miniapp/api/me', async (req, res) => {
+  try {
+    const verified = verifyMiniApp(req);
+    const tgUser = verified?.user || null;
+    const telegramId = tgUser?.id != null ? Number(tgUser.id) : null;
+    if (!telegramId || !Number.isFinite(telegramId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_telegram_user' });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const startParam = body.start_param != null ? String(body.start_param).trim() : null;
+    const referralCodeUsed = startParam || verified.start_param || null;
+
+    const username = tgUser?.username || tgUser?.first_name || 'no_username';
+    const ensured = await ensureUserFromTelegramWebApp({
+      telegramId,
+      username,
+      referralCodeUsed,
+    });
+
+    const stats = await computeUserStats({ telegramId });
+    const botUsername = getBotUsernameFromEnv();
+    const bot_link = botUsername ? `https://t.me/${botUsername}` : '';
+    const referral_link =
+      botUsername && stats?.referral_code
+        ? `https://t.me/${botUsername}?start=${encodeURIComponent(stats.referral_code)}`
+        : '';
+
+    return res.json({
+      ok: true,
+      profile: {
+        telegram_id: telegramId,
+        username: ensured.user?.username || username,
+        created: ensured.created,
+      },
+      stats,
+      referral_link,
+      bot_link,
+    });
+  } catch (err) {
+    const code = err?.code || 'miniapp_auth_failed';
+    const msg = err?.message || String(err);
+    console.error('miniapp /me failed:', { code, msg });
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+app.get('/miniapp/api/referrals', async (req, res) => {
+  try {
+    const verified = verifyMiniApp(req);
+    const tgUser = verified?.user || null;
+    const telegramId = tgUser?.id != null ? Number(tgUser.id) : null;
+    if (!telegramId || !Number.isFinite(telegramId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_telegram_user' });
+    }
+
+    const user = await getUserByTelegramId(telegramId);
+    if (!user) return res.json({ ok: true, referrals: [] });
+
+    const r = await pool.query(
+      `
+        SELECT username, tier, created_at
+        FROM users
+        WHERE referred_by = $1
+        ORDER BY created_at DESC
+        LIMIT 50
+      `,
+      [user.referral_code]
     );
-  `);
+
+    const referrals = (r.rows || []).map((x) => ({
+      username: x.username || null,
+      tier: x.tier || null,
+      created_at: x.created_at ? new Date(x.created_at).toISOString().slice(0, 10) : null,
+    }));
+
+    return res.json({ ok: true, referrals });
+  } catch (err) {
+    const code = err?.code || 'miniapp_referrals_failed';
+    const msg = err?.message || String(err);
+    console.error('miniapp referrals failed:', { code, msg });
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+let ensureGrowthSchemaPromise = null;
+async function ensureGrowthSchema() {
+  if (ensureGrowthSchemaPromise) return ensureGrowthSchemaPromise;
+
+  // Ensure schema at most once per process. This endpoint is called from many request paths
+  // (bot commands, cron runners, etc.) and can be slow on cold DB connections.
+  ensureGrowthSchemaPromise = (async () => {
+    // Keep this idempotent and safe to run multiple times.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        key TEXT PRIMARY KEY,
+        applied_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    async function runOnce(key, statements) {
+      const r = await pool.query(
+        `INSERT INTO schema_migrations (key) VALUES ($1)
+         ON CONFLICT (key) DO NOTHING
+         RETURNING key`,
+        [key]
+      );
+      if (!r.rowCount) return;
+
+      const list = Array.isArray(statements) ? statements : [statements];
+      for (const sql of list) {
+        // eslint-disable-next-line no-await-in-loop
+        await pool.query(sql);
+      }
+    }
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT UNIQUE NOT NULL,
+        username TEXT,
+        referral_code TEXT UNIQUE,
+        referred_by TEXT,
+        total_won NUMERIC DEFAULT 0,
+        games_played INT DEFAULT 0,
+        tier TEXT DEFAULT 'Bronze',
+        matches_played INT DEFAULT 0,
+        wins INT DEFAULT 0,
+        fun_mode_completed BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Safe migrations for existing DBs
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_won NUMERIC DEFAULT 0"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS games_played INT DEFAULT 0"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'Bronze'"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS matches_played INT DEFAULT 0"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INT DEFAULT 0"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS fun_mode_completed BOOLEAN DEFAULT FALSE"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_match_at TIMESTAMP"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_onboarding_nudge_at TIMESTAMP"
+    );
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS groups (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT UNIQUE,
+        title TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS matches (
@@ -706,6 +892,12 @@ async function ensureGrowthSchema() {
       PRIMARY KEY (day, telegram_id)
     );
   `);
+  })().catch((err) => {
+    ensureGrowthSchemaPromise = null;
+    throw err;
+  });
+
+  return ensureGrowthSchemaPromise;
 }
 
 function registerWithApiAlias(method, path, handler) {
@@ -1445,6 +1637,56 @@ registerWithApiAlias('post', '/intel/workspace/enqueue-run', async (req, res) =>
     const platform = String(body.platform || 'telegram').toLowerCase();
     const optionsRaw =
       body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {};
+    const force = body.force === true || optionsRaw.force === true;
+
+    // Guardrails to reduce spam/duplicates from automation (and keep costs stable).
+    // - Skip if a job is already queued/running
+    // - Skip if a successful run finished recently (unless force=true)
+    const enqueueMinHours = Math.max(0, Number(process.env.WORKSPACE_ENQUEUE_MIN_HOURS || 6) || 6);
+    if (!force) {
+      const last = await pool.query(
+        `
+          SELECT id, status, finished_at
+          FROM intel_workspace_run_jobs
+          WHERE workspace_id = $1
+          ORDER BY created_at DESC
+          LIMIT 1
+        `,
+        [Number(workspace.id)]
+      );
+      const lastJob = last.rows[0] || null;
+      const lastStatus = lastJob ? String(lastJob.status || '') : '';
+      if (lastStatus === 'queued' || lastStatus === 'running') {
+        const preview = await getQuickPreviewCommunities({ workspaceId: workspace.id, limit: 3 });
+        return res.json({
+          ok: true,
+          skipped: true,
+          reason: 'job_in_progress',
+          workspace,
+          last_job: lastJob,
+          preview,
+        });
+      }
+      if (enqueueMinHours > 0 && lastStatus === 'success' && lastJob?.finished_at) {
+        const recentRes = await pool.query(
+          `SELECT ($1::timestamp > NOW() - ($2::int * INTERVAL '1 hour')) AS recent`,
+          [lastJob.finished_at, Number(enqueueMinHours)]
+        );
+        if (recentRes.rows[0]?.recent) {
+          const preview = await getQuickPreviewCommunities({ workspaceId: workspace.id, limit: 3 });
+          return res.json({
+            ok: true,
+            skipped: true,
+            reason: 'recent_success',
+            min_hours: enqueueMinHours,
+            workspace,
+            last_job: lastJob,
+            preview,
+          });
+        }
+      }
+    }
+
     // Guardrails (serverless + cost control)
     const options = {
       ...optionsRaw,
@@ -1455,6 +1697,8 @@ registerWithApiAlias('post', '/intel/workspace/enqueue-run', async (req, res) =>
       scrape: optionsRaw.scrape !== false,
       message_extraction: optionsRaw.message_extraction !== false,
     };
+    // Ensure internal-only control flags don't end up in persisted job options.
+    delete options.force;
 
     const r = await pool.query(
       `
@@ -1532,99 +1776,104 @@ registerWithApiAlias('get', '/cron/workspace-runner', async (req, res) => {
   // can create jobs. Without queued jobs, this endpoint is effectively a no-op.
 
   try {
-    await ensureGrowthSchema();
-
-    // Throttle to at most once per N seconds (DB-backed, safe across serverless instances).
-    const throttleSeconds = Math.max(5, Number(process.env.INTEL_RUNNER_THROTTLE_SECONDS || 30) || 30);
-    const lockRes = await pool.query(
-      `
-        INSERT INTO intel_runner_locks (key, locked_at)
-        VALUES ('workspace_runner', NOW())
-        ON CONFLICT (key) DO UPDATE
-          SET locked_at = EXCLUDED.locked_at
-        WHERE intel_runner_locks.locked_at < NOW() - ($1::int * INTERVAL '1 second')
-        RETURNING locked_at
-      `,
-      [throttleSeconds]
-    );
-    if (!lockRes.rowCount) {
-      return res.json({ ok: true, processed: 0, throttled: true });
-    }
-
-    // Mark stuck jobs as failed (e.g., function timeout mid-run).
-    await pool.query(
-      `
-        UPDATE intel_workspace_run_jobs
-        SET status = 'failed', finished_at = NOW(), error_message = COALESCE(error_message, 'runner_timeout_or_abort')
-        WHERE status = 'running'
-          AND started_at IS NOT NULL
-          AND started_at < NOW() - INTERVAL '15 minutes'
-      `
-    );
-
-    // IMPORTANT: claim jobs inside a real transaction (single client), otherwise BEGIN/COMMIT can hop connections.
-    const client = await pool.connect();
-    let job = null;
-    try {
-      await client.query('BEGIN');
-
-      const jobRes = await client.query(
-        `
-          SELECT id, workspace_id, telegram_chat_id, options
-          FROM intel_workspace_run_jobs
-          WHERE status = 'queued'
-          ORDER BY created_at ASC
-          LIMIT 1
-          FOR UPDATE SKIP LOCKED
-        `
-      );
-
-      job = jobRes.rows[0] || null;
-      if (!job) {
-        await client.query('COMMIT');
-        return res.json({ ok: true, processed: 0 });
-      }
-
-      await client.query(
-        `UPDATE intel_workspace_run_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
-        [Number(job.id)]
-      );
-
-      await client.query('COMMIT');
-    } catch (txErr) {
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        // ignore
-      }
-      throw txErr;
-    } finally {
-      client.release();
-    }
-
-    const wsRes = await pool.query(
-      `SELECT id, name, telegram_chat_id FROM intel_workspaces WHERE id = $1 LIMIT 1`,
-      [Number(job.workspace_id)]
-    );
-    const workspace = wsRes.rows[0];
-    if (!workspace) {
-      await pool.query(
-        `UPDATE intel_workspace_run_jobs SET status = 'failed', finished_at = NOW(), error_message = 'workspace not found' WHERE id = $1`,
-        [Number(job.id)]
-      );
-      return res.json({ ok: true, processed: 1, status: 'failed', reason: 'workspace_not_found' });
-    }
-
-    const options = job.options && typeof job.options === 'object' ? job.options : {};
-    const platform = String(options.platform || 'telegram').toLowerCase();
-
-    await runWorkspaceDiscoveryJob({ jobId: job.id, workspace, platform, options });
-    return res.json({ ok: true, processed: 1, status: 'success', job_id: job.id });
+    const out = await processWorkspaceRunQueueOnce();
+    return res.json(out);
   } catch (err) {
     console.error('workspace runner failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: err?.message || 'runner_failed' });
   }
 });
+
+async function processWorkspaceRunQueueOnce() {
+  await ensureGrowthSchema();
+
+  // Throttle to at most once per N seconds (DB-backed, safe across serverless instances).
+  const throttleSeconds = Math.max(5, Number(process.env.INTEL_RUNNER_THROTTLE_SECONDS || 30) || 30);
+  const lockRes = await pool.query(
+    `
+      INSERT INTO intel_runner_locks (key, locked_at)
+      VALUES ('workspace_runner', NOW())
+      ON CONFLICT (key) DO UPDATE
+        SET locked_at = EXCLUDED.locked_at
+      WHERE intel_runner_locks.locked_at < NOW() - ($1::int * INTERVAL '1 second')
+      RETURNING locked_at
+    `,
+    [throttleSeconds]
+  );
+  if (!lockRes.rowCount) {
+    return { ok: true, processed: 0, throttled: true };
+  }
+
+  // Mark stuck jobs as failed (e.g., function timeout mid-run).
+  await pool.query(
+    `
+      UPDATE intel_workspace_run_jobs
+      SET status = 'failed', finished_at = NOW(), error_message = COALESCE(error_message, 'runner_timeout_or_abort')
+      WHERE status = 'running'
+        AND started_at IS NOT NULL
+        AND started_at < NOW() - INTERVAL '15 minutes'
+    `
+  );
+
+  // IMPORTANT: claim jobs inside a real transaction (single client), otherwise BEGIN/COMMIT can hop connections.
+  const client = await pool.connect();
+  let job = null;
+  try {
+    await client.query('BEGIN');
+
+    const jobRes = await client.query(
+      `
+        SELECT id, workspace_id, telegram_chat_id, options
+        FROM intel_workspace_run_jobs
+        WHERE status = 'queued'
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      `
+    );
+
+    job = jobRes.rows[0] || null;
+    if (!job) {
+      await client.query('COMMIT');
+      return { ok: true, processed: 0 };
+    }
+
+    await client.query(
+      `UPDATE intel_workspace_run_jobs SET status = 'running', started_at = NOW() WHERE id = $1`,
+      [Number(job.id)]
+    );
+
+    await client.query('COMMIT');
+  } catch (txErr) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore
+    }
+    throw txErr;
+  } finally {
+    client.release();
+  }
+
+  const wsRes = await pool.query(
+    `SELECT id, name, telegram_chat_id FROM intel_workspaces WHERE id = $1 LIMIT 1`,
+    [Number(job.workspace_id)]
+  );
+  const workspace = wsRes.rows[0];
+  if (!workspace) {
+    await pool.query(
+      `UPDATE intel_workspace_run_jobs SET status = 'failed', finished_at = NOW(), error_message = 'workspace not found' WHERE id = $1`,
+      [Number(job.id)]
+    );
+    return { ok: true, processed: 1, status: 'failed', reason: 'workspace_not_found' };
+  }
+
+  const options = job.options && typeof job.options === 'object' ? job.options : {};
+  const platform = String(options.platform || 'telegram').toLowerCase();
+
+  await runWorkspaceDiscoveryJob({ jobId: job.id, workspace, platform, options });
+  return { ok: true, processed: 1, status: 'success', job_id: job.id };
+}
 
 registerWithApiAlias('get', '/intel/workspace/top', async (req, res) => {
   const auth = String(req.headers.authorization || '');
@@ -1761,64 +2010,6 @@ registerWithApiAlias('get', '/intel/workspace/actions/leaderboard', async (req, 
   } catch (err) {
     console.error('workspace leaderboard failed:', err?.message || String(err));
     return res.status(500).json({ ok: false, error: 'Failed to load leaderboard' });
-  }
-});
-
-// Telegram webhook (Vercel/serverless friendly)
-registerWithApiAlias('get', '/telegram/webhook', async (req, res) => {
-  const botReady = !!getBot();
-  res.json({ ok: true, bot: botReady, error: botReady ? null : getBotError() });
-});
-
-registerWithApiAlias('post', '/telegram/webhook', async (req, res) => {
-  // CRITICAL: Telegram expects a fast 200 OK. Never block on bot processing here.
-  try {
-    if (!isValidTelegramWebhook(req)) return res.sendStatus(401);
-    res.sendStatus(200);
-
-    const bot = getBot();
-    if (!bot) {
-      console.warn('Telegram webhook received but bot is disabled', { error: getBotError() });
-      return;
-    }
-
-    Promise.resolve()
-      .then(() => bot.handleUpdate(req.body))
-      .catch((err) => {
-        console.error('Telegram webhook async handler failed:', err?.message || String(err));
-      });
-  } catch (err) {
-    // Response may already be sent; keep this path side-effect only.
-    console.error('Telegram webhook handler crashed:', err?.message || String(err));
-    try {
-      if (!res.headersSent) res.sendStatus(200);
-    } catch {
-      // ignore
-    }
-  }
-});
-
-registerWithApiAlias('post', '/telegram/set-webhook', async (req, res) => {
-  const adminKey = (process.env.ADMIN_API_KEY || '').trim();
-  if (adminKey) {
-    const auth = String(req.headers.authorization || '');
-    if (auth !== `Bearer ${adminKey}`) return res.sendStatus(401);
-  }
-
-  const baseUrl = getPublicBaseUrl(req);
-  if (!baseUrl) return res.status(400).json({ ok: false, error: 'Missing base URL' });
-
-  const secret = (process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
-  const webhookUrl = secret
-    ? `${baseUrl}/telegram/webhook?secret=${encodeURIComponent(secret)}`
-    : `${baseUrl}/telegram/webhook`;
-
-  try {
-    const telegram = await telegramSetWebhook({ webhookUrl });
-    return res.json({ ok: true, webhookUrl, telegram });
-  } catch (err) {
-    console.error('set-webhook failed:', err?.message || String(err));
-    return res.status(500).json({ ok: false, error: 'Failed to set webhook' });
   }
 });
 
@@ -2249,6 +2440,140 @@ registerWithApiAlias('get', '/cron/workspace-daily-run', async (req, res) => {
   }
 });
 
+registerWithApiAlias('get', '/cron/workspace-auto-run', async (req, res) => {
+  const cronHeader = String(req.headers['x-vercel-cron'] || '');
+  const secret = (process.env.CRON_SECRET || '').trim();
+  const qs = req.query?.secret ? String(req.query.secret) : '';
+  const auth = String(req.headers.authorization || '');
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.split(' ')[1] : '';
+
+  const allowed =
+    cronHeader === '1' ||
+    (secret && qs && qs === secret) ||
+    (secret && token && token === secret);
+  if (!allowed) return res.sendStatus(401);
+
+  const enabled =
+    String(process.env.ENABLE_WORKSPACE_AUTO_RUN || '').trim().toLowerCase() === 'true' ||
+    String(process.env.ENABLE_WORKSPACE_DAILY_RUN || '').trim().toLowerCase() === 'true';
+  if (!enabled) return res.json({ ok: true, skipped: true, reason: 'disabled' });
+
+  try {
+    const out = await enqueueWorkspaceAutoRuns();
+    return res.json(out);
+  } catch (err) {
+    console.error('workspace-auto-run cron failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, error: 'workspace_auto_run_failed' });
+  }
+});
+
+async function enqueueWorkspaceAutoRuns() {
+  await ensureGrowthSchema();
+
+  // Lightweight concurrency guard to prevent duplicate enqueue bursts across multiple instances.
+  const lockSeconds = Math.max(30, Number(process.env.WORKSPACE_AUTO_RUN_LOCK_SECONDS || 300) || 300);
+  const lockRes = await pool.query(
+    `
+      INSERT INTO intel_runner_locks (key, locked_at)
+      VALUES ('workspace_auto_enqueue', NOW())
+      ON CONFLICT (key) DO UPDATE
+        SET locked_at = EXCLUDED.locked_at
+      WHERE intel_runner_locks.locked_at < NOW() - ($1::int * INTERVAL '1 second')
+      RETURNING locked_at
+    `,
+    [lockSeconds]
+  );
+  if (!lockRes.rowCount) {
+    return { ok: true, enqueued: 0, skipped: 0, throttled: true };
+  }
+
+  const rawGroups = String(process.env.INTERNAL_GROUP_IDS || '').trim();
+  const groupIds = rawGroups
+    .split(',')
+    .map((s) => String(s).trim())
+    .filter(Boolean)
+    .slice(0, 25);
+  if (!groupIds.length) return { ok: true, skipped: 0, enqueued: 0, reason: 'no_groups' };
+
+  const cfg = getDiscoveryConfigFromEnv();
+  const doSearch = String(process.env.WORKSPACE_DAILY_RUN_SEARCH || '').trim().toLowerCase() === 'true';
+  const minHours = Math.max(1, Number(process.env.WORKSPACE_AUTO_RUN_MIN_HOURS || 10) || 10);
+
+  const results = [];
+  let enqueued = 0;
+  let skipped = 0;
+
+  for (const chatId of groupIds) {
+    // eslint-disable-next-line no-await-in-loop
+    const workspace = await getOrCreateWorkspace({ pool, ensureGrowthSchema, telegramChatId: chatId, name: null });
+
+    // eslint-disable-next-line no-await-in-loop
+    const last = await pool.query(
+      `
+        SELECT id, status, finished_at
+        FROM intel_workspace_run_jobs
+        WHERE workspace_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+      [Number(workspace.id)]
+    );
+    const lastJob = last.rows[0] || null;
+    const lastStatus = lastJob ? String(lastJob.status || '') : '';
+
+    if (lastStatus === 'queued' || lastStatus === 'running') {
+      skipped += 1;
+      results.push({ telegram_chat_id: chatId, workspace_id: workspace.id, skipped: true, reason: 'job_in_progress' });
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    // Only skip when the last run succeeded recently; failures should be retried on the next tick.
+    if (lastStatus === 'success' && lastJob?.finished_at) {
+      const recentRes = await pool.query(
+        `SELECT ($1::timestamp > NOW() - ($2::int * INTERVAL '1 hour')) AS recent`,
+        [lastJob.finished_at, Number(minHours)]
+      );
+      if (recentRes.rows[0]?.recent) {
+        skipped += 1;
+        results.push({
+          telegram_chat_id: chatId,
+          workspace_id: workspace.id,
+          skipped: true,
+          reason: 'recent_success',
+          last_finished_at: lastJob.finished_at,
+        });
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+    }
+
+    const options = {
+      platform: 'telegram',
+      search: doSearch,
+      scrape: true,
+      message_extraction: true,
+      window_hours: Number(cfg.windowHours),
+      max_posts: Number(cfg.maxPosts),
+      max_scrapes: 1,
+    };
+
+    // eslint-disable-next-line no-await-in-loop
+    const r = await pool.query(
+      `
+        INSERT INTO intel_workspace_run_jobs (workspace_id, telegram_chat_id, status, options)
+        VALUES ($1, $2, 'queued', $3::jsonb)
+        RETURNING id, created_at
+      `,
+      [Number(workspace.id), String(workspace.telegram_chat_id), JSON.stringify(options)]
+    );
+    enqueued += 1;
+    results.push({ telegram_chat_id: chatId, workspace_id: workspace.id, enqueued: true, job: r.rows[0] });
+  }
+
+  return { ok: true, enqueued, skipped, workspaces: results, min_hours: minHours, search: doSearch };
+}
+
 registerWithApiAlias('get', '/cron/intel-full-pipeline', async (req, res) => {
   const cronHeader = String(req.headers['x-vercel-cron'] || '');
   const secret = (process.env.CRON_SECRET || '').trim();
@@ -2541,9 +2866,9 @@ registerWithApiAlias('post', '/user/create', async (req, res) => {
     });
 
     // Fire-and-forget: detect leaderboard changes after new user insertion.
-    if (process.env.ENABLE_LEADERBOARD_HYPE !== 'false') {
-      void (async () => {
-        try {
+  if (process.env.ENABLE_LEADERBOARD_HYPE !== 'false') {
+    void (async () => {
+      try {
           const [referrers, winners, players] = await Promise.all([
             leaderboardService.getTopReferrers(10),
             leaderboardService.getTopWinners(10),
@@ -2858,6 +3183,55 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
   }
 });
 
+// One-player "practice" match for onboarding (fast first win).
+// This updates the user's stats without requiring a second participant.
+registerWithApiAlias('post', '/matches/practice', async (req, res) => {
+  const { telegram_id, username } = req.body || {};
+  try {
+    const tid = telegram_id != null ? Number(telegram_id) : null;
+    if (!tid || !Number.isFinite(tid)) {
+      return res.status(400).json({ ok: false, message: 'telegram_id is required' });
+    }
+
+    await ensureGrowthSchema();
+
+    const uname = username != null ? String(username).trim() : '';
+    const existing = await pool.query('SELECT telegram_id FROM users WHERE telegram_id = $1', [tid]);
+    if (!existing.rowCount) {
+      const referral_code = generateReferralCode(tid);
+      await pool.query(
+        `INSERT INTO users (telegram_id, username, referral_code)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (telegram_id) DO NOTHING`,
+        [tid, uname || 'no_username', referral_code]
+      );
+    } else if (uname) {
+      await pool.query(
+        `UPDATE users
+         SET username = $2
+         WHERE telegram_id = $1 AND (username IS NULL OR username = '' OR username = 'no_username')`,
+        [tid, uname]
+      );
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET matches_played = COALESCE(matches_played, 0) + 1,
+           wins = COALESCE(wins, 0) + 1,
+           fun_mode_completed = TRUE,
+           first_match_at = COALESCE(first_match_at, NOW())
+       WHERE telegram_id = $1`,
+      [tid]
+    );
+
+    const stats = await computeUserStats({ telegramId: tid });
+    return res.json({ ok: true, stats });
+  } catch (err) {
+    console.error('practice match failed:', err?.message || String(err));
+    return res.status(500).json({ ok: false, message: 'practice_match_failed' });
+  }
+});
+
 // Tournament endpoints
 registerWithApiAlias('get', '/tournaments', async (req, res) => {
   try {
@@ -2894,17 +3268,68 @@ registerWithApiAlias('post', '/seed-tournaments', async (req, res) => {
 });
 
 if (require.main === module) {
-  const PORT = process.env.PORT || 3000;
+  const PORT = Number(process.env.PORT || 3004) || 3004;
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
   });
+
+  const pollingEnv = String(process.env.ENABLE_TELEGRAM_POLLING || '').trim().toLowerCase();
+  const enableTelegramPolling = pollingEnv
+    ? (pollingEnv === 'true' || pollingEnv === '1' || pollingEnv === 'yes')
+    : !process.env.VERCEL;
+
+  let pollingBot = null;
+  if (enableTelegramPolling && !process.env.VERCEL) {
+    const bot = getBot();
+    if (!bot) {
+      console.warn('ENABLE_TELEGRAM_POLLING is true but bot is disabled:', getBotError());
+    } else {
+      console.log('Starting Telegram bot polling...');
+      const clearWebhook =
+        String(process.env.TELEGRAM_CLEAR_WEBHOOK_ON_POLLING || 'true').trim().toLowerCase() !== 'false';
+      if (clearWebhook) {
+        telegramDeleteWebhook({ dropPendingUpdates: true })
+          .then((r) => {
+            if (r?.ok === true) {
+              console.log('Telegram webhook cleared ✅ (polling mode)');
+            } else {
+              console.warn('Failed to clear Telegram webhook (polling may fail):', r?.description || r);
+            }
+          })
+          .catch((err) => {
+            console.warn(
+              'Failed to clear Telegram webhook (polling may fail):',
+              err?.message || String(err)
+            );
+          });
+      }
+      bot
+        .launch({ dropPendingUpdates: true }, () => {
+          pollingBot = bot;
+          console.log('Telegram bot connected (polling active)');
+        })
+        .catch((err) => {
+          console.error('Telegram bot polling failed:', err?.message || String(err));
+        });
+    }
+  } else if (!process.env.VERCEL) {
+    console.log('Telegram bot polling is disabled (set ENABLE_TELEGRAM_POLLING=true to enable).');
+  }
 
   async function shutdown(signal) {
     console.log(`Received ${signal}, shutting down...`);
     server.close(() => {
       console.log('HTTP server closed.');
     });
+    try {
+      if (pollingBot) {
+        pollingBot.stop(signal);
+        console.log('Telegram bot polling stopped.');
+      }
+    } catch (err) {
+      console.error('Failed to stop telegram bot:', err?.message || String(err));
+    }
     try {
       await pool.end();
       console.log('DB pool closed.');
@@ -2927,6 +3352,33 @@ if (require.main === module) {
       console.log('Posting weekly leaderboard...');
       postWeeklyLeaderboard();
     });
+  }
+
+  // Local-only workspace automation (VPS / long-lived node process).
+  if (!process.env.VERCEL) {
+    // eslint-disable-next-line global-require
+    const cron = require('node-cron');
+
+    const runnerEnabled = String(process.env.ENABLE_WORKSPACE_RUNNER_SCHEDULER || 'true').trim().toLowerCase() !== 'false';
+    if (runnerEnabled) {
+      cron.schedule('*/1 * * * *', () => {
+        processWorkspaceRunQueueOnce().catch((err) => {
+          console.error('local workspace runner tick failed:', err?.message || String(err));
+        });
+      });
+    }
+
+    const autoEnabled =
+      String(process.env.ENABLE_WORKSPACE_AUTO_RUN || '').trim().toLowerCase() === 'true' ||
+      String(process.env.ENABLE_WORKSPACE_DAILY_RUN || '').trim().toLowerCase() === 'true';
+    if (autoEnabled) {
+      const schedule = String(process.env.WORKSPACE_AUTO_RUN_CRON || '0 */10 * * *').trim() || '0 */10 * * *';
+      cron.schedule(schedule, () => {
+        enqueueWorkspaceAutoRuns().catch((err) => {
+          console.error('local workspace auto-run enqueue failed:', err?.message || String(err));
+        });
+      });
+    }
   }
 }
 

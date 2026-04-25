@@ -9,8 +9,28 @@ if (!bot) {
   process.exit(1);
 }
 
-bot
-  .launch({ dropPendingUpdates: true })
+async function clearTelegramWebhook() {
+  const botToken = String(process.env.BOT_TOKEN || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!botToken) return;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${botToken}/deleteWebhook`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ drop_pending_updates: true }),
+    });
+    const j = await r.json().catch(() => null);
+    if (j?.ok) {
+      console.log('Telegram webhook cleared ✅ (polling mode)');
+    } else {
+      console.warn('Failed to clear Telegram webhook (polling may fail):', j?.description || j);
+    }
+  } catch (err) {
+    console.warn('Failed to clear Telegram webhook (polling may fail):', err?.message || String(err));
+  }
+}
+
+clearTelegramWebhook()
+  .then(() => bot.launch({ dropPendingUpdates: true }))
   .then(() => console.log('Bot is running 🤖'))
   .catch((err) => {
     const code = err?.response?.error_code;
@@ -31,4 +51,3 @@ bot
     console.error('Bot startup failed:', err?.message || 'Unknown error');
     process.exit(1);
   });
-

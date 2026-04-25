@@ -33,6 +33,35 @@ function readAuthtokenFromConfig(cfgPath) {
   }
 }
 
+function upsertAuthtokenIntoConfig(cfgPath, token) {
+  const tokenLine = `authtoken: ${token}`;
+  const versionLine = 'version: 2';
+
+  const existing = fs.existsSync(cfgPath) ? fs.readFileSync(cfgPath, 'utf8') : '';
+  const text = existing || '';
+
+  if (!text.trim()) {
+    fs.writeFileSync(cfgPath, `${versionLine}\n${tokenLine}\n`);
+    return;
+  }
+
+  const hasAuthtoken = /^\s*authtoken\s*:/m.test(text);
+  if (hasAuthtoken) {
+    const updated = text.replace(/^\s*authtoken\s*:.*$/m, tokenLine);
+    fs.writeFileSync(cfgPath, updated.endsWith('\n') ? updated : `${updated}\n`);
+    return;
+  }
+
+  const hasVersion = /^\s*version\s*:\s*\d+\s*$/m.test(text);
+  if (hasVersion) {
+    const updated = text.replace(/^\s*version\s*:\s*\d+\s*$/m, (m) => `${m}\n${tokenLine}`);
+    fs.writeFileSync(cfgPath, updated.endsWith('\n') ? updated : `${updated}\n`);
+    return;
+  }
+
+  fs.writeFileSync(cfgPath, `${versionLine}\n${tokenLine}\n${text.endsWith('\n') ? text : `${text}\n`}`);
+}
+
 async function fetchJson(url, { timeoutMs = 1500 } = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -89,11 +118,12 @@ async function main() {
   }
 
   if (tokenFromEnv || !fs.existsSync(cfgPath)) {
-    const configLines = [`authtoken: ${token}`, 'version: 2'];
-    fs.writeFileSync(cfgPath, `${configLines.join('\n')}\n`);
+    upsertAuthtokenIntoConfig(cfgPath, token);
   }
 
   const apiUrl = 'http://127.0.0.1:4040';
+  const domain = String(process.env.NGROK_DOMAIN || '').trim();
+  const region = String(process.env.NGROK_REGION || '').trim();
   const args = [
     'http',
     String(port),
@@ -102,6 +132,13 @@ async function main() {
     '--log',
     'stdout',
   ];
+  if (region) {
+    args.push('--region', region);
+  }
+  if (domain) {
+    // Requires a reserved ngrok domain (paid or configured in your account).
+    args.push('--domain', domain);
+  }
 
   const child = spawn(bin, args, { stdio: 'inherit' });
   child.on('exit', (code) => {

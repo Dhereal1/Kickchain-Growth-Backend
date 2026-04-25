@@ -1,8 +1,14 @@
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 
 function normalizeBotToken(value) {
   return String(value || '').trim().replace(/^['"]|['"]$/g, '');
+}
+
+function normalizeUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.replace(/\/+$/, '');
 }
 
 function normalizeGroupId(value) {
@@ -26,13 +32,39 @@ function parseInternalGroupIds() {
 
 function createKickchainBot(options) {
   const botToken = normalizeBotToken(options?.botToken || process.env.BOT_TOKEN);
-  const backendUrl = String(
-    options?.backendUrl ||
-      process.env.BACKEND_URL ||
+  const port = Number(process.env.PORT || 3004) || 3004;
+  const defaultBackendUrl = `http://127.0.0.1:${port}`;
+
+  // IMPORTANT:
+  // - In polling mode the bot usually runs co-located with the backend (same process/container),
+  //   so the most reliable default is 127.0.0.1.
+  // - If you run the bot separately, set BOT_BACKEND_URL to the backend's reachable URL.
+  const botBackendOverride = normalizeUrl(options?.backendUrl || process.env.BOT_BACKEND_URL);
+  const envBackendUrl = normalizeUrl(
+    process.env.BACKEND_URL ||
       process.env.PUBLIC_BASE_URL ||
-      (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '') ||
-      ''
-  ).trim();
+      (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')
+  );
+  const pollingEnv = String(process.env.ENABLE_TELEGRAM_POLLING || '').trim().toLowerCase();
+  const pollingEnabled = pollingEnv ? (pollingEnv === 'true' || pollingEnv === '1' || pollingEnv === 'yes') : !process.env.VERCEL;
+  const backendUrl = botBackendOverride || (pollingEnabled && !process.env.VERCEL ? defaultBackendUrl : (envBackendUrl || defaultBackendUrl));
+
+  const httpTimeoutMs = Math.max(1000, Number(process.env.BOT_HTTP_TIMEOUT_MS || 60000) || 60000);
+  axios.defaults.timeout = httpTimeoutMs;
+
+  const miniappPublicUrl = normalizeUrl(process.env.MINIAPP_PUBLIC_URL || '');
+  const miniappUrl = miniappPublicUrl
+    ? (miniappPublicUrl.toLowerCase().endsWith('/miniapp') ? miniappPublicUrl : `${miniappPublicUrl}/miniapp`)
+    : '';
+
+  console.log('Kickchain bot config', {
+    polling_enabled: pollingEnabled,
+    backend_url: backendUrl,
+    timeout_ms: httpTimeoutMs,
+    backend_override: !!botBackendOverride,
+    miniapp_public_url: miniappPublicUrl || null,
+  });
+
   const rawGroupId = String(options?.groupId || process.env.GROUP_ID || '').trim();
   const debugChatId =
     String(options?.debugChatId ?? process.env.DEBUG_CHAT_ID ?? '')
@@ -43,16 +75,62 @@ function createKickchainBot(options) {
       .trim()
       .toLowerCase() === 'true';
 
-  if (!botToken || !backendUrl) {
-    return { bot: null, error: 'Missing BOT_TOKEN or backend base URL (set BACKEND_URL or PUBLIC_BASE_URL)' };
+  if (!botToken) {
+    return { bot: null, error: 'Missing BOT_TOKEN' };
   }
 
   const intelAdminKey = String(process.env.INTEL_API_KEY || '').trim();
   const internalGroupIds = parseInternalGroupIds();
+  const allowAnyGroupWorkspace =
+    String(process.env.ALLOW_ANY_GROUP_WORKSPACE || '').trim().toLowerCase() === 'true';
 
   function isInternalGroup(chatId) {
     const id = normalizeGroupId(chatId);
     return internalGroupIds.has(String(id));
+  }
+
+  let cachedBotId = null;
+  async function getBotId(ctx) {
+    if (cachedBotId) return cachedBotId;
+    const info = ctx?.botInfo || null;
+    if (info?.id) {
+      cachedBotId = Number(info.id);
+      return cachedBotId;
+    }
+    const me = await ctx.telegram.getMe();
+    cachedBotId = Number(me?.id);
+    return cachedBotId;
+  }
+
+  function isAdminStatus(status) {
+    return status === 'creator' || status === 'administrator';
+  }
+
+  async function getMemberStatus(ctx, userId) {
+    try {
+      const m = await ctx.telegram.getChatMember(ctx.chat.id, userId);
+      return String(m?.status || '').toLowerCase();
+    } catch {
+      return '';
+    }
+  }
+
+  async function isBotAdminInChat(ctx) {
+    const botId = await getBotId(ctx);
+    const status = await getMemberStatus(ctx, botId);
+    return isAdminStatus(status);
+  }
+
+  async function isSenderAdminInChat(ctx) {
+    const fromId = Number(ctx.from?.id);
+    if (!fromId) return false;
+    const status = await getMemberStatus(ctx, fromId);
+    return isAdminStatus(status);
+  }
+
+  function isWorkspaceAllowedByEnv(chatId) {
+    if (internalGroupIds.size) return isInternalGroup(chatId);
+    return allowAnyGroupWorkspace;
   }
 
   const groupId = normalizeGroupId(rawGroupId);
@@ -146,6 +224,31 @@ function createKickchainBot(options) {
     });
   });
 
+  const logAllUpdates =
+    String(process.env.BOT_LOG_ALL_UPDATES || '').trim().toLowerCase() === 'true';
+  if (logAllUpdates) {
+    bot.use((ctx, next) => {
+      try {
+        const chat = ctx?.chat;
+        const from = ctx?.from;
+        const text = ctx?.message?.text;
+        const isCommand = typeof text === 'string' && text.trim().startsWith('/');
+        console.info('Telegram update', {
+          update_type: ctx?.updateType,
+          chat_id: chat?.id,
+          chat_type: chat?.type,
+          from_id: from?.id,
+          from_username: from?.username,
+          has_text: typeof text === 'string' && text.length > 0,
+          is_command: isCommand,
+        });
+      } catch {
+        // ignore
+      }
+      return next();
+    });
+  }
+
   bot.on('text', (ctx, next) => {
     const text = String(ctx.message?.text || '');
     if (text.startsWith('/run') || text.startsWith('/top') || text.startsWith('/leaderboard') || text.startsWith('/join')) {
@@ -160,10 +263,51 @@ function createKickchainBot(options) {
     return next();
   });
   const PLAY_MATCH_CB = 'kc_play_match';
+  const STAKE_10_CB = 'kc_stake_10';
+  const STAKE_25_CB = 'kc_stake_25';
   const REFERRAL_PUSH_CB = 'kc_referral_push';
   let cachedBotUsername = '';
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const autoRegisterPrivate =
+    String(process.env.BOT_AUTO_REGISTER_PRIVATE || 'true').trim().toLowerCase() !== 'false';
+
+  const autoWorkspaceIntelEnabled =
+    String(process.env.BOT_AUTO_WORKSPACE_INTEL || 'true').trim().toLowerCase() !== 'false';
+  const autoWorkspaceIntelCooldownMs = Math.max(
+    10_000,
+    Number(process.env.BOT_AUTO_WORKSPACE_INTEL_COOLDOWN_MS || 5 * 60 * 1000) || 5 * 60 * 1000
+  );
+  const autoWorkspaceIntelSearch =
+    String(process.env.BOT_AUTO_WORKSPACE_INTEL_SEARCH || '').trim().toLowerCase() === 'true';
+  const autoWorkspaceIntelMessageExtraction =
+    String(process.env.BOT_AUTO_WORKSPACE_INTEL_MESSAGE_EXTRACTION || 'true')
+      .trim()
+      .toLowerCase() !== 'false';
+
+  const lastAutoEnqueueAttemptAtByChat = new Map();
+  const pendingOnboardingNudgeByUser = new Map();
+
+  async function ensureUserRegistered({ ctx, referralCode = null }) {
+    try {
+      const telegram_id = ctx.from?.id;
+      const username = ctx.from?.username || 'no_username';
+      if (!telegram_id) return { ok: false, reason: 'missing_telegram_id' };
+
+      const response = await axios.post(`${backendUrl}/user/create`, {
+        telegram_id,
+        username,
+        referral_code_used: referralCode,
+      });
+
+      const isNewUser = response.data?.message === 'User created ✅';
+      return { ok: true, isNewUser, user: response.data?.user || null };
+    } catch (err) {
+      console.error('auto registration failed:', err?.response?.data || err?.message || String(err));
+      return { ok: false, reason: 'registration_failed' };
+    }
+  }
 
   const getBotUsername = async (ctx) => {
     if (cachedBotUsername) return cachedBotUsername;
@@ -187,21 +331,18 @@ function createKickchainBot(options) {
         return ctx.reply('👉 Please message me in private to start.');
       }
 
+      const telegram_id = ctx.from?.id;
+      const username = ctx.from?.username || ctx.from?.first_name || 'no_username';
+      if (!telegram_id) {
+        return ctx.reply('Could not read your Telegram user id. Please retry.');
+      }
+
       const message = ctx.message?.text || '';
       const parts = message.split(' ');
       const referral_code = parts.length > 1 ? parts[1] : null;
 
-      const telegram_id = ctx.from.id;
-      const username = ctx.from.username || 'no_username';
-
-      const response = await axios.post(`${backendUrl}/user/create`, {
-        telegram_id,
-        username,
-        referral_code_used: referral_code,
-      });
-
-      const isNewUser = response.data?.message === 'User created ✅';
-      if (isNewUser) {
+      const reg = await ensureUserRegistered({ ctx, referralCode: referral_code });
+      if (reg.ok && reg.isNewUser) {
         await sendToAllGroups(
           ctx,
           `🚀 ${username} just joined Kickchain!\n\nCan you beat them?`
@@ -216,22 +357,52 @@ function createKickchainBot(options) {
       }
 
       const stats = await axios.get(`${backendUrl}/user/stats/${telegram_id}`);
-      const data = stats.data;
-      const botUsername = ctx.botInfo?.username || '';
-      const referralLink = `https://t.me/${botUsername}?start=${data.referral_code}`;
+      const data = stats.data || {};
+      const botUsername = await getBotUsername(ctx);
+      const referralLink =
+        botUsername && data.referral_code
+          ? `https://t.me/${botUsername}?start=${encodeURIComponent(String(data.referral_code))}`
+          : '';
+
+      const buttons = [
+        [{ text: '🎮 Play Free (60s)', callback_data: PLAY_MATCH_CB }],
+      ];
+      if (miniappUrl) {
+        buttons.push([{ text: '🏆 Open Mini App', web_app: { url: miniappUrl } }]);
+      }
 
       await ctx.reply(
         `🚀 Welcome to Kickchain\n\n` +
           `⚔️ Play 1v1 matches and win rewards\n\n` +
-          `👉 Tap below to start your first match\n\n` +
-          `🔥 Your referral link:\n${referralLink}\n\n` +
+          `👉 Tap below to get your *first win* (free)\n\n` +
+          `🔥 Your referral link:\n${referralLink || '(referral link unavailable)'}\n\n` +
           `🏆 Invite friends → climb leaderboard → earn more`,
         {
           reply_markup: {
-            inline_keyboard: [[{ text: '🎮 Play Match', callback_data: PLAY_MATCH_CB }]],
+            inline_keyboard: buttons,
           },
         }
       );
+
+      // Onboarding nudge: if they don't play within 60s, remind them.
+      // Best-effort (in-memory). Safe-guard against duplicate timers per user.
+      if (!pendingOnboardingNudgeByUser.has(String(telegram_id))) {
+        const t = setTimeout(async () => {
+          pendingOnboardingNudgeByUser.delete(String(telegram_id));
+          try {
+            const latest = await axios.get(`${backendUrl}/user/stats/${telegram_id}`);
+            const s = latest.data || {};
+            if ((Number(s.matches_played) || 0) > 0) return;
+            await ctx.telegram.sendMessage(
+              ctx.chat.id,
+              `⏳ Quick one: want a free win to get started?\nTap: “Play Free (60s)”`
+            );
+          } catch {
+            // ignore
+          }
+        }, 60_000);
+        pendingOnboardingNudgeByUser.set(String(telegram_id), t);
+      }
     } catch (err) {
       console.error('Bot request failed:', err?.message || 'Unknown error');
       ctx.reply('Something went wrong ❌');
@@ -240,34 +411,56 @@ function createKickchainBot(options) {
 
   bot.action(PLAY_MATCH_CB, async (ctx) => {
     try {
-      await ctx.answerCbQuery('Finding opponent...');
+      await ctx.answerCbQuery('Starting free match…');
 
       const telegram_id = ctx.from?.id;
+      const username = ctx.from?.username || ctx.from?.first_name || 'no_username';
       if (!telegram_id) return;
 
-      // Immediate action + dopamine loop (no real gameplay needed yet)
-      await ctx.reply('Finding opponent...');
-      await sleep(2500);
-      await ctx.reply('🔥 You won!');
+      // Guided "first match" flow: fast first win, then prompt for stake.
+      await ctx.reply('🎮 Free Match started…');
+      await sleep(900);
+      await ctx.reply('⚔️ Match found. Playing…');
+      await sleep(1400);
+      const practice = await axios.post(`${backendUrl}/matches/practice`, {
+        telegram_id,
+        username,
+      });
+      const data = practice.data?.stats || {};
 
-      const stats = await axios.get(`${backendUrl}/user/stats/${telegram_id}`);
-      const data = stats.data || {};
+      let oneAwayLine = '';
+      try {
+        const lb = await axios.get(`${backendUrl}/leaderboard/extended`);
+        const winners = Array.isArray(lb.data?.winners) ? lb.data.winners : [];
+        if (winners.length >= 10) {
+          const tenth = winners[winners.length - 1] || null;
+          const threshold = Number(tenth?.wins);
+          const myWins = Number(data?.wins || 0);
+          if (Number.isFinite(threshold) && threshold > 0 && myWins === threshold - 1) {
+            oneAwayLine = `\n\n⚡ You’re 1 win away from the Top 10 leaderboard.`;
+          }
+        }
+      } catch {
+        // ignore
+      }
+
       const botUsername = await getBotUsername(ctx);
       const referralLink = botUsername
         ? `https://t.me/${botUsername}?start=${data.referral_code}`
         : '';
 
       await ctx.reply(
-        `🔥 You won your first match!\n\n` +
-          `Invite a friend and earn rewards:\n` +
-          `${referralLink || '(referral link unavailable)'}\n\n` +
-          `🏆 Climb the leaderboard now\n\n` +
-          `What is this?`,
+        `🔥 First win recorded ✅\n\n` +
+          `Next: try a *staked* match (real challenge), or invite a friend.` +
+          `${oneAwayLine}\n\n` +
+          `Referral link:\n${referralLink || '(referral link unavailable)'}`,
         {
           reply_markup: {
             inline_keyboard: [
+              [{ text: '💰 Stake $10', callback_data: STAKE_10_CB }],
+              [{ text: '💰 Stake $25', callback_data: STAKE_25_CB }],
               [{ text: '📣 Share Referral', callback_data: REFERRAL_PUSH_CB }],
-              [{ text: '🎮 Play Again', callback_data: PLAY_MATCH_CB }],
+              [{ text: '🎮 Play Free Again', callback_data: PLAY_MATCH_CB }],
             ],
           },
         }
@@ -279,6 +472,64 @@ function createKickchainBot(options) {
       } catch {
         // ignore
       }
+    }
+  });
+
+  async function createStakeChallenge(ctx, amount) {
+    const telegram_id = ctx.from?.id;
+    if (!telegram_id) return null;
+    const stake = Number(amount) || 0;
+    const res = await axios.post(`${backendUrl}/matches/challenge`, {
+      challenger_id: telegram_id,
+      stake_amount: stake,
+      is_fun_mode: false,
+    });
+    return res.data || null;
+  }
+
+  bot.action(STAKE_10_CB, async (ctx) => {
+    try {
+      await ctx.answerCbQuery('Creating $10 challenge…');
+      const match = await createStakeChallenge(ctx, 10);
+      if (!match?.id) return ctx.reply('Failed to create challenge ❌');
+      const name = ctx.from?.username || ctx.from?.first_name || 'challenger';
+      const text =
+        `🔥 NEW CHALLENGE!\n\n` +
+        `👤 Challenger: ${name}\n` +
+        `💰 Stake: 10 USDC\n\n` +
+        `Accept with: /join ${match.id}\n` +
+        `Winner reports: /win ${match.id}`;
+      if (ctx.chat?.type === 'private') {
+        await sendToAllGroups(ctx, text);
+        return ctx.reply(`Challenge posted to groups ✅\n\n${text}`);
+      }
+      return ctx.reply(text);
+    } catch (err) {
+      console.error('stake_10 failed:', err?.message || 'Unknown error');
+      return ctx.reply('Failed to create challenge ❌');
+    }
+  });
+
+  bot.action(STAKE_25_CB, async (ctx) => {
+    try {
+      await ctx.answerCbQuery('Creating $25 challenge…');
+      const match = await createStakeChallenge(ctx, 25);
+      if (!match?.id) return ctx.reply('Failed to create challenge ❌');
+      const name = ctx.from?.username || ctx.from?.first_name || 'challenger';
+      const text =
+        `🔥 NEW CHALLENGE!\n\n` +
+        `👤 Challenger: ${name}\n` +
+        `💰 Stake: 25 USDC\n\n` +
+        `Accept with: /join ${match.id}\n` +
+        `Winner reports: /win ${match.id}`;
+      if (ctx.chat?.type === 'private') {
+        await sendToAllGroups(ctx, text);
+        return ctx.reply(`Challenge posted to groups ✅\n\n${text}`);
+      }
+      return ctx.reply(text);
+    } catch (err) {
+      console.error('stake_25 failed:', err?.message || 'Unknown error');
+      return ctx.reply('Failed to create challenge ❌');
     }
   });
 
@@ -340,13 +591,57 @@ function createKickchainBot(options) {
     return next();
   });
 
+  bot.command('help', async (ctx) => {
+    const lines = [];
+    lines.push('Kickchain bot commands:');
+    lines.push('');
+    lines.push('Private chat:');
+    lines.push('- /start — register (optional referral code)');
+    lines.push('- /app — open the Mini App (leaderboard/stats)');
+    lines.push('- /stats — your stats + referral link');
+    lines.push('- /fun_match — create a fun match');
+    lines.push('- /challenge <stake> — create a paid challenge');
+    lines.push('- /join <match_id> — join a match');
+    lines.push('- /win <match_id> — report match winner');
+    lines.push('');
+    lines.push('Group workspace (internal groups only):');
+    lines.push('- /run — run intel discovery');
+    lines.push('- /top — show latest intel results');
+    lines.push('- /leaderboard — weekly team leaderboard');
+    lines.push('');
+    lines.push('Debug:');
+    lines.push('- /whereami — print chat id/type');
+    lines.push('- /testgroup — broadcast test message');
+    return ctx.reply(lines.join('\n'));
+  });
+
+  bot.command('app', async (ctx) => {
+    try {
+      if (!miniappUrl) {
+        return ctx.reply(
+          'Mini App is not configured.\n\nSet MINIAPP_PUBLIC_URL to your public HTTPS base URL (e.g. ngrok), then try again.'
+        );
+      }
+      return ctx.reply(
+        'Open Kickchain Mini App:',
+        Markup.inlineKeyboard([Markup.button.webApp('Open Mini App', miniappUrl)])
+      );
+    } catch (err) {
+      console.error('app command failed:', err?.message || 'Unknown error');
+      return ctx.reply('Failed to open Mini App ❌');
+    }
+  });
+
   bot.command('stats', async (ctx) => {
     try {
       const telegram_id = ctx.from.id;
       const stats = await axios.get(`${backendUrl}/user/stats/${telegram_id}`);
       const data = stats.data;
-      const botUsername = ctx.botInfo?.username || '';
-      const referralLink = `https://t.me/${botUsername}?start=${data.referral_code}`;
+      const botUsername = await getBotUsername(ctx);
+      const referralLink =
+        botUsername && data?.referral_code
+          ? `https://t.me/${botUsername}?start=${encodeURIComponent(String(data.referral_code))}`
+          : '';
 
       await ctx.reply(
         `📊 Your Stats:\n` +
@@ -357,7 +652,7 @@ function createKickchainBot(options) {
           (typeof data.matches_played === 'number'
             ? `• Matches: ${data.matches_played}\n\n`
             : '\n') +
-          `🔥 Your referral link:\n${referralLink}\n\n` +
+          `🔥 Your referral link:\n${referralLink || '(referral link unavailable)'}\n\n` +
           `Invite more friends and climb the leaderboard 🏆`
       );
     } catch (err) {
@@ -375,14 +670,31 @@ function createKickchainBot(options) {
       if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
         return ctx.reply('Use /leaderboard inside the team group workspace.');
       }
-      if (!internalGroupIds.size || !isInternalGroup(ctx.chat.id)) {
+      if (!isWorkspaceAllowedByEnv(ctx.chat.id)) {
         console.warn('Unauthorized intel /leaderboard attempt', {
           chat_id: ctx.chat?.id,
           chat_type: ctx.chat?.type,
           from_id: ctx.from?.id,
           from_username: ctx.from?.username,
         });
-        return ctx.reply('❌ Not allowed here');
+        if (!internalGroupIds.size && !allowAnyGroupWorkspace) {
+          return ctx.reply(
+            '❌ Not allowed here.\n\nAdmin: set INTERNAL_GROUP_IDS, or set ALLOW_ANY_GROUP_WORKSPACE=true and make the bot an admin.'
+          );
+        }
+        return ctx.reply(
+          '❌ Not allowed here.\n\nAdmin: add this chat_id to INTERNAL_GROUP_IDS, then restart the bot.\nTip: run /whereami to see chat_id.'
+        );
+      }
+      if (allowAnyGroupWorkspace && !internalGroupIds.size) {
+        const botIsAdmin = await isBotAdminInChat(ctx);
+        if (!botIsAdmin) {
+          return ctx.reply('Make the bot an admin in this group to use workspace commands.');
+        }
+        const senderIsAdmin = await isSenderAdminInChat(ctx);
+        if (!senderIsAdmin) {
+          return ctx.reply('Only group admins can run workspace commands in this group.');
+        }
       }
       if (!intelAdminKey) return ctx.reply('Intel admin key is not configured on the backend.');
 
@@ -580,23 +892,31 @@ function createKickchainBot(options) {
       if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
         return ctx.reply('Use /run inside a Telegram group workspace.');
       }
-      if (!internalGroupIds.size) {
-        console.warn('Unauthorized intel /run attempt (INTERNAL_GROUP_IDS not set)', {
-          chat_id: ctx.chat?.id,
-          chat_type: ctx.chat?.type,
-          from_id: ctx.from?.id,
-          from_username: ctx.from?.username,
-        });
-        return ctx.reply('❌ Not allowed here');
-      }
-      if (!isInternalGroup(ctx.chat.id)) {
+      if (!isWorkspaceAllowedByEnv(ctx.chat.id)) {
         console.warn('Unauthorized intel /run attempt', {
           chat_id: ctx.chat?.id,
           chat_type: ctx.chat?.type,
           from_id: ctx.from?.id,
           from_username: ctx.from?.username,
         });
-        return ctx.reply('❌ Not allowed here');
+        if (!internalGroupIds.size && !allowAnyGroupWorkspace) {
+          return ctx.reply(
+            '❌ Not allowed here.\n\nAdmin: set INTERNAL_GROUP_IDS, or set ALLOW_ANY_GROUP_WORKSPACE=true and make the bot an admin.'
+          );
+        }
+        return ctx.reply(
+          '❌ Not allowed here.\n\nAdmin: add this chat_id to INTERNAL_GROUP_IDS, then restart the bot.\nTip: run /whereami to see chat_id.'
+        );
+      }
+      if (allowAnyGroupWorkspace && !internalGroupIds.size) {
+        const botIsAdmin = await isBotAdminInChat(ctx);
+        if (!botIsAdmin) {
+          return ctx.reply('Make the bot an admin in this group to use workspace commands.');
+        }
+        const senderIsAdmin = await isSenderAdminInChat(ctx);
+        if (!senderIsAdmin) {
+          return ctx.reply('Only group admins can run workspace commands in this group.');
+        }
       }
       if (!intelAdminKey) {
         return ctx.reply('Intel admin key is not configured on the backend.');
@@ -651,23 +971,31 @@ function createKickchainBot(options) {
       if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') {
         return ctx.reply('Use /top inside a Telegram group workspace.');
       }
-      if (!internalGroupIds.size) {
-        console.warn('Unauthorized intel /top attempt (INTERNAL_GROUP_IDS not set)', {
-          chat_id: ctx.chat?.id,
-          chat_type: ctx.chat?.type,
-          from_id: ctx.from?.id,
-          from_username: ctx.from?.username,
-        });
-        return ctx.reply('❌ Not allowed here');
-      }
-      if (!isInternalGroup(ctx.chat.id)) {
+      if (!isWorkspaceAllowedByEnv(ctx.chat.id)) {
         console.warn('Unauthorized intel /top attempt', {
           chat_id: ctx.chat?.id,
           chat_type: ctx.chat?.type,
           from_id: ctx.from?.id,
           from_username: ctx.from?.username,
         });
-        return ctx.reply('❌ Not allowed here');
+        if (!internalGroupIds.size && !allowAnyGroupWorkspace) {
+          return ctx.reply(
+            '❌ Not allowed here.\n\nAdmin: set INTERNAL_GROUP_IDS, or set ALLOW_ANY_GROUP_WORKSPACE=true and make the bot an admin.'
+          );
+        }
+        return ctx.reply(
+          '❌ Not allowed here.\n\nAdmin: add this chat_id to INTERNAL_GROUP_IDS, then restart the bot.\nTip: run /whereami to see chat_id.'
+        );
+      }
+      if (allowAnyGroupWorkspace && !internalGroupIds.size) {
+        const botIsAdmin = await isBotAdminInChat(ctx);
+        if (!botIsAdmin) {
+          return ctx.reply('Make the bot an admin in this group to use workspace commands.');
+        }
+        const senderIsAdmin = await isSenderAdminInChat(ctx);
+        if (!senderIsAdmin) {
+          return ctx.reply('Only group admins can run workspace commands in this group.');
+        }
       }
       if (!intelAdminKey) {
         return ctx.reply('Intel admin key is not configured on the backend.');
@@ -688,6 +1016,94 @@ function createKickchainBot(options) {
       const msg = err?.response?.data?.error || err?.message || 'Failed';
       console.error('intel /top failed:', msg);
       return ctx.reply(`❌ Failed to load top: ${String(msg).slice(0, 180)}`);
+    }
+  });
+
+  // Friendly default behavior: reply with /help in private chats when users send plain text
+  // or unknown commands. Avoids "silent bot" confusion.
+  bot.on('text', async (ctx, next) => {
+    try {
+      await next();
+    } catch {
+      // ignore
+    }
+    try {
+      if (ctx.chat?.type !== 'private') return;
+      const text = String(ctx.message?.text || '').trim();
+      if (!text) return;
+      if (text === '/help') return;
+      if (autoRegisterPrivate && !text.startsWith('/')) {
+        const reg = await ensureUserRegistered({ ctx, referralCode: null });
+        if (reg.ok && reg.isNewUser) {
+          const username = ctx.from?.username || 'no_username';
+          try {
+            await sendToAllGroups(ctx, `🚀 ${username} just joined Kickchain!\n\nCan you beat them?`);
+          } catch {
+            // ignore group broadcast failures
+          }
+        }
+      }
+      if (text.startsWith('/')) {
+        return ctx.reply('Unknown command. Send /help for available commands.');
+      }
+      return ctx.reply('Send /help to see what I can do.');
+    } catch {
+      // ignore
+    }
+  });
+
+  // Workspace automation: auto-enqueue intel runs on group activity (no manual /run needed).
+  bot.on('text', async (ctx, next) => {
+    try {
+      await next();
+    } catch {
+      // ignore
+    }
+    try {
+      if (!autoWorkspaceIntelEnabled) return;
+      if (!intelAdminKey) return;
+      if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') return;
+      if (!isWorkspaceAllowedByEnv(ctx.chat.id)) return;
+      if (allowAnyGroupWorkspace && !internalGroupIds.size) {
+        const botIsAdmin = await isBotAdminInChat(ctx);
+        if (!botIsAdmin) return;
+      }
+
+      const text = String(ctx.message?.text || '').trim();
+      if (!text) return;
+      if (text.startsWith('/')) return; // don't react to commands
+      if (ctx.from?.is_bot) return;
+
+      const chatId = String(ctx.chat.id);
+      const lastAttemptAt = Number(lastAutoEnqueueAttemptAtByChat.get(chatId) || 0);
+      const now = Date.now();
+      if (now - lastAttemptAt < autoWorkspaceIntelCooldownMs) return;
+      lastAutoEnqueueAttemptAtByChat.set(chatId, now);
+
+      const title = ctx.chat.title || null;
+
+      await axios.post(
+        `${backendUrl}/intel/workspace/enqueue-run`,
+        {
+          telegram_chat_id: chatId,
+          name: title,
+          requested_by: ctx.from?.id,
+          requested_by_username: ctx.from?.username || null,
+          options: {
+            search: autoWorkspaceIntelSearch,
+            scrape: true,
+            message_extraction: autoWorkspaceIntelMessageExtraction,
+            max_scrapes: 1,
+            // Let backend guardrails cap these. Keep defaults unless explicitly overridden.
+          },
+        },
+        { headers: { Authorization: `Bearer ${intelAdminKey}` } }
+      );
+    } catch (err) {
+      // Best-effort: don't spam the chat or crash the bot on automation failures.
+      const status = err?.response?.status;
+      const msg = err?.response?.data?.error || err?.message || 'auto workspace enqueue failed';
+      console.error('auto workspace enqueue failed:', { status, msg });
     }
   });
 
