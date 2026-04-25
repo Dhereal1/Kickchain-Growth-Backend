@@ -100,6 +100,47 @@ function computeTierFromReferrals(totalReferrals) {
   return 'Bronze';
 }
 
+function xpForLevel(level) {
+  const lvl = Math.max(1, Number(level) || 1);
+  // Quadratic curve: level 1 starts at 0, then ramps.
+  const n = lvl - 1;
+  return Math.floor(100 * n + 60 * n * n);
+}
+
+function computeLevelFromXp(xp) {
+  const x = Math.max(0, Number(xp) || 0);
+  let level = 1;
+  // Levels won't be huge; keep it simple and deterministic.
+  while (x >= xpForLevel(level + 1)) level += 1;
+  return level;
+}
+
+function progressToNextLevel({ xp }) {
+  const x = Math.max(0, Number(xp) || 0);
+  const level = computeLevelFromXp(x);
+  const cur = xpForLevel(level);
+  const next = xpForLevel(level + 1);
+  const span = Math.max(1, next - cur);
+  const pct = Math.max(0, Math.min(1, (x - cur) / span));
+  return { xp: x, level, cur_level_xp: cur, next_level_xp: next, pct };
+}
+
+function tierNextGoal({ totalReferrals }) {
+  const refs = Number(totalReferrals) || 0;
+  const steps = [
+    { tier: 'Silver', at: 3 },
+    { tier: 'Gold', at: 10 },
+    { tier: 'Platinum', at: 25 },
+    { tier: 'Diamond', at: 50 },
+  ];
+  for (const s of steps) {
+    if (refs < s.at) {
+      return { next_tier: s.tier, refs_needed: s.at - refs, at: s.at };
+    }
+  }
+  return { next_tier: null, refs_needed: 0, at: null };
+}
+
 function getMiniAppInitData(req) {
   const header = req.headers['x-telegram-init-data'];
   if (header) return String(header);
@@ -116,7 +157,98 @@ async function getUserByTelegramId(telegramId) {
   return r.rows[0] || null;
 }
 
+async function getUserBadges(telegramId) {
+  await ensureGrowthSchema();
+  try {
+    const r = await pool.query(
+      `SELECT badge_key, earned_at
+       FROM user_badges
+       WHERE telegram_id = $1
+       ORDER BY earned_at ASC`,
+      [telegramId]
+    );
+    return r.rows || [];
+  } catch {
+    return [];
+  }
+}
+
+function badgeDefs() {
+  return [
+    { key: 'ref_3', name: 'Connector', desc: 'Get 3 referrals', kind: 'referrals', at: 3 },
+    { key: 'ref_10', name: 'Influencer', desc: 'Get 10 referrals', kind: 'referrals', at: 10 },
+    { key: 'win_3', name: 'Streak Starter', desc: 'Reach a 3-win streak', kind: 'streak', at: 3 },
+    { key: 'win_10', name: 'Champion', desc: 'Win 10 matches', kind: 'wins', at: 10 },
+    { key: 'daily_3', name: 'Regular', desc: '3-day daily check-in streak', kind: 'daily', at: 3 },
+    { key: 'daily_7', name: 'Daily Grinder', desc: '7-day daily check-in streak', kind: 'daily', at: 7 },
+  ];
+}
+
+async function upsertBadge({ telegramId, badgeKey }) {
+  await ensureGrowthSchema();
+  await pool.query(
+    `INSERT INTO user_badges (telegram_id, badge_key)
+     VALUES ($1, $2)
+     ON CONFLICT (telegram_id, badge_key) DO NOTHING`,
+    [telegramId, badgeKey]
+  );
+}
+
+async function awardBadgesIfEligible({ telegramId }) {
+  await ensureGrowthSchema();
+  const user = await getUserByTelegramId(telegramId);
+  if (!user) return [];
+
+  const badges = await getUserBadges(telegramId);
+  const owned = new Set((badges || []).map((b) => String(b.badge_key)));
+
+  const countResult = await pool.query('SELECT COUNT(*)::int AS total FROM users WHERE referred_by = $1', [
+    user.referral_code,
+  ]);
+  const totalReferrals = countResult.rows[0]?.total ?? 0;
+
+  const wins = Number(user.wins || 0);
+  const streak = Number(user.win_streak || 0);
+  const daily = Number(user.daily_check_streak || 0);
+
+  const newly = [];
+  for (const def of badgeDefs()) {
+    if (owned.has(def.key)) continue;
+    if (def.kind === 'referrals' && totalReferrals >= def.at) {
+      newly.push(def.key);
+    } else if (def.kind === 'wins' && wins >= def.at) {
+      newly.push(def.key);
+    } else if (def.kind === 'streak' && streak >= def.at) {
+      newly.push(def.key);
+    } else if (def.kind === 'daily' && daily >= def.at) {
+      newly.push(def.key);
+    }
+  }
+
+  for (const key of newly) {
+    // eslint-disable-next-line no-await-in-loop
+    await upsertBadge({ telegramId, badgeKey: key });
+  }
+  return newly;
+}
+
+async function awardXp({ telegramId, amount, reason }) {
+  await ensureGrowthSchema();
+  const a = Number(amount) || 0;
+  if (!Number.isFinite(a) || a === 0) return;
+  await pool.query(
+    `UPDATE users
+     SET xp = COALESCE(xp, 0) + $2
+     WHERE telegram_id = $1`,
+    [telegramId, Math.trunc(a)]
+  );
+  if (reason) {
+    console.info('XP awarded', { telegram_id: String(telegramId), amount: Math.trunc(a), reason: String(reason) });
+  }
+}
+
 async function ensureUserFromTelegramWebApp({ telegramId, username, referralCodeUsed }) {
+  await ensureGrowthSchema();
   const existing = await getUserByTelegramId(telegramId);
   if (existing) return { user: existing, created: false };
 
@@ -134,10 +266,17 @@ async function ensureUserFromTelegramWebApp({ telegramId, username, referralCode
     [telegramId, username || 'no_username', referral_code, referrer ? referrer.referral_code : null]
   );
 
+  // Reward referrer on successful referral (best-effort).
+  if (referrer?.telegram_id) {
+    await awardXp({ telegramId: Number(referrer.telegram_id), amount: 120, reason: 'referral_signup' });
+    await awardBadgesIfEligible({ telegramId: Number(referrer.telegram_id) });
+  }
+
   return { user: result.rows[0], created: true };
 }
 
 async function computeUserStats({ telegramId }) {
+  await ensureGrowthSchema();
   const user = await getUserByTelegramId(telegramId);
   if (!user) return null;
 
@@ -167,6 +306,12 @@ async function computeUserStats({ telegramId }) {
   const tier = computeTierFromReferrals(totalReferrals);
   await pool.query('UPDATE users SET tier = $1 WHERE telegram_id = $2 AND tier IS DISTINCT FROM $1', [tier, telegramId]);
 
+  // Badges are derived but persisted for fast display.
+  await awardBadgesIfEligible({ telegramId });
+  const badges = await getUserBadges(telegramId);
+  const prog = progressToNextLevel({ xp: user.xp || 0 });
+  const tierGoal = tierNextGoal({ totalReferrals });
+
   return {
     username: user.username,
     referral_code: user.referral_code,
@@ -175,9 +320,21 @@ async function computeUserStats({ telegramId }) {
     tier,
     matches_played: user.matches_played ?? 0,
     wins: user.wins ?? 0,
+    win_streak: user.win_streak ?? 0,
+    daily_check_streak: user.daily_check_streak ?? 0,
     fun_mode_completed: !!user.fun_mode_completed,
     total_won: user.total_won ?? 0,
     games_played: user.games_played ?? 0,
+    xp: prog.xp,
+    level: prog.level,
+    next_level_xp: prog.next_level_xp,
+    level_progress_pct: prog.pct,
+    badges,
+    nudges: {
+      next_tier: tierGoal.next_tier,
+      refs_needed_for_next_tier: tierGoal.refs_needed,
+      xp_to_next_level: Math.max(0, prog.next_level_xp - prog.xp),
+    },
   };
 }
 
@@ -319,6 +476,100 @@ app.get('/miniapp/api/referrals', async (req, res) => {
   }
 });
 
+app.post('/miniapp/api/daily', async (req, res) => {
+  try {
+    const verified = verifyMiniApp(req);
+    const tgUser = verified?.user || null;
+    const telegramId = tgUser?.id != null ? Number(tgUser.id) : null;
+    if (!telegramId || !Number.isFinite(telegramId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_telegram_user' });
+    }
+
+    await ensureGrowthSchema();
+
+    const user = await getUserByTelegramId(telegramId);
+    if (!user) return res.status(404).json({ ok: false, error: 'user_not_found' });
+
+    const last = user.last_daily_check_at ? new Date(user.last_daily_check_at) : null;
+    const now = new Date();
+    const todayKey = now.toISOString().slice(0, 10);
+    const lastKey = last ? last.toISOString().slice(0, 10) : '';
+
+    if (lastKey === todayKey) {
+      const stats = await computeUserStats({ telegramId });
+      return res.json({ ok: true, claimed: false, reason: 'already_claimed_today', stats });
+    }
+
+    const yesterday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1))
+      .toISOString()
+      .slice(0, 10);
+    const continueStreak = lastKey === yesterday;
+
+    const nextStreak = continueStreak ? Math.max(0, Number(user.daily_check_streak || 0)) + 1 : 1;
+    await pool.query(
+      `UPDATE users
+       SET daily_check_streak = $2,
+           last_daily_check_at = NOW()
+       WHERE telegram_id = $1`,
+      [telegramId, nextStreak]
+    );
+
+    const xp = 25 + Math.min(30, (nextStreak - 1) * 5);
+    await awardXp({ telegramId, amount: xp, reason: 'daily_checkin' });
+    await awardBadgesIfEligible({ telegramId });
+
+    const stats = await computeUserStats({ telegramId });
+    return res.json({ ok: true, claimed: true, xp_awarded: xp, daily_streak: nextStreak, stats });
+  } catch (err) {
+    const code = err?.code || 'miniapp_daily_failed';
+    const msg = err?.message || String(err);
+    console.error('miniapp daily failed:', { code, msg });
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
+app.post('/miniapp/api/tournaments/private/create', async (req, res) => {
+  try {
+    const verified = verifyMiniApp(req);
+    const tgUser = verified?.user || null;
+    const telegramId = tgUser?.id != null ? Number(tgUser.id) : null;
+    if (!telegramId || !Number.isFinite(telegramId)) {
+      return res.status(400).json({ ok: false, error: 'invalid_telegram_user' });
+    }
+
+    await ensureGrowthSchema();
+    const user = await getUserByTelegramId(telegramId);
+    if (!user) return res.status(404).json({ ok: false, error: 'user_not_found' });
+
+    const prog = progressToNextLevel({ xp: user.xp || 0 });
+    if (prog.level < 5) {
+      return res.status(403).json({ ok: false, error: 'locked', message: 'Unlocks at Level 5' });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const title = body.title != null ? String(body.title).trim() : 'Private Tournament';
+    const invite = `KC${telegramId}${Math.floor(Math.random() * 100000)}`;
+
+    const r = await pool.query(
+      `
+        INSERT INTO tournaments (title, description, start_date, status, is_private, invite_code, owner_telegram_id)
+        VALUES ($1, $2, NOW(), 'upcoming', TRUE, $3, $4)
+        RETURNING id, title, invite_code, status, created_at
+      `,
+      [title.slice(0, 80), 'Invite-only tournament', invite, telegramId]
+    );
+
+    return res.json({ ok: true, tournament: r.rows[0] });
+  } catch (err) {
+    const code = err?.code || 'miniapp_private_tournament_failed';
+    const msg = err?.message || String(err);
+    console.error('miniapp private tournament failed:', { code, msg });
+    const status = code === 'INIT_DATA_INVALID_SIGNATURE' || code === 'INIT_DATA_EXPIRED' ? 401 : 500;
+    return res.status(status).json({ ok: false, error: code, message: msg });
+  }
+});
+
 let ensureGrowthSchemaPromise = null;
 async function ensureGrowthSchema() {
   if (ensureGrowthSchemaPromise) return ensureGrowthSchemaPromise;
@@ -392,6 +643,27 @@ async function ensureGrowthSchema() {
     await pool.query(
       "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_onboarding_nudge_at TIMESTAMP"
     );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INT DEFAULT 0"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_check_streak INT DEFAULT 0"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_check_at TIMESTAMP"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS win_streak INT DEFAULT 0"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_win_at TIMESTAMP"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_loss_at TIMESTAMP"
+    );
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_hype_at TIMESTAMP"
+    );
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS groups (
@@ -401,6 +673,18 @@ async function ensureGrowthSchema() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_badges (
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+        badge_key TEXT NOT NULL,
+        earned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(
+      'CREATE UNIQUE INDEX IF NOT EXISTS user_badges_uq ON user_badges (telegram_id, badge_key)'
+    );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS matches (
@@ -416,6 +700,37 @@ async function ensureGrowthSchema() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS rivalries (
+      id SERIAL PRIMARY KEY,
+      user_a BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      user_b BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      wins_a INT DEFAULT 0,
+      wins_b INT DEFAULT 0,
+      matches_played INT DEFAULT 0,
+      last_winner_id BIGINT REFERENCES users(telegram_id) ON DELETE SET NULL,
+      last_played_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // Normalize any legacy rows to keep user_a < user_b (and keep win columns aligned).
+  await runOnce('2026-04-25_normalize_rivalries', [
+    `
+      UPDATE rivalries
+      SET user_a = user_b,
+          user_b = user_a,
+          wins_a = wins_b,
+          wins_b = wins_a
+      WHERE user_a > user_b
+    `,
+  ]);
+
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS rivalries_pair_uq ON rivalries (LEAST(user_a, user_b), GREATEST(user_a, user_b))'
+  );
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS tournaments (
       id SERIAL PRIMARY KEY,
       title TEXT NOT NULL,
@@ -425,6 +740,10 @@ async function ensureGrowthSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS is_private BOOLEAN DEFAULT FALSE");
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS invite_code TEXT");
+  await pool.query("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS owner_telegram_id BIGINT");
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS tournaments_invite_code_uq ON tournaments (invite_code)");
 
   await pool.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS tournaments_title_uq ON tournaments (title)'
@@ -2812,6 +3131,8 @@ registerWithApiAlias('post', '/user/create', async (req, res) => {
   const { telegram_id, username, referral_code_used } = req.body;
 
   try {
+    await ensureGrowthSchema();
+
     // Check if user already exists
     const existingUser = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
@@ -2856,6 +3177,8 @@ registerWithApiAlias('post', '/user/create', async (req, res) => {
 
     if (referrer) {
       console.log(`Referral success: ${referrer.username} invited ${username}`);
+      await awardXp({ telegramId: Number(referrer.telegram_id), amount: 120, reason: 'referral_signup' });
+      await awardBadgesIfEligible({ telegramId: Number(referrer.telegram_id) });
     }
 
     const createdUser = result.rows[0];
@@ -2976,6 +3299,8 @@ registerWithApiAlias('get', '/user/stats/:telegram_id', async (req, res) => {
   const { telegram_id } = req.params;
 
   try {
+    await ensureGrowthSchema();
+
     // Get user
     const userResult = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
@@ -3045,6 +3370,7 @@ registerWithApiAlias('get', '/user/stats/:telegram_id', async (req, res) => {
 registerWithApiAlias('post', '/matches/challenge', async (req, res) => {
   const { challenger_id, stake_amount, is_fun_mode } = req.body || {};
   try {
+    await ensureGrowthSchema();
     if (!challenger_id) return res.status(400).json({ message: 'challenger_id is required' });
 
     const userRes = await pool.query('SELECT telegram_id FROM users WHERE telegram_id = $1', [
@@ -3087,6 +3413,7 @@ registerWithApiAlias('get', '/matches/pending', async (req, res) => {
 registerWithApiAlias('post', '/matches/join', async (req, res) => {
   const { match_id, opponent_id } = req.body || {};
   try {
+    await ensureGrowthSchema();
     if (!match_id || !opponent_id) return res.status(400).json({ message: 'match_id and opponent_id are required' });
 
     const oppRes = await pool.query('SELECT telegram_id FROM users WHERE telegram_id = $1', [
@@ -3121,6 +3448,8 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
   try {
     if (!match_id || !winner_id) return res.status(400).json({ message: 'match_id and winner_id are required' });
 
+    await ensureGrowthSchema();
+
     const matchRes = await pool.query('SELECT * FROM matches WHERE id = $1', [match_id]);
     if (matchRes.rows.length === 0) return res.status(404).send('Match not found');
     const match = matchRes.rows[0];
@@ -3133,9 +3462,12 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
       return res.status(400).json({ message: 'winner_id must be a match participant' });
     }
 
+    const winnerId = Number(winner_id);
+    const loserId = Number(String(match.challenger_id) === String(winner_id) ? match.opponent_id : match.challenger_id);
+
     await pool.query(
       `UPDATE matches SET winner_id = $1, status = 'completed' WHERE id = $2`,
-      [winner_id, match_id]
+      [winnerId, match_id]
     );
 
     // Update user stats (safe even if older rows had NULLs)
@@ -3149,7 +3481,23 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
       `UPDATE users
        SET wins = COALESCE(wins, 0) + 1
        WHERE telegram_id = $1`,
-      [winner_id]
+      [winnerId]
+    );
+
+    // Streak tracking: increment winner, reset loser.
+    await pool.query(
+      `UPDATE users
+       SET win_streak = COALESCE(win_streak, 0) + 1,
+           last_win_at = NOW()
+       WHERE telegram_id = $1`,
+      [winnerId]
+    );
+    await pool.query(
+      `UPDATE users
+       SET win_streak = 0,
+           last_loss_at = NOW()
+       WHERE telegram_id = $1`,
+      [loserId]
     );
 
     if (match.is_fun_mode) {
@@ -3160,6 +3508,89 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
         [[match.challenger_id, match.opponent_id]]
       );
     }
+
+    // Rivalry stats (pairwise record)
+    const a = Math.min(Number(match.challenger_id), Number(match.opponent_id));
+    const b = Math.max(Number(match.challenger_id), Number(match.opponent_id));
+    await pool.query(
+      `
+        INSERT INTO rivalries (user_a, user_b, wins_a, wins_b, matches_played, last_winner_id, last_played_at, updated_at)
+        VALUES ($1, $2, 0, 0, 0, NULL, NOW(), NOW())
+        ON CONFLICT DO NOTHING
+      `,
+      [a, b]
+    );
+    if (winnerId === a) {
+      await pool.query(
+        `
+          UPDATE rivalries
+          SET wins_a = COALESCE(wins_a, 0) + 1,
+              matches_played = COALESCE(matches_played, 0) + 1,
+              last_winner_id = $3,
+              last_played_at = NOW(),
+              updated_at = NOW()
+          WHERE user_a = $1 AND user_b = $2
+        `,
+        [a, b, winnerId]
+      );
+    } else {
+      await pool.query(
+        `
+          UPDATE rivalries
+          SET wins_b = COALESCE(wins_b, 0) + 1,
+              matches_played = COALESCE(matches_played, 0) + 1,
+              last_winner_id = $3,
+              last_played_at = NOW(),
+              updated_at = NOW()
+          WHERE user_a = $1 AND user_b = $2
+        `,
+        [a, b, winnerId]
+      );
+    }
+
+    const [winnerUser, loserUser] = await Promise.all([
+      pool.query('SELECT telegram_id, username, wins, win_streak FROM users WHERE telegram_id = $1', [winnerId]),
+      pool.query('SELECT telegram_id, username, wins, win_streak FROM users WHERE telegram_id = $1', [loserId]),
+    ]);
+    const winner = winnerUser.rows[0] || null;
+    const loser = loserUser.rows[0] || null;
+    const rivalryRes = await pool.query('SELECT * FROM rivalries WHERE user_a = $1 AND user_b = $2', [a, b]);
+    const rivalry = rivalryRes.rows[0] || null;
+
+    // Hype cooldown (server-side decision)
+    const hypeEnabled = String(process.env.MATCH_HYPE_ENABLED || 'true').trim().toLowerCase() !== 'false';
+    const cooldownSeconds = Math.max(0, Number(process.env.MATCH_HYPE_COOLDOWN_SECONDS || 90) || 90);
+    let hypeAllowed = hypeEnabled;
+    if (hypeAllowed && cooldownSeconds > 0) {
+      const last = await pool.query('SELECT last_hype_at FROM users WHERE telegram_id = $1', [winnerId]);
+      const lastAt = last.rows[0]?.last_hype_at ? new Date(last.rows[0].last_hype_at).getTime() : 0;
+      const now = Date.now();
+      if (lastAt && now - lastAt < cooldownSeconds * 1000) {
+        hypeAllowed = false;
+      }
+    }
+    if (hypeAllowed) {
+      await pool.query('UPDATE users SET last_hype_at = NOW() WHERE telegram_id = $1', [winnerId]);
+    }
+
+    const stake = Number(match.stake_amount || 0);
+    const xpWinner = 60 + Math.min(240, Math.floor(stake * 2));
+    const xpLoser = 25 + Math.min(120, Math.floor(stake));
+    await awardXp({ telegramId: winnerId, amount: xpWinner, reason: 'match_win' });
+    await awardXp({ telegramId: loserId, amount: xpLoser, reason: 'match_loss' });
+    await awardBadgesIfEligible({ telegramId: winnerId });
+    await awardBadgesIfEligible({ telegramId: loserId });
+    const safeWinner = String(winner?.username || '').replace(/^@/, '') || 'player';
+    const safeLoser = String(loser?.username || '').replace(/^@/, '') || 'player';
+    const streak = Number(winner?.win_streak || 0);
+    const wonLine = stake > 0 ? `won $${stake} USDC` : 'won a match';
+    const streakLine = streak >= 2 ? ` (${streak} win streak)` : '';
+    const rivalryLine =
+      rivalry && Number(rivalry.matches_played || 0) >= 3
+        ? `\nRivalry: @${safeWinner} vs @${safeLoser} (${Number(rivalry.wins_a || 0)}-${Number(rivalry.wins_b || 0)})`
+        : '';
+    const calloutStake = stake > 0 ? stake : 10;
+    const hypeText = `🔥 @${safeWinner} just ${wonLine}${streakLine}.\nWho can beat @${safeWinner}? Try: /challenge ${calloutStake}${rivalryLine}`;
 
     // Keep tiers in sync with referral counts.
     for (const uid of [match.challenger_id, match.opponent_id]) {
@@ -3176,10 +3607,39 @@ registerWithApiAlias('post', '/matches/complete', async (req, res) => {
       );
     }
 
-    res.send('Match completed and stats updated ✅');
+    return res.json({
+      ok: true,
+      message: 'Match completed and stats updated ✅',
+      match: {
+        id: match.id,
+        challenger_id: String(match.challenger_id),
+        opponent_id: String(match.opponent_id),
+        stake_amount: String(match.stake_amount || 0),
+        is_fun_mode: !!match.is_fun_mode,
+        winner_id: String(winnerId),
+        loser_id: String(loserId),
+      },
+      winner: winner ? { telegram_id: String(winner.telegram_id), username: winner.username || null, win_streak: Number(winner.win_streak || 0) } : null,
+      loser: loser ? { telegram_id: String(loser.telegram_id), username: loser.username || null } : null,
+      rivalry: rivalry
+        ? {
+            user_a: String(rivalry.user_a),
+            user_b: String(rivalry.user_b),
+            wins_a: Number(rivalry.wins_a || 0),
+            wins_b: Number(rivalry.wins_b || 0),
+            matches_played: Number(rivalry.matches_played || 0),
+            last_winner_id: rivalry.last_winner_id != null ? String(rivalry.last_winner_id) : null,
+          }
+        : null,
+      hype: {
+        allowed: hypeAllowed,
+        text: hypeText,
+        cooldown_seconds: cooldownSeconds,
+      },
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).send('Error completing match ❌');
+    return res.status(500).send('Error completing match ❌');
   }
 });
 
@@ -3218,11 +3678,16 @@ registerWithApiAlias('post', '/matches/practice', async (req, res) => {
       `UPDATE users
        SET matches_played = COALESCE(matches_played, 0) + 1,
            wins = COALESCE(wins, 0) + 1,
+           win_streak = COALESCE(win_streak, 0) + 1,
+           last_win_at = NOW(),
            fun_mode_completed = TRUE,
            first_match_at = COALESCE(first_match_at, NOW())
        WHERE telegram_id = $1`,
       [tid]
     );
+
+    await awardXp({ telegramId: tid, amount: 40, reason: 'practice_win' });
+    await awardBadgesIfEligible({ telegramId: tid });
 
     const stats = await computeUserStats({ telegramId: tid });
     return res.json({ ok: true, stats });

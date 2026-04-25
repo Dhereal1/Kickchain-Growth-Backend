@@ -34,14 +34,10 @@ Telegram Mini Apps must be reachable over public HTTPS. To test locally:
    - `BOT_USERNAME=<your_bot_username>` (no `@`, enables referral links)
 4) In Telegram, open your bot and run: `/app`
 
-## Mini App (local) via Cloudflare Quick Tunnel (no domain)
+Or run everything at once (backend + proxy + ngrok): `npm run miniapp:up`
 
-If you don't have a domain and ngrok shows an interstitial warning page, Cloudflare Quick Tunnel works well for Telegram WebApps.
-
-1) Start backend: `npm run dev`
-2) Start a narrow proxy (only exposes `/miniapp/*`): `npm run miniapp:proxy`
-3) Start tunnel (requires `cloudflared` installed): `npm run tunnel:miniapp:cloudflare`
-4) In Telegram, open your bot and run: `/app`
+Notes:
+- ngrok URLs are ephemeral and only work while the tunnel process is running.
 
 ## Option B: run services manually
 

@@ -260,6 +260,135 @@ async function showMyStats() {
   setPanel(root);
 }
 
+async function claimDaily() {
+  return await apiFetch('/miniapp/api/daily', { method: 'POST', body: {} });
+}
+
+function badgePill(def, owned) {
+  const el = document.createElement('div');
+  el.className = 'item';
+  const ok = owned;
+  el.innerHTML = `
+    <div class="t">
+      <div class="name">${escapeHtml(def.name)}</div>
+      <div class="pill2">${ok ? 'Unlocked' : 'Locked'}</div>
+    </div>
+    <div class="m">${escapeHtml(def.desc)}</div>
+  `;
+  return el;
+}
+
+async function showProgress() {
+  setFooter('Progress');
+  const me = await loadMe();
+  const stats = me?.stats || {};
+
+  const xp = Number(stats.xp || 0);
+  const level = Number(stats.level || 1);
+  const nextXp = Number(stats.next_level_xp || 0);
+  const toNext = Math.max(0, nextXp - xp);
+  const pct = Math.max(0, Math.min(1, Number(stats.level_progress_pct || 0)));
+
+  const root = document.createElement('div');
+  root.className = 'row';
+
+  const box = document.createElement('div');
+  box.className = 'row';
+  box.appendChild(kv('Level', safeText(level)));
+  box.appendChild(kv('XP', `${fmtNum(xp)} / ${fmtNum(nextXp)} (${fmtNum(Math.round(pct * 100))}%)`));
+  box.appendChild(kv('Next Level', toNext ? `${fmtNum(toNext)} XP to go` : 'Maxed'));
+  if (stats?.nudges?.next_tier && stats?.nudges?.refs_needed_for_next_tier) {
+    const n = Number(stats.nudges.refs_needed_for_next_tier || 0);
+    box.appendChild(kv('Tier Nudge', `${n} referral${n === 1 ? '' : 's'} to ${safeText(stats.nudges.next_tier)}`));
+  }
+
+  const dailyRow = document.createElement('div');
+  dailyRow.className = 'row';
+  const btn = document.createElement('button');
+  btn.className = 'btn primary';
+  btn.textContent = 'Claim Daily XP';
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const r = await claimDaily();
+      const claimed = !!r?.claimed;
+      const xpAwarded = Number(r?.xp_awarded || 0);
+      setFooter(claimed ? `Claimed +${xpAwarded} XP` : 'Already claimed today');
+      await showProgress();
+    } catch (err) {
+      setFooter('Daily claim failed');
+      setPanel(renderError('Daily claim failed', err));
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  dailyRow.appendChild(btn);
+  dailyRow.appendChild(
+    (() => {
+      const p = document.createElement('div');
+      p.className = 'hint';
+      p.textContent = `Daily streak: ${fmtNum(stats.daily_check_streak || 0)} day(s)`;
+      return p;
+    })()
+  );
+
+  const badgesCard = document.createElement('div');
+  badgesCard.className = 'row';
+  const list = document.createElement('div');
+  list.className = 'list';
+  const ownedKeys = new Set((Array.isArray(stats.badges) ? stats.badges : []).map((b) => String(b.badge_key)));
+  const defs = [
+    { key: 'ref_3', name: 'Connector', desc: 'Get 3 referrals' },
+    { key: 'ref_10', name: 'Influencer', desc: 'Get 10 referrals' },
+    { key: 'win_3', name: 'Streak Starter', desc: 'Reach a 3-win streak' },
+    { key: 'win_10', name: 'Champion', desc: 'Win 10 matches' },
+    { key: 'daily_3', name: 'Regular', desc: '3-day daily check-in streak' },
+    { key: 'daily_7', name: 'Daily Grinder', desc: '7-day daily check-in streak' },
+  ];
+  defs.forEach((d) => list.appendChild(badgePill(d, ownedKeys.has(d.key))));
+  badgesCard.appendChild(card('Badges', list));
+
+  const unlocks = document.createElement('div');
+  unlocks.className = 'row';
+  const unlockList = document.createElement('div');
+  unlockList.className = 'list';
+  const unlockedTourneys = level >= 5;
+  unlockList.appendChild(
+    itemRow({
+      left: 'Private Tournaments',
+      right: unlockedTourneys ? 'Unlocked' : 'Locked',
+      meta: unlockedTourneys ? 'Create invite-only tournaments for your squad.' : 'Unlocks at Level 5.',
+    })
+  );
+  if (unlockedTourneys) {
+    const btnCreate = document.createElement('button');
+    btnCreate.className = 'btn';
+    btnCreate.textContent = 'Create Private Tournament';
+    btnCreate.onclick = async () => {
+      btnCreate.disabled = true;
+      try {
+        const r = await apiFetch('/miniapp/api/tournaments/private/create', { method: 'POST', body: { title: 'Private Tournament' } });
+        const t = r?.tournament || null;
+        if (t?.invite_code) {
+          alert(`Tournament created!\nInvite code: ${t.invite_code}`);
+        }
+      } catch (err) {
+        setPanel(renderError('Create tournament failed', err));
+      } finally {
+        btnCreate.disabled = false;
+      }
+    };
+    unlockList.appendChild(btnCreate);
+  }
+  unlocks.appendChild(card('Unlockables', unlockList));
+
+  root.appendChild(card('XP Progression', box));
+  root.appendChild(card('Daily', dailyRow));
+  root.appendChild(badgesCard);
+  root.appendChild(unlocks);
+  setPanel(root);
+}
+
 async function showReferrals() {
   setFooter('Referrals');
   const data = await apiFetch('/miniapp/api/referrals');
@@ -298,6 +427,7 @@ async function route(tab) {
   try {
     setConn({ ok: true, text: 'Connected' });
     if (tab === 'leaderboard') return await showLeaderboard();
+    if (tab === 'progress') return await showProgress();
     if (tab === 'me') return await showMyStats();
     if (tab === 'referrals') return await showReferrals();
     return await showLeaderboard();
@@ -342,4 +472,3 @@ function init() {
 }
 
 init();
-

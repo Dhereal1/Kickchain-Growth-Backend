@@ -139,7 +139,7 @@ existing_proxy_code="$(http_code "http://127.0.0.1:${PROXY_PORT}/miniapp/")"
 if [[ "$existing_proxy_code" != "000" ]]; then
   echo "Miniapp proxy already running on :${PROXY_PORT}"
 else
-  start_bg "miniapp-proxy" env MINIAPP_PROXY_PORT="$PROXY_PORT" MINIAPP_TARGET_PORT="$BACKEND_PORT" npm run miniapp:proxy
+start_bg "miniapp-proxy" env MINIAPP_PROXY_PORT="$PROXY_PORT" MINIAPP_TARGET_PORT="$BACKEND_PORT" npm run miniapp:proxy
 fi
 sleep 0.5
 

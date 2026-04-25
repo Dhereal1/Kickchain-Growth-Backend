@@ -1,5 +1,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 function normalizeBotToken(value) {
   return String(value || '').trim().replace(/^['"]|['"]$/g, '');
@@ -9,6 +11,27 @@ function normalizeUrl(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
   return raw.replace(/\/+$/, '');
+}
+
+function toMiniappUrl(miniappPublicUrl) {
+  const base = normalizeUrl(miniappPublicUrl);
+  if (!base) return '';
+  const lower = base.toLowerCase();
+  if (lower.endsWith('/miniapp/')) return base;
+  if (lower.endsWith('/miniapp')) return `${base}/`;
+  return `${base}/miniapp/`;
+}
+
+function readEnvValueFromFile(envPath, key) {
+  try {
+    const text = fs.readFileSync(envPath, 'utf8');
+    const re = new RegExp(`^\\s*${key}\\s*=\\s*(.*)\\s*$`, 'm');
+    const m = text.match(re);
+    if (!m) return '';
+    return String(m[1] || '').trim().replace(/^['"]|['"]$/g, '');
+  } catch {
+    return '';
+  }
 }
 
 function normalizeGroupId(value) {
@@ -52,17 +75,32 @@ function createKickchainBot(options) {
   const httpTimeoutMs = Math.max(1000, Number(process.env.BOT_HTTP_TIMEOUT_MS || 60000) || 60000);
   axios.defaults.timeout = httpTimeoutMs;
 
-  const miniappPublicUrl = normalizeUrl(process.env.MINIAPP_PUBLIC_URL || '');
-  const miniappUrl = miniappPublicUrl
-    ? (miniappPublicUrl.toLowerCase().endsWith('/miniapp') ? miniappPublicUrl : `${miniappPublicUrl}/miniapp`)
-    : '';
+  const envPath = path.join(process.cwd(), '.env');
+  let cachedMiniapp = { mtimeMs: 0, url: '' };
+
+  function getMiniappUrl() {
+    // Prefer the .env file so local tunnel scripts that rewrite it take effect without restarting.
+    try {
+      const st = fs.statSync(envPath);
+      if (st.mtimeMs !== cachedMiniapp.mtimeMs) {
+        cachedMiniapp.mtimeMs = st.mtimeMs;
+        const v = readEnvValueFromFile(envPath, 'MINIAPP_PUBLIC_URL');
+        cachedMiniapp.url = toMiniappUrl(v);
+      }
+      if (cachedMiniapp.url) return cachedMiniapp.url;
+    } catch {
+      // ignore
+    }
+
+    return toMiniappUrl(process.env.MINIAPP_PUBLIC_URL || '');
+  }
 
   console.log('Kickchain bot config', {
     polling_enabled: pollingEnabled,
     backend_url: backendUrl,
     timeout_ms: httpTimeoutMs,
     backend_override: !!botBackendOverride,
-    miniapp_public_url: miniappPublicUrl || null,
+    miniapp_public_url: normalizeUrl(process.env.MINIAPP_PUBLIC_URL || '') || null,
   });
 
   const rawGroupId = String(options?.groupId || process.env.GROUP_ID || '').trim();
@@ -367,6 +405,7 @@ function createKickchainBot(options) {
       const buttons = [
         [{ text: '🎮 Play Free (60s)', callback_data: PLAY_MATCH_CB }],
       ];
+      const miniappUrl = getMiniappUrl();
       if (miniappUrl) {
         buttons.push([{ text: '🏆 Open Mini App', web_app: { url: miniappUrl } }]);
       }
@@ -617,6 +656,7 @@ function createKickchainBot(options) {
 
   bot.command('app', async (ctx) => {
     try {
+      const miniappUrl = getMiniappUrl();
       if (!miniappUrl) {
         return ctx.reply(
           'Mini App is not configured.\n\nSet MINIAPP_PUBLIC_URL to your public HTTPS base URL (e.g. ngrok), then try again.'
@@ -841,11 +881,16 @@ function createKickchainBot(options) {
 
     try {
       const telegram_id = ctx.from.id;
-      await axios.post(`${backendUrl}/matches/complete`, {
+      const done = await axios.post(`${backendUrl}/matches/complete`, {
         match_id,
         winner_id: telegram_id,
       });
       await ctx.reply(`🏁 Result recorded for match #${match_id} ✅`);
+
+      const hype = done.data?.hype || null;
+      if (hype?.allowed && hype?.text) {
+        await sendToAllGroups(ctx, String(hype.text).slice(0, 1000));
+      }
     } catch (err) {
       const status = err?.response?.status;
       const msg = err?.response?.data?.message || err?.response?.data || err?.message;
