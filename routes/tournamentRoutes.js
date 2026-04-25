@@ -14,10 +14,11 @@ function registerTournamentRoutes(app, { pool, ensureGrowthSchema }) {
   router.get('/health', (_req, res) => res.json({ ok: true, module: 'tournament-orchestration' }));
 
   // Auth applied per-route in later PRs; keep PR0 as stub-only.
-  router.get('/:id(\\d+)', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
+  router.get('/:id', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
     try {
       if (!isTournamentOrchestrationEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
       const id = Number(req.params.id);
+      if (!Number.isFinite(id) || !id) return res.status(400).json({ ok: false, error: 'invalid_id' });
       const state = await getTournamentState({ pool, ensureGrowthSchema, tournamentId: id });
       if (!state.tournament) return res.status(404).json({ ok: false, error: 'not_found' });
       return res.json({ ok: true, ...state });
@@ -28,11 +29,12 @@ function registerTournamentRoutes(app, { pool, ensureGrowthSchema }) {
   });
 
   // Admin helper: join participant by telegram_id
-  router.post('/:id(\\d+)/join', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
+  router.post('/:id/join', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
     try {
       if (!isTournamentOrchestrationEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
       if (!req.intelAuth?.isAdmin) return res.status(401).json({ ok: false, error: 'unauthorized' });
       const id = Number(req.params.id);
+      if (!Number.isFinite(id) || !id) return res.status(400).json({ ok: false, error: 'invalid_id' });
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const telegramId = body.telegram_id != null ? Number(body.telegram_id) : null;
       if (!telegramId || !Number.isFinite(telegramId)) {
@@ -46,11 +48,12 @@ function registerTournamentRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.post('/:id(\\d+)/start', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
+  router.post('/:id/start', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
     try {
       if (!isTournamentOrchestrationEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
       if (!req.intelAuth?.isAdmin) return res.status(401).json({ ok: false, error: 'unauthorized' });
       const id = Number(req.params.id);
+      if (!Number.isFinite(id) || !id) return res.status(400).json({ ok: false, error: 'invalid_id' });
       const out = await startTournament({ pool, ensureGrowthSchema, tournamentId: id });
       return res.json(out);
     } catch (err) {
@@ -59,11 +62,12 @@ function registerTournamentRoutes(app, { pool, ensureGrowthSchema }) {
     }
   });
 
-  router.post('/:id(\\d+)/advance', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
+  router.post('/:id/advance', requireIntelUser({ pool, allowAdmin: true }), async (req, res) => {
     try {
       if (!isTournamentOrchestrationEnabled()) return res.status(404).json({ ok: false, error: 'disabled' });
       if (!req.intelAuth?.isAdmin) return res.status(401).json({ ok: false, error: 'unauthorized' });
       const id = Number(req.params.id);
+      if (!Number.isFinite(id) || !id) return res.status(400).json({ ok: false, error: 'invalid_id' });
       const out = await recomputeTournamentProgress({ pool, ensureGrowthSchema, tournamentId: id });
       return res.json(out);
     } catch (err) {
