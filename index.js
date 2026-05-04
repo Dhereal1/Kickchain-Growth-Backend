@@ -70,6 +70,47 @@ app.use(
   })
 );
 
+// Mini App API request logging (helps debug "stuck on connecting" issues).
+// Enable by setting INTEL_DEBUG=true (or MINIAPP_DEBUG=true).
+app.use((req, res, next) => {
+  try {
+    const debugEnabled =
+      String(process.env.MINIAPP_DEBUG || '').trim().toLowerCase() === 'true' ||
+      String(process.env.INTEL_DEBUG || '').trim().toLowerCase() === 'true';
+    if (!debugEnabled) return next();
+    const pathOnly = String(req.path || '');
+    if (!pathOnly.startsWith('/miniapp/api/')) return next();
+
+    const startedAt = Date.now();
+    let responseError = null;
+
+    // Capture `{ ok:false, error: ... }` from JSON responses for easier log triage.
+    const origJson = res.json.bind(res);
+    res.json = (body) => {
+      try {
+        if (body && typeof body === 'object' && body.ok === false && body.error) {
+          responseError = String(body.error);
+        }
+      } catch {
+        // ignore
+      }
+      return origJson(body);
+    };
+
+    res.on('finish', () => {
+      const ms = Date.now() - startedAt;
+      const status = res.statusCode;
+      // Avoid logging initData/query contents; only log path + status.
+      const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'log';
+      // eslint-disable-next-line no-console
+      console[level]('miniapp api', { method: req.method, path: pathOnly, status, ms, error: responseError || undefined });
+    });
+  } catch {
+    // ignore logging failures
+  }
+  return next();
+});
+
 registerIntelRoutes(app, { pool, ensureGrowthSchema });
 registerGrowthRoutes(app, { pool, ensureGrowthSchema });
 registerTournamentRoutes(app, { pool, ensureGrowthSchema });

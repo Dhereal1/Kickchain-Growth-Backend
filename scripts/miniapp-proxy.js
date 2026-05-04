@@ -1,5 +1,8 @@
 const http = require('http');
 
+// Ensure MINIAPP_PROXY_PORT / MINIAPP_TARGET_PORT env vars from .env are respected when running via `npm run ...`.
+require('dotenv').config({ quiet: true });
+
 function isAllowedPath(url) {
   const u = String(url || '');
   return u === '/miniapp' || u.startsWith('/miniapp/') || u.startsWith('/miniapp/api/');

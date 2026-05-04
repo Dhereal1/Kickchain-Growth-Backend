@@ -93,6 +93,19 @@ find_free_port() {
 echo "Logs: $LOG_FILE"
 echo "Starting backend + miniapp proxy + ngrok tunnel..."
 
+# Load a few port-related settings from .env when not already exported in the shell.
+# (This keeps backend, proxy, and ngrok aligned on the same ports.)
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  if [[ -z "${PORT:-}" ]]; then
+    PORT="$(rg -N "^PORT=" "$ROOT_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    PORT="${PORT//$'\r'/}"
+  fi
+  if [[ -z "${MINIAPP_PROXY_PORT:-}" ]]; then
+    MINIAPP_PROXY_PORT="$(rg -N "^MINIAPP_PROXY_PORT=" "$ROOT_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    MINIAPP_PROXY_PORT="${MINIAPP_PROXY_PORT//$'\r'/}"
+  fi
+fi
+
 BACKEND_PORT="${PORT:-3004}"
 
 BACKEND_ENV=()

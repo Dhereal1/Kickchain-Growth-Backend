@@ -2,6 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
+// Ensure MINIAPP_PROXY_PORT / NGROK_* env vars from .env are respected when running via `npm run ...`.
+require('dotenv').config({ quiet: true });
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }

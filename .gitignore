@@ -13,6 +13,7 @@ bot/.env
 
 # Runtime artifacts
 logs/
+*.log
 
 # Local tool installs
 tools/ngrok/

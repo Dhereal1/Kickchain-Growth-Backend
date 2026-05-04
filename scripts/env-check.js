@@ -48,6 +48,14 @@ function checkOne({ name, examplePath, envPath, requiredKeys = [], optionalRequi
   };
 }
 
+function readInt(envMap, key) {
+  const raw = String(envMap.get(key) ?? '').trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+}
+
 function main() {
   const root = process.cwd();
   const rootResult = checkOne({
@@ -56,6 +64,24 @@ function main() {
     envPath: path.join(root, '.env'),
     requiredKeys: ['DATABASE_URL', 'BOT_TOKEN'],
   });
+  // Extra sanity checks that help avoid "Mini App not loading" footguns.
+  try {
+    const envPath = path.join(root, '.env');
+    const envText = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+    const env = parseEnv(envText);
+    const proxyPort = readInt(env, 'MINIAPP_PROXY_PORT');
+    const targetPort = readInt(env, 'MINIAPP_TARGET_PORT');
+    if (proxyPort != null && targetPort != null && proxyPort === targetPort) {
+      console.log('\nMini App sanity');
+      console.log(
+        `- MINIAPP_TARGET_PORT (${targetPort}) must not equal MINIAPP_PROXY_PORT (${proxyPort}); set MINIAPP_TARGET_PORT to your backend PORT (default 3004).`
+      );
+      rootResult.emptyRequired.push('MINIAPP_TARGET_PORT');
+    }
+  } catch {
+    // ignore
+  }
+
   const botResult = checkOne({
     name: 'Bot env (bot/.env)',
     examplePath: path.join(root, 'bot', '.env.example'),

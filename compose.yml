@@ -3,6 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       PORT: ${PORT:-3004}
@@ -14,6 +18,14 @@ services:
       CORS_ORIGIN: ${CORS_ORIGIN:-*}
       BACKEND_URL: ${BACKEND_URL:-http://localhost:3004}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3004}
+
+      # Additive modules / feature flags
+      ENABLE_GROWTH_CRM: ${ENABLE_GROWTH_CRM:-false}
+      ENABLE_MATCH_HYPE_EVENTS: ${ENABLE_MATCH_HYPE_EVENTS:-false}
+      ENABLE_TOURNAMENT_ORCHESTRATION: ${ENABLE_TOURNAMENT_ORCHESTRATION:-false}
+      ENABLE_AMBASSADORS: ${ENABLE_AMBASSADORS:-false}
+      ENABLE_COPILOT: ${ENABLE_COPILOT:-false}
+      ENABLE_PR6_REFERRAL_ENGINE: ${ENABLE_PR6_REFERRAL_ENGINE:-false}
 
       INTEL_API_KEY: ${INTEL_API_KEY}
       INTERNAL_GROUP_IDS: ${INTERNAL_GROUP_IDS}

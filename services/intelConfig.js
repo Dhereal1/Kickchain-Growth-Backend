@@ -173,9 +173,7 @@ function getIntelConfig() {
     (json.datasets && Array.isArray(json.datasets) ? json.datasets : null) ||
     (process.env.INTEL_COMMUNITIES ? parseCsv(process.env.INTEL_COMMUNITIES) : null) ||
     (process.env.TELETHON_COMMUNITIES ? parseCsv(process.env.TELETHON_COMMUNITIES) : null) ||
-    // Older envs (deprecated): treat as communities if they look like usernames.
-    (process.env.APIFY_DATASET_IDS ? parseCsv(process.env.APIFY_DATASET_IDS) : null) ||
-    (process.env.APIFY_DATASET_ID ? [String(process.env.APIFY_DATASET_ID).trim()].filter(Boolean) : []);
+    null;
 
   return {
     keywords: keywords.map((k) => String(k).toLowerCase()),

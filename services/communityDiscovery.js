@@ -145,9 +145,9 @@ async function scrapeDiscoveredCommunities({
   return {
     ok: true,
     skipped: true,
-    reason: 'apify_removed',
+    reason: 'scrape_removed',
     hint:
-      'Apify scraping has been removed. Use TELETHON_SERVICE_URL for message ingestion and Crawlee for discovery (links only).',
+      'Community scraping has been removed. Use TELETHON_SERVICE_URL for message ingestion and Crawlee for discovery (links only).',
     config: { maxScrapes, cooldownHours, platform, hasConfigOverride: !!cfg && !!configOverride },
   };
 }

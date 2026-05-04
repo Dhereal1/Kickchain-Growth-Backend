@@ -29,15 +29,16 @@ Telegram Mini Apps must be reachable over public HTTPS. To test locally:
 1) Start backend: `npm run dev`
 2) Start a narrow proxy (only exposes `/miniapp/*`): `npm run miniapp:proxy`
 3) Start tunnel: `npm run tunnel:miniapp`
-3) Set `.env`:
+4) Set `.env`:
    - `MINIAPP_PUBLIC_URL=https://<your-ngrok-domain>` (auto-written by `npm run tunnel:miniapp`)
    - `BOT_USERNAME=<your_bot_username>` (no `@`, enables referral links)
-4) In Telegram, open your bot and run: `/app`
+5) In Telegram, open your bot and run: `/app`
 
 Or run everything at once (backend + proxy + ngrok): `npm run miniapp:up`
 
 Notes:
 - ngrok URLs are ephemeral and only work while the tunnel process is running.
+- If you change `MINIAPP_PROXY_PORT` in `.env`, both `npm run miniapp:proxy` and `npm run tunnel:miniapp` will use it.
 
 ## Option B: run services manually
 
