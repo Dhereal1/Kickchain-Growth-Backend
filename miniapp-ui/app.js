@@ -62,11 +62,10 @@ function applyTelegramTheme() {
   if (!tg) return;
 
   const tp = tg.themeParams || {};
-  // Minimal mapping to feel native; keep fallback palette when missing.
+  // Minimal mapping to feel native; keep Kickchain readable on the pitch background.
+  // Do NOT override --bg/--text because Telegram light theme provides dark text on light bg,
+  // which makes the Mini App unreadable with our dark/photographic background.
   const map = [
-    ['--bg', tp.bg_color],
-    ['--text', tp.text_color],
-    ['--muted', tp.hint_color],
     ['--accent', tp.button_color],
     ['--accent2', tp.link_color],
   ];

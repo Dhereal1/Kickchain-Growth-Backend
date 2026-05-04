@@ -10,11 +10,11 @@
         /* KickChain theme (football pitch + Web3 neon) */
         --pitch: #0B3D2E;
         --bg: #000000;
-        --panel: rgba(0, 0, 0, 0.40);
-        --panel2: rgba(0, 0, 0, 0.26);
-        --text: rgba(255, 255, 255, 0.93);
-        --muted: rgba(255, 255, 255, 0.68);
-        --border: rgba(255, 255, 255, 0.10);
+        --panel: rgba(0, 0, 0, 0.30);
+        --panel2: rgba(0, 0, 0, 0.18);
+        --text: rgba(255, 255, 255, 0.96);
+        --muted: rgba(255, 255, 255, 0.78);
+        --border: rgba(255, 255, 255, 0.14);
         --primary: #00FF88;
         --primary2: rgba(0, 255, 136, 0.60);
         --danger: #ff3b5c;
@@ -23,10 +23,10 @@
         --glow: 0 0 0 1px rgba(0, 255, 136, 0.16), 0 0 24px rgba(0, 255, 136, 0.15);
         --glow-strong: 0 0 0 1px rgba(0, 255, 136, 0.26), 0 0 34px rgba(0, 255, 136, 0.24);
 
-        /* Telegram theme vars (fallbacks). Keep app readable inside Telegram. */
-        --tg-bg: var(--tg-theme-bg-color, var(--bg));
-        --tg-text: var(--tg-theme-text-color, rgba(255, 255, 255, 0.93));
-        --tg-hint: var(--tg-theme-hint-color, rgba(255, 255, 255, 0.68));
+        /* Telegram vars: keep Kickchain readable even in Telegram light theme. */
+        --tg-bg: var(--bg);
+        --tg-text: var(--text);
+        --tg-hint: var(--muted);
       }
       * { box-sizing: border-box; }
       html, body { height: 100%; }
@@ -34,7 +34,7 @@
         margin: 0;
         font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
         background:
-          linear-gradient(180deg, rgba(0,0,0,0.66) 0%, rgba(0,0,0,0.78) 100%),
+          linear-gradient(180deg, rgba(0,0,0,0.40) 0%, rgba(0,0,0,0.58) 100%),
           radial-gradient(1000px 520px at 50% -20%, rgba(0, 255, 136, 0.10), transparent 60%),
           radial-gradient(900px 520px at 0% 20%, rgba(0, 255, 136, 0.08), transparent 60%),
           repeating-linear-gradient(
@@ -47,7 +47,7 @@
           linear-gradient(180deg, var(--pitch) 0%, var(--bg) 100%),
           url("./assets/kickchain-bg.jpg");
         background-size: auto, auto, auto, auto, auto, cover;
-        background-position: 0 0, 50% 0, 0 20%, 0 0, 0 0, center;
+        background-position: 0 0, 50% 0, 0 20%, 0 0, 0 0, center 22%;
         background-repeat: no-repeat, no-repeat, no-repeat, repeat, no-repeat, no-repeat;
         color: var(--tg-text);
         color-scheme: dark;
@@ -70,7 +70,7 @@
         pointer-events: none;
         background: radial-gradient(800px 520px at 50% 40%, rgba(0, 255, 136, 0.10), rgba(0,0,0,0.38) 65%, rgba(0,0,0,0.72) 100%);
         mix-blend-mode: screen;
-        opacity: 0.55;
+        opacity: 0.40;
       }
       .wrap {
         max-width: 900px;
@@ -106,7 +106,7 @@
         gap: 8px;
         padding: 7px 10px;
         border: 1px solid var(--border);
-        background: rgba(0, 0, 0, 0.24);
+        background: var(--panel2);
         border-radius: 999px;
         font-size: 12px;
         color: var(--tg-hint);
@@ -125,7 +125,7 @@
       .tab {
         appearance: none;
         border: 1px solid var(--border);
-        background: rgba(0, 0, 0, 0.26);
+        background: var(--panel2);
         color: var(--tg-text);
         padding: 9px 11px;
         border-radius: 12px;
@@ -150,7 +150,7 @@
       .card {
         border: 1px solid var(--border);
         border-radius: 16px;
-        background: linear-gradient(180deg, rgba(0, 0, 0, 0.46), rgba(0, 0, 0, 0.22));
+        background: linear-gradient(180deg, rgba(0, 0, 0, 0.34), rgba(0, 0, 0, 0.14));
         overflow: hidden;
         box-shadow: var(--shadow);
         backdrop-filter: blur(12px);
@@ -162,7 +162,7 @@
         justify-content: space-between;
         align-items: center;
         gap: 10px;
-        background: rgba(0, 0, 0, 0.22);
+        background: var(--panel2);
       }
       .card .hd h2 {
         margin: 0;
@@ -178,7 +178,7 @@
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 10px 12px;
-        background: rgba(0, 0, 0, 0.22);
+        background: var(--panel2);
         display: grid;
         gap: 6px;
         box-shadow: 0 6px 14px rgba(0, 0, 0, 0.35);
@@ -190,7 +190,7 @@
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 10px 12px;
-        background: rgba(0, 0, 0, 0.22);
+        background: var(--panel2);
         box-shadow: 0 6px 14px rgba(0, 0, 0, 0.35);
         transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
       }
@@ -204,14 +204,14 @@
         border: 1px solid var(--border);
         border-radius: 999px;
         padding: 3px 8px;
-        background: rgba(0, 0, 0, 0.18);
+        background: rgba(0, 0, 0, 0.14);
       }
       .item .m { margin-top: 6px; color: var(--tg-hint); font-size: 12px; line-height: 1.45; }
       .btns { display: flex; gap: 8px; flex-wrap: wrap; }
       .btn {
         appearance: none;
         border: 1px solid var(--border);
-        background: rgba(0, 0, 0, 0.28);
+        background: rgba(255, 255, 255, 0.07);
         color: var(--tg-text);
         padding: 9px 10px;
         border-radius: 12px;
@@ -229,7 +229,7 @@
       .btn.primary {
         background:
           linear-gradient(180deg, rgba(0, 255, 136, 0.22), rgba(0, 255, 136, 0.10)),
-          rgba(0, 0, 0, 0.32);
+          rgba(0, 0, 0, 0.22);
         border-color: rgba(0, 255, 136, 0.55);
         box-shadow: var(--glow-strong);
       }
@@ -262,7 +262,7 @@
         right: 0;
         bottom: 0;
         padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
-        background: rgba(0, 0, 0, 0.56);
+        background: rgba(0, 0, 0, 0.44);
         backdrop-filter: blur(10px);
         border-top: 1px solid rgba(255, 255, 255, 0.10);
       }
